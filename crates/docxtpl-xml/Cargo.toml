@@ -1,0 +1,14 @@
+[package]
+name = "docxtpl-xml"
+description = "XML 可编辑片段层：宽松(recover)解析、树模型、保留式序列化与位置追踪"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+zip = "2"

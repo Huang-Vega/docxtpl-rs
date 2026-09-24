@@ -1,0 +1,19 @@
+[package]
+name = "docxtpl-rs"
+description = "docxtpl-rs：Python docxtpl 的 Rust 语义移植（公开门面 crate）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# 启用 Python oracle 差分集成测试（需要本机 python + tests/oracle 依赖）。
+oracle = []
+
+[dependencies]
+docxtpl-compat = { path = "../docxtpl-compat" }
+docxtpl-opc = { path = "../docxtpl-opc" }
+docxtpl-template = { path = "../docxtpl-template" }
+docxtpl-xml = { path = "../docxtpl-xml" }
+serde_json = "1"
+thiserror = "2"

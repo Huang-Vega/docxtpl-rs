@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/docxtpl-rs",
+    "crates/docxtpl-opc",
+    "crates/docxtpl-xml",
+    "crates/docxtpl-template",
+    "crates/docxtpl-compat",
+    "crates/docxtpl-cli",
+]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2021"
+rust-version = "1.85"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/elapouya/python-docx-template"

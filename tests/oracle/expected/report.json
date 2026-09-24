@@ -1,0 +1,494 @@
+{
+  "generated_at": "2026-09-24T16:41:13+08:00",
+  "versions": {
+    "docxtpl": "0.20.2",
+    "jinja2": "3.1.6",
+    "python-docx": "1.2.0",
+    "lxml": "6.1.1"
+  },
+  "fixtures": [
+    {
+      "id": "rt_minimal",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_paragraphs",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_special_chars",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_formats",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_styles",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_lists",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_table_basic",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_table_merged",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_nested_table",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_xml_space",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_media",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_header_footer",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_hyperlink",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_bookmark",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_unknown_part",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_unicode",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_long",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_footnotes",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_rsid",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "rt_multi_section",
+      "mode": "roundtrip",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_var_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_var_multiple",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_var_spacing",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_filter_upper",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_filter_join",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_filter_default",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_undefined",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_value_amp",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_value_specials",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_value_lt_tag",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_value_lt_bare",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_if_inline_true",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_if_inline_false",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_if_cross_runs",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_for_inline",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_for_cross_runs",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_trim",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_comment",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_split_delims",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_split_content",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_literal_escape",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_newline_value",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_tab_value",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_smart_quotes",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_entity_in_tag",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r2_syntax_error",
+      "mode": "render",
+      "status": "error",
+      "error_type": "TemplateSyntaxError",
+      "error_message": "Unexpected end of template. Jinja was looking for the following tags: 'elif' or 'else' or 'endif'. The innermost block that needs to be closed is 'if'."
+    },
+    {
+      "id": "r2_for_empty",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_if_true",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_if_false",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_for",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_for_empty",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_nested",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_set",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_tr_for",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_tr_for_empty",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_tr_if",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_tr_nested_p",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_tc_for",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_nested_tables",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_r_tag",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_p_var",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_colspan",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_cellbg",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_vm",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_hm",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_fix_add",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_fix_remove",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_docpr",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "r3_combo_invoice",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    }
+  ]
+}

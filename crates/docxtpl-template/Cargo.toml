@@ -1,0 +1,15 @@
+[package]
+name = "docxtpl-template"
+description = "模板渲染管线：patch_xml → MiniJinja 渲染 → resolve_listing → fix_tables/fix_docpr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+docxtpl-compat = { path = "../docxtpl-compat" }
+docxtpl-xml = { path = "../docxtpl-xml" }
+minijinja = "2"
+regex = "1"
+serde_json = "1"
+thiserror = "2"

@@ -1,0 +1,112 @@
+//! 渲染错误类型（代码规范 §3.2：分层、可定位、不吞上下文）。
+
+use docxtpl_xml::XmlError;
+use std::fmt;
+
+/// 模板错误的稳定类别（具体消息可演进，类别用于兼容 oracle 错误分类）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateErrorKind {
+    /// 模板语法错误（对齐 jinja2 `TemplateSyntaxError`）。
+    Syntax,
+    /// 变量/属性未定义（strict undefined 下）。
+    Undefined,
+    /// 其他模板执行错误。
+    Other,
+}
+
+impl TemplateErrorKind {
+    /// 对齐 oracle report 的 Python 异常类名。
+    #[must_use]
+    pub fn oracle_exception(self) -> &'static str {
+        match self {
+            TemplateErrorKind::Syntax => "TemplateSyntaxError",
+            TemplateErrorKind::Undefined => "UndefinedError",
+            TemplateErrorKind::Other => "TemplateError",
+        }
+    }
+}
+
+/// 渲染管线错误。
+#[derive(Debug)]
+pub enum RenderError {
+    /// XML 解析/愈合/后处理失败。
+    Xml {
+        /// 出错的 part 名。
+        part: String,
+        /// 底层 XML 错误。
+        source: XmlError,
+    },
+
+    /// 模板语法或求值错误。
+    Template {
+        /// 稳定类别。
+        kind: TemplateErrorKind,
+        /// 出错的 part 名。
+        part: String,
+        /// MiniJinja 报告的 1 起始行号（若有）。
+        line: Option<usize>,
+        /// 错误消息。
+        message: String,
+        /// 对齐上游 `exc.docx_context`：出错行附近去标签后的纯文本片段。
+        context: Vec<String>,
+    },
+}
+
+impl RenderError {
+    /// 取错误的稳定类别（XML 错误为 None）。
+    #[must_use]
+    pub fn kind(&self) -> Option<TemplateErrorKind> {
+        match self {
+            RenderError::Template { kind, .. } => Some(*kind),
+            RenderError::Xml { .. } => None,
+        }
+    }
+
+    /// 出错附近的文本上下文（对齐上游 docx_context）。
+    #[must_use]
+    pub fn context_lines(&self) -> &[String] {
+        match self {
+            RenderError::Template { context, .. } => context,
+            RenderError::Xml { .. } => &[],
+        }
+    }
+
+    /// 出错的 part 名。
+    #[must_use]
+    pub fn part(&self) -> &str {
+        match self {
+            RenderError::Xml { part, .. } | RenderError::Template { part, .. } => part,
+        }
+    }
+}
+
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RenderError::Xml { source, .. } => Some(source),
+            RenderError::Template { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::Xml { part, source } => {
+                write!(f, "XML 处理失败（part {part}）: {source}")
+            }
+            RenderError::Template {
+                kind,
+                part,
+                line,
+                message,
+                ..
+            } => {
+                let line = line
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                write!(f, "模板错误（part {part}，行 {line}）: {kind:?}: {message}")
+            }
+        }
+    }
+}

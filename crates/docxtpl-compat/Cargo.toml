@@ -1,0 +1,14 @@
+[package]
+name = "docxtpl-compat"
+description = "上游 docxtpl 0.20.2 兼容层：patch_xml 正则的逐条移植与替换单元"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fancy-regex = "0.13"
+thiserror = "2"
+
+[dev-dependencies]
+zip = "2"

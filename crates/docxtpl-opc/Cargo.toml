@@ -1,0 +1,16 @@
+[package]
+name = "docxtpl-opc"
+description = "OOXML/OPC 包读写层：ZIP、part、Content Types、relationships 与资源限额"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zip = "2"
+quick-xml = "0.37"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
