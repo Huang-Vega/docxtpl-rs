@@ -34,11 +34,11 @@ pub struct PackageLimits {
 impl Default for PackageLimits {
     fn default() -> Self {
         Self {
-            max_entries: 10_000,
-            max_entry_uncompressed: 256 * 1024 * 1024,
-            max_total_uncompressed: 1024 * 1024 * 1024,
+            max_entries: 1_000,
+            max_entry_uncompressed: 32 * 1024 * 1024,
+            max_total_uncompressed: 128 * 1024 * 1024,
             max_compression_ratio: 200,
-            max_output_size: 1024 * 1024 * 1024,
+            max_output_size: 128 * 1024 * 1024,
         }
     }
 }
@@ -50,10 +50,10 @@ mod tests {
     #[test]
     fn default_values_match_adr004() {
         let limits = PackageLimits::default();
-        assert_eq!(limits.max_entries, 10_000);
-        assert_eq!(limits.max_entry_uncompressed, 256 * 1024 * 1024);
-        assert_eq!(limits.max_total_uncompressed, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_entries, 1_000);
+        assert_eq!(limits.max_entry_uncompressed, 32 * 1024 * 1024);
+        assert_eq!(limits.max_total_uncompressed, 128 * 1024 * 1024);
         assert_eq!(limits.max_compression_ratio, 200);
-        assert_eq!(limits.max_output_size, 1024 * 1024 * 1024);
+        assert_eq!(limits.max_output_size, 128 * 1024 * 1024);
     }
 }

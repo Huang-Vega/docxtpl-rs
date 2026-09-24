@@ -29,6 +29,15 @@ impl TemplateErrorKind {
 /// 渲染管线错误。
 #[derive(Debug)]
 pub enum RenderError {
+    /// 渲染超过资源预算。
+    Limit {
+        /// 出错的 part 名。
+        part: String,
+        /// 限额类别。
+        kind: &'static str,
+        /// 允许的最大值。
+        max: u64,
+    },
     /// XML 解析/愈合/后处理失败。
     Xml {
         /// 出错的 part 名。
@@ -58,7 +67,7 @@ impl RenderError {
     pub fn kind(&self) -> Option<TemplateErrorKind> {
         match self {
             RenderError::Template { kind, .. } => Some(*kind),
-            RenderError::Xml { .. } => None,
+            RenderError::Xml { .. } | RenderError::Limit { .. } => None,
         }
     }
 
@@ -67,7 +76,7 @@ impl RenderError {
     pub fn context_lines(&self) -> &[String] {
         match self {
             RenderError::Template { context, .. } => context,
-            RenderError::Xml { .. } => &[],
+            RenderError::Xml { .. } | RenderError::Limit { .. } => &[],
         }
     }
 
@@ -75,7 +84,9 @@ impl RenderError {
     #[must_use]
     pub fn part(&self) -> &str {
         match self {
-            RenderError::Xml { part, .. } | RenderError::Template { part, .. } => part,
+            RenderError::Xml { part, .. }
+            | RenderError::Template { part, .. }
+            | RenderError::Limit { part, .. } => part,
         }
     }
 }
@@ -84,7 +95,7 @@ impl std::error::Error for RenderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             RenderError::Xml { source, .. } => Some(source),
-            RenderError::Template { .. } => None,
+            RenderError::Template { .. } | RenderError::Limit { .. } => None,
         }
     }
 }
@@ -92,6 +103,9 @@ impl std::error::Error for RenderError {
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RenderError::Limit { part, kind, max } => {
+                write!(f, "渲染资源超限（part {part}，{kind} 最大 {max}）")
+            }
             RenderError::Xml { part, source } => {
                 write!(f, "XML 处理失败（part {part}）: {source}")
             }

@@ -27,6 +27,8 @@ use std::path::Path;
 use docxtpl_opc::{OpcError, Package, PackageLimits, TargetMode};
 use docxtpl_template::RenderError;
 
+const MAX_INPUT_DOCX_BYTES: u64 = 128 * 1024 * 1024;
+
 /// 一个可复用的 docx 模板（只读持有模板字节）。
 pub struct DocxTemplate {
     data: Vec<u8>,
@@ -35,22 +37,26 @@ pub struct DocxTemplate {
 impl DocxTemplate {
     /// 从文件打开模板（读取全部字节并做基础可读校验，不渲染）。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let mut fh = std::fs::File::open(path)?;
-        let mut data = Vec::new();
-        fh.read_to_end(&mut data)?;
-        Self::from_bytes(data)
+        Self::from_reader(std::fs::File::open(path)?)
     }
 
     /// 从任意读取器读入模板。
-    pub fn from_reader(mut reader: impl Read) -> Result<Self, Error> {
+    pub fn from_reader(reader: impl Read) -> Result<Self, Error> {
         let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
+        reader
+            .take(MAX_INPUT_DOCX_BYTES + 1)
+            .read_to_end(&mut data)?;
         Self::from_bytes(data)
     }
 
     /// 从已有字节构造模板；会立即按 OPC 限额做一次完整解析与校验，
     /// 确保后续 render 不会因包结构问题失败。
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
+        if data.len() as u64 > MAX_INPUT_DOCX_BYTES {
+            return Err(Error::InputTooLarge {
+                max: MAX_INPUT_DOCX_BYTES,
+            });
+        }
         let pkg = Package::from_reader(Cursor::new(&data), &PackageLimits::default())?;
         pkg.validate()?;
         Ok(Self { data })
@@ -163,6 +169,9 @@ impl Error {
 /// 门面层错误：OPC、模板渲染或编码问题。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// 压缩后的输入文件超过默认读取限额。
+    #[error("输入 DOCX 超过 {max} 字节限额")]
+    InputTooLarge { max: u64 },
     /// ZIP/OPC 包错误（限额、URI、关系等）。
     #[error(transparent)]
     Opc(#[from] OpcError),

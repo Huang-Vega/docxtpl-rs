@@ -3,3 +3,4 @@
 tests/oracle/actual/
 __pycache__/
 *.pyc
+.DS_Store

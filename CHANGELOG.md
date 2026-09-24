@@ -33,5 +33,8 @@ docs/compatibility.md §7）。
 
 ## [Unreleased]
 
-- 无（0.1.0-alpha 之后的工作待规划：RichText、InlineImage、header/footer、
-  footnotes、subdoc 等 P4–P6 功能）。
+- 收紧默认 OPC 限额，并在门面增加 128 MiB 压缩输入、64 MiB 渲染 XML
+  及 MiniJinja 10 000 000 fuel 限额；超限返回明确错误。
+- 锁定与 Rust 1.85 兼容的 `time`、`deflate64`；固定 golden XML 的换行字节，
+  修复 Windows 测试受 Git 换行转换影响的问题。
+- 新增 LibreOffice 打开并另存的 CI 检查、MVP 使用指南和 P1 限额校准记录。

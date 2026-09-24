@@ -5,10 +5,35 @@ use docxtpl_xml::{Recovery, XmlDocument, XmlLimits};
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use regex::Regex;
 use serde_json::Value as JsonValue;
+use std::io::{self, Write};
 use std::sync::OnceLock;
 
 use crate::error::{RenderError, TemplateErrorKind};
 use crate::fix_tables::{fix_docpr_ids, fix_tables};
+
+const MAX_RENDERED_XML_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TEMPLATE_FUEL: u64 = 10_000_000;
+
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    max: usize,
+    exceeded: bool,
+}
+
+impl Write for LimitedOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.max.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::other("rendered XML size limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// 主文档 part 名（本阶段仅渲染主文档，header/footer 属 P5）。
 pub const MAIN_PART: &str = "word/document.xml";
@@ -107,6 +132,13 @@ pub fn render_document_xml(
 
     // 5. resolve_listing：\n \t \a \f → br/tab/换段/分页。
     let dst = resolve_listing(&dst);
+    if dst.len() > MAX_RENDERED_XML_BYTES {
+        return Err(RenderError::Limit {
+            part: MAIN_PART.to_string(),
+            kind: "rendered_xml_bytes",
+            max: MAX_RENDERED_XML_BYTES as u64,
+        });
+    }
 
     // 6. 宽松(recover)解析愈合（安全限额仍强制）。
     let outcome =
@@ -130,6 +162,7 @@ pub fn render_document_xml(
 /// `Undefined`），autoescape 仅在显式开启时生效（HTML 规则转义）。
 pub(crate) fn build_jinja_env(autoescape: bool) -> Environment<'static> {
     let mut env = Environment::new();
+    env.set_fuel(Some(MAX_TEMPLATE_FUEL));
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
     if autoescape {
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
@@ -144,8 +177,40 @@ pub(crate) fn render_inline(
     context: &JsonValue,
     part: &'static str,
 ) -> Result<String, RenderError> {
-    env.render_str(template_src, minijinja::Value::from_serialize(context))
-        .map_err(|e| map_jinja_error(&e, template_src, part))
+    let template = env
+        .template_from_str(template_src)
+        .map_err(|e| map_jinja_error(&e, template_src, part))?;
+    let mut output = LimitedOutput {
+        bytes: Vec::new(),
+        max: MAX_RENDERED_XML_BYTES,
+        exceeded: false,
+    };
+    let rendered =
+        template.render_captured_to(minijinja::Value::from_serialize(context), &mut output);
+    if output.exceeded {
+        return Err(RenderError::Limit {
+            part: part.to_string(),
+            kind: "rendered_xml_bytes",
+            max: MAX_RENDERED_XML_BYTES as u64,
+        });
+    }
+    if let Err(e) = rendered {
+        if e.kind() == ErrorKind::OutOfFuel {
+            return Err(RenderError::Limit {
+                part: part.to_string(),
+                kind: "template_fuel",
+                max: env.fuel().unwrap_or(MAX_TEMPLATE_FUEL),
+            });
+        }
+        return Err(map_jinja_error(&e, template_src, part));
+    }
+    String::from_utf8(output.bytes).map_err(|e| RenderError::Template {
+        kind: TemplateErrorKind::Other,
+        part: part.to_string(),
+        line: None,
+        message: e.to_string(),
+        context: Vec::new(),
+    })
 }
 
 /// 把 MiniJinja 错误映射为稳定的 [`RenderError`]，附带对齐上游 docx_context
@@ -175,5 +240,47 @@ fn map_jinja_error(err: &minijinja::Error, prepared: &str, part: &str) -> Render
         line: err.line(),
         message: err.to_string(),
         context,
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn output_writer_stops_before_exceeding_limit() {
+        let mut output = LimitedOutput {
+            bytes: Vec::new(),
+            max: 4,
+            exceeded: false,
+        };
+        output.write_all(b"abcd").unwrap();
+        assert!(output.write_all(b"e").is_err());
+        assert!(output.exceeded);
+        assert_eq!(output.bytes, b"abcd");
+    }
+
+    #[test]
+    fn looping_template_exhausts_fuel() {
+        let mut env = build_jinja_env(false);
+        env.set_fuel(Some(100));
+        let error = render_inline(
+            &env,
+            "{% for i in range(1000) %}x{% endfor %}",
+            &json!({}),
+            MAIN_PART,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RenderError::Limit {
+                    kind: "template_fuel",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }

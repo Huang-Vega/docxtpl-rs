@@ -9,7 +9,7 @@ license.workspace = true
 [dependencies]
 docxtpl-compat = { path = "../docxtpl-compat" }
 docxtpl-xml = { path = "../docxtpl-xml" }
-minijinja = "2"
+minijinja = { version = "2", features = ["fuel"] }
 regex = "1"
 serde_json = "1"
 thiserror = "2"

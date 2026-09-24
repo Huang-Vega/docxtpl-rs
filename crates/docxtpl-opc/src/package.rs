@@ -254,7 +254,7 @@ impl Package {
     /// ```no_run
     /// # use docxtpl_opc::{Package, PackageLimits};
     /// let pkg = Package::open("template.docx", &PackageLimits::default())?;
-    /// assert_eq!(pkg.limits().max_entries, 10_000);
+    /// assert_eq!(pkg.limits().max_entries, 1_000);
     /// # Ok::<(), docxtpl_opc::OpcError>(())
     /// ```
     pub fn limits(&self) -> &PackageLimits {
