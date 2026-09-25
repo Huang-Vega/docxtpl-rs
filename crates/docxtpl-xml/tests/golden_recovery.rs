@@ -59,7 +59,10 @@ fn golden_recovery_all_pairs() {
         checked += 1;
     }
 
-    assert_eq!(checked, 48, "golden fixture 对数应为 48");
+    assert_eq!(
+        checked, 64,
+        "golden fixture 对数应为 64（48 P2/P3 + 16 P4）"
+    );
     assert!(
         failures.is_empty(),
         "以下 fixture 树结构不一致:\n{}",

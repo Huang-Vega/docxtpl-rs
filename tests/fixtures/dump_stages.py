@@ -12,8 +12,11 @@
   tests/fixtures/stages/<id>.recovered.xml
       = etree.fromstring(pre_recover, XMLParser(recover=True)) 再 tostring 的结果
         —— 精确钉死 docxtpl-xml 宽松(recover)解析器。
-error 预期的 fixture（r2_syntax_error）只导出 full/body patched。
+error 预期的 fixture（r2_syntax_error、p4_img_bad）只导出 full/body patched。
+context_kind=python 的 fixture 通过 build_context(tpl) 构建类型化上下文
+（RichText/Listing/InlineImage 等，见 P4）。
 """
+import importlib.util
 import json
 import os
 import sys
@@ -33,6 +36,20 @@ def write(name, text):
         text = text.decode("utf-8")
     with open(os.path.join(OUT_DIR, name), "w", encoding="utf-8", newline="") as fh:
         fh.write(text)
+
+
+def load_context(fx, tpl):
+    if not fx.get("context"):
+        return {}
+    ctx_path = os.path.join(ROOT, fx["context"].replace("/", os.sep))
+    if fx.get("context_kind") == "python":
+        spec = importlib.util.spec_from_file_location(
+            "docxtplrs_stage_ctx_" + fx["id"], ctx_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.build_context(tpl)
+    with open(ctx_path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def main():
@@ -62,9 +79,7 @@ def main():
 
         ctx_rel = fx.get("context")
         if ctx_rel:
-            ctx_path = os.path.join(ROOT, ctx_rel.replace("/", os.sep))
-            with open(ctx_path, encoding="utf-8") as fh:
-                ctx = json.load(fh)
+            ctx = load_context(fx, real)
         else:
             ctx = {}
 

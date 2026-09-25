@@ -1,0 +1,11 @@
+[package]
+name = "docxtpl-rich"
+description = "P4 富内容值库：RichText/RichTextParagraph/Listing/InlineImage 与图片头解析，字节级对齐 docxtpl 0.20.2 与 python-docx 1.2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha1 = "0.10"
+thiserror = "2"

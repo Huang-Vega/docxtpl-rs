@@ -6,6 +6,7 @@ members = [
     "crates/docxtpl-xml",
     "crates/docxtpl-template",
     "crates/docxtpl-compat",
+    "crates/docxtpl-rich",
     "crates/docxtpl-cli",
 ]
 

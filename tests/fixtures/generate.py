@@ -45,6 +45,7 @@ from docx.shared import Inches, Pt, RGBColor
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
 CONTEXTS_DIR = SCRIPT_DIR / "contexts"
+MEDIA_DIR = SCRIPT_DIR / "media"
 MANIFEST_PATH = SCRIPT_DIR / "manifest.json"
 
 UPSTREAM = {"docxtpl": "0.20.2", "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd"}
@@ -52,6 +53,7 @@ UPSTREAM = {"docxtpl": "0.20.2", "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6c
 # Fixture ids whose measured upstream outcome is "error" (all others are "ok").
 EXPECTED_OVERRIDES = {
     "r2_syntax_error": "error",
+    "p4_img_bad": "error",
 }
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -63,11 +65,13 @@ REL_FOOTNOTES = "http://schemas.openxmlformats.org/officeDocument/2006/relations
 FIXTURES = []
 
 
-def fixture(fid, feature, phase, mode, context=None, post=None):
+def fixture(fid, feature, phase, mode, context=None, post=None,
+            context_kind="json", context_src=None):
     def deco(build):
         FIXTURES.append({
             "id": fid, "feature": feature, "phase": phase, "mode": mode,
             "context": context, "post": post, "build": build,
+            "context_kind": context_kind, "context_src": context_src,
         })
         return build
     return deco
@@ -840,14 +844,360 @@ def r3_combo_invoice(doc):
 
 
 # ===========================================================================
+# P4 -- media samples (hand-built, deterministic; MEDIA_DIR is script-owned)
+# ===========================================================================
+
+def _png_chunk(ctype, data):
+    blob = ctype + data
+    return (struct.pack(">I", len(data)) + blob
+            + struct.pack(">I", zlib.crc32(blob) & 0xFFFFFFFF))
+
+
+def make_png(w, h, px_per_unit=None):
+    """RGB PNG；px_per_unit 为 pHYs 像素/米（None 则省略 pHYs，dpi=72）。"""
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x00\x7f\xff" * w for _ in range(h))
+    out = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+    if px_per_unit is not None:
+        out += _png_chunk(b"pHYs", struct.pack(">IIB", px_per_unit, px_per_unit, 1))
+    out += _png_chunk(b"IDAT", zlib.compress(raw))
+    return out + _png_chunk(b"IEND", b"")
+
+
+def make_jpeg(w, h, dpi):
+    """最小 JFIF（APP0 dpi + SOF0），不被解码，仅头有效。
+
+    JFIF 段布局：marker(FF E0) + len + 'JFIF\\0' + ver(01 02) + units + x/y + 缩略图尺寸。
+    units=1 表示英寸（python-docx 依此把 density 当 dpi；0 会退化成 72dpi）。
+    """
+    jpg = b"\xff\xd8"
+    jpg += (b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x02\x01"
+            + struct.pack(">HH", dpi, dpi) + b"\x00\x00")
+    jpg += (b"\xff\xc0" + struct.pack(">H", 17) + b"\x08"
+            + struct.pack(">HH", h, w) + b"\x03" + b"\x01\x11\x00" * 3)
+    return jpg + b"\xff\xd9"
+
+
+def make_bmp(w, h, px_per_m):
+    """24bpp BITMAPINFOHEADER BMP（bottom-up，行 4 字节对齐）。"""
+    row = ((w * 3 + 3) // 4) * 4
+    pix = b"\x00" * (row * h)
+    dib = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(pix),
+                      px_per_m, px_per_m, 0, 0)
+    off = 14 + 40
+    fh = struct.pack("<2sIHHI", b"BM", off + len(pix), 0, 0, off)
+    return fh + dib + pix
+
+
+def make_gif(w, h):
+    """GIF87a（2 色全局色表，LZW 数据仅头有效，不被解码）。"""
+    return (b"GIF87a" + struct.pack("<HHBBB", w, h, 0x80, 0, 0)
+            + b"\x00\x00\x00\xff\xff\xff"
+            + b"," + struct.pack("<HHHHB", 0, 0, w, h, 0)
+            + b"\x02\x02\x2c\x01;"
+            )
+
+
+def make_tiff(w, h, res_num, unit=2):
+    """小端 TIFF：IFD0 含尺寸与 RATIONAL 分辨率（值区在 IFD 之后）。"""
+    res_off = 8 + 2 + 12 * 5 + 4
+    entries = [
+        (256, 4, 1, w),           # ImageWidth LONG
+        (257, 4, 1, h),           # ImageLength LONG
+        (282, 5, 1, res_off),     # XResolution RATIONAL
+        (283, 5, 1, res_off),     # YResolution RATIONAL
+        (296, 3, 1, unit),        # ResolutionUnit SHORT（值内联）
+    ]
+    ifd = b"".join(struct.pack("<HHII", t, ty, c, v) for t, ty, c, v in entries)
+    return (b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", len(entries))
+            + ifd + struct.pack("<I", 0) + struct.pack("<II", res_num, 1))
+
+
+MEDIA_FILES = {
+    # 2x1 PNG，无 pHYs -> 72dpi -> EMU 25400x12700
+    "p4_dot2x1.png": lambda: make_png(2, 1),
+    # 4x1 PNG，pHYs 5906 px/m -> int(round(5906*0.0254))=150dpi -> 24384x6096
+    "p4_wide4x1.png": lambda: make_png(4, 1, px_per_unit=5906),
+    # 4x2 JFIF，300dpi -> native EMU 12192x6096
+    "p4_rect4x2.jpg": lambda: make_jpeg(4, 2, 300),
+    # 4x2 BMP，2835 px/m -> round(71.889)=72dpi
+    "p4_brick4x2.bmp": lambda: make_bmp(4, 2, 2835),
+    "p4_arrow4x2.gif": lambda: make_gif(4, 2),
+    # 4x2 TIFF，150/1 dpi，unit=2(英寸)
+    "p4_tile4x2.tiff": lambda: make_tiff(4, 2, 150),
+    # 非图片：用于 UnrecognizedImageError
+    "p4_bad.png": lambda: b"this is not an image at all\n",
+}
+
+
+# ===========================================================================
+# P4 -- render fixtures (mode=render, typed context via build_context(tpl))
+# ===========================================================================
+
+_CTX_HEADER = '''\
+# -*- coding: utf-8 -*-
+"""P4 fixture context（由 tests/fixtures/generate.py 生成，勿手改）。
+
+提供 build_context(tpl)：返回渲染上下文，可包含 RichText/RichTextParagraph/
+Listing/InlineImage 等类型化值（对齐上游 docxtpl 0.20.2 用法）。
+"""
+import os
+
+from docx.shared import Mm
+from docxtpl import InlineImage, Listing, RichText, RichTextParagraph
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _img(name):
+    return os.path.join(_HERE, os.pardir, "media", name)
+
+'''
+
+
+# 70
+@fixture("p4_rt_basic", "render: RichText props + concat + empty", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    rt = RichText("中文<b>粗", bold=True, color="#FF0000", size="20")
+    rt.add("斜体", italic=True)
+    rt.add("下划线", underline=True)
+    rt.add("删除线", strike=True)
+    rt.add("高亮", highlight="#FFFF00")
+    return {"rt": rt, "empty": RichText()}
+''')
+def p4_rt_basic(doc):
+    doc.add_paragraph("A: {{rt}} B: {{empty}}E")
+
+
+# 71
+@fixture("p4_rt_style_font", "render: RichText style/font/sub/sup/lang/rtl", "P4",
+         "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    rt1 = RichText("样式", style="Emphasis")
+    rt1.add("区域字体", font="eastAsia:SimSun")
+    rt2 = RichText("上标", superscript=True, lang="zh-CN")
+    rt3 = RichText("RTL", bold=True, rtl=True)
+    rt3.add("下标", subscript=True)
+    return {"rt1": rt1, "rt2": rt2, "rt3": rt3}
+''')
+def p4_rt_style_font(doc):
+    doc.add_paragraph("X{{rt1}}Y{{rt2}}Z{{rt3}}")
+
+
+# 72
+@fixture("p4_rt_url", "render: RichText hyperlink via url_id", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    url_id = tpl.build_url_id("https://docxtpl.readthedocs.io/")
+    return {"rt": RichText("链接文本", url_id=url_id, color="0563C1",
+                           underline="single")}
+''')
+def p4_rt_url(doc):
+    doc.add_paragraph("L: {{rt}} R")
+
+
+# 73
+@fixture("p4_rt_in_table", "render: RichText inside table cell", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"rt": RichText("单元格", bold=True, size="18")}
+''')
+def p4_rt_in_table(doc):
+    t = doc.add_table(rows=2, cols=2)
+    fill_row(t, 0, ["H1", "H2"])
+    fill_row(t, 1, ["{{rt}}", "plain"])
+
+
+# 74
+@fixture("p4_rtp_basic", "render: RichTextParagraph with parastyle", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    rp = RichTextParagraph("首段", parastyle="ListBullet")
+    rp.add(RichText("次段粗体", bold=True), parastyle=None)
+    return {"rp": rp}
+''')
+def p4_rtp_basic(doc):
+    doc.add_paragraph("BEFORE")
+    doc.add_paragraph("{{rp}}")
+    doc.add_paragraph("AFTER")
+
+
+# 75
+@fixture("p4_listing_basic", "render: Listing with nl/tab/bell/ff", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"lst": Listing("L1\\nL2\\tT3\\aP4\\fPAGE")}
+''')
+def p4_listing_basic(doc):
+    doc.add_paragraph("V: {{lst}} W")
+
+
+# 76
+@fixture("p4_listing_after_rt", "render: Listing after RichText (resolve_listing escape)",
+         "P4", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"rt": RichText("前"), "lst": Listing("X\\nY")}
+''')
+def p4_listing_after_rt(doc):
+    doc.add_paragraph("A{{rt}}B{{lst}}C")
+
+
+# 77
+@fixture("p4_img_png", "render: InlineImage png native size", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"img": InlineImage(tpl, _img("p4_dot2x1.png"))}
+''')
+def p4_img_png(doc):
+    doc.add_paragraph("P:{{ img }}Q")
+
+
+# 78
+@fixture("p4_img_scale_w", "render: InlineImage width only (keep ratio)", "P4",
+         "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"img": InlineImage(tpl, _img("p4_wide4x1.png"), width=Mm(20))}
+''')
+def p4_img_scale_w(doc):
+    doc.add_paragraph("W:{{ img }}")
+
+
+# 79
+@fixture("p4_img_wh", "render: InlineImage explicit width+height (no constraint)",
+         "P4", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"img": InlineImage(tpl, _img("p4_rect4x2.jpg"),
+                               width=Mm(10), height=Mm(3))}
+''')
+def p4_img_wh(doc):
+    doc.add_paragraph("S:{{ img }}")
+
+
+# 80
+@fixture("p4_img_dup", "render: same image twice (sha1 dedup, same rId)", "P4",
+         "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"i1": InlineImage(tpl, _img("p4_dot2x1.png")),
+            "i2": InlineImage(tpl, _img("p4_dot2x1.png"))}
+''')
+def p4_img_dup(doc):
+    doc.add_paragraph("A{{i1}}B{{i2}}C")
+
+
+# 81
+@fixture("p4_img_two", "render: two different images", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"i1": InlineImage(tpl, _img("p4_dot2x1.png")),
+            "i2": InlineImage(tpl, _img("p4_rect4x2.jpg"))}
+''')
+def p4_img_two(doc):
+    doc.add_paragraph("A{{i1}}B{{i2}}C")
+
+
+# 82
+@fixture("p4_img_anchor", "render: InlineImage with hyperlink anchor", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"img": InlineImage(tpl, _img("p4_dot2x1.png"),
+                               anchor="https://example.com/")}
+''')
+def p4_img_anchor(doc):
+    doc.add_paragraph("A:{{ img }}")
+
+
+# 83
+@fixture("p4_img_formats", "render: bmp/gif/tiff + template drawing (shape_id=2)",
+         "P4", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"bmp": InlineImage(tpl, _img("p4_brick4x2.bmp")),
+            "gif": InlineImage(tpl, _img("p4_arrow4x2.gif")),
+            "tif": InlineImage(tpl, _img("p4_tile4x2.tiff"))}
+''')
+def p4_img_formats(doc):
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+    doc.add_paragraph("B{{bmp}}G{{gif}}T{{tif}}")
+
+
+# 84
+@fixture("p4_img_in_table", "render: images in table row loop", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    img = InlineImage(tpl, _img("p4_dot2x1.png"))
+    return {"rows": [{"n": "r1", "img": img}, {"n": "r2", "img": img}]}
+''')
+def p4_img_in_table(doc):
+    t = doc.add_table(rows=4, cols=2)
+    fill_row(t, 0, ["Name", "Pic"])
+    t.cell(1, 0).text = "{%tr for r in rows %}"
+    fill_row(t, 2, ["{{r.n}}", "{{r.img}}"])
+    t.cell(3, 0).text = "{%tr endfor %}"
+
+
+# 85
+@fixture("p4_img_bad", "render: unrecognized image error", "P4", "render",
+         context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"img": InlineImage(tpl, _img("p4_bad.png"))}
+''')
+def p4_img_bad(doc):
+    doc.add_paragraph("E:{{ img }}")
+
+
+# 86
+@fixture("p4_combo_rich", "render: RichText + Listing + image + row loop combo",
+         "P4", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    title = RichText("INV-2026-001", bold=True, color="1F4E79", size="24")
+    rows = [
+        {"name": RichText("Alpha", bold=True), "qty": 1,
+         "img": InlineImage(tpl, _img("p4_dot2x1.png"))},
+        {"name": RichText("Beta", italic=True), "qty": 2,
+         "img": InlineImage(tpl, _img("p4_dot2x1.png"))},
+    ]
+    return {"title": title, "rows": rows,
+            "notes": Listing("first line\\nsecond line\\tlast")}
+''')
+def p4_combo_rich(doc):
+    doc.add_paragraph("Title: {{title}}")
+    t = doc.add_table(rows=4, cols=3)
+    fill_row(t, 0, ["Item", "Qty", "Pic"])
+    t.cell(1, 0).text = "{%tr for r in rows %}"
+    fill_row(t, 2, ["{{r.name}}", "{{r.qty}}", "{{r.img}}"])
+    t.cell(3, 0).text = "{%tr endfor %}"
+    doc.add_paragraph("N: {{notes}}")
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
 def main():
-    for directory in (TEMPLATES_DIR, CONTEXTS_DIR):
+    for directory in (TEMPLATES_DIR, CONTEXTS_DIR, MEDIA_DIR):
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
+
+    for name, make in sorted(MEDIA_FILES.items()):
+        (MEDIA_DIR / name).write_bytes(make())
 
     records = []
     for fx in FIXTURES:
@@ -860,11 +1210,17 @@ def main():
 
         context_field = None
         if fx["mode"] == "render":
-            context_path = CONTEXTS_DIR / (fx["id"] + ".json")
-            context_path.write_text(
-                json.dumps(fx["context"], indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8")
-            context_field = "contexts/%s.json" % fx["id"]
+            if fx["context_kind"] == "python":
+                context_path = CONTEXTS_DIR / (fx["id"] + ".py")
+                context_path.write_text(_CTX_HEADER + fx["context_src"].lstrip("\n"),
+                                        encoding="utf-8")
+                context_field = "contexts/%s.py" % fx["id"]
+            else:
+                context_path = CONTEXTS_DIR / (fx["id"] + ".json")
+                context_path.write_text(
+                    json.dumps(fx["context"], indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+                context_field = "contexts/%s.json" % fx["id"]
 
         records.append({
             "id": fx["id"],
@@ -873,6 +1229,7 @@ def main():
             "mode": fx["mode"],
             "template": "templates/%s.docx" % fx["id"],
             "context": context_field,
+            "context_kind": fx["context_kind"],
             "expected": EXPECTED_OVERRIDES.get(fx["id"], "ok"),
             "allowed_normalizations": [],
             "known_deviations": [],

@@ -1,4 +1,4 @@
-﻿//! OPC 包：打开（限额）、关系/Content Types 索引、校验与写回。
+//! OPC 包：打开（限额）、关系/Content Types 索引、校验与写回。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -358,6 +358,45 @@ impl Package {
             }
         }
         self.parts[index].replace_bytes(bytes);
+        Ok(())
+    }
+
+    /// 追加一个新 part（如渲染注入的 `word/media/imageN.*`）。
+    ///
+    /// 新 part 以 Deflate 压缩、默认 ZIP 时间戳写出（对齐 python-docx
+    /// `PackageWriter` 新增图片 part 的写出方式）；条目尾插在 parts 末尾。
+    ///
+    /// # 失败情况
+    ///
+    /// - [`OpcError::InvalidUri`]：条目名非法
+    /// - [`OpcError::DuplicateEntry`]：条目名已存在（精确匹配；新增路径由
+    ///   调用方按 image 编号分配，构造场景下不会出现 case/percent 变体）
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// # use docxtpl_opc::{Package, PackageLimits};
+    /// let mut pkg = Package::open("template.docx", &PackageLimits::default())?;
+    /// pkg.add_part("word/media/image1.png", b"\x89PNG".to_vec())?;
+    /// assert!(pkg.contains("word/media/image1.png"));
+    /// # Ok::<(), docxtpl_opc::OpcError>(())
+    /// ```
+    pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), OpcError> {
+        let uri = PartUri::new(name)?;
+        if self.index.contains_key(name) {
+            return Err(OpcError::DuplicateEntry {
+                uri: name.to_string(),
+                scope: "exact",
+            });
+        }
+        self.index.insert(name.to_string(), self.parts.len());
+        self.parts.push(Part::new(
+            uri,
+            bytes,
+            false,
+            CompressionMethod::Deflated,
+            None,
+        ));
         Ok(())
     }
 

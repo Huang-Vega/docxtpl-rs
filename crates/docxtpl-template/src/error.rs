@@ -10,6 +10,9 @@ pub enum TemplateErrorKind {
     Syntax,
     /// 变量/属性未定义（strict undefined 下）。
     Undefined,
+    /// 图片字节无法识别（对齐 docxtpl `UnrecognizedImageError`，
+    /// 由 InlineImage 的 probe/尺寸换算失败触发）。
+    Image,
     /// 其他模板执行错误。
     Other,
 }
@@ -21,6 +24,7 @@ impl TemplateErrorKind {
         match self {
             TemplateErrorKind::Syntax => "TemplateSyntaxError",
             TemplateErrorKind::Undefined => "UndefinedError",
+            TemplateErrorKind::Image => "UnrecognizedImageError",
             TemplateErrorKind::Other => "TemplateError",
         }
     }

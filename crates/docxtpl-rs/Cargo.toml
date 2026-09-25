@@ -13,7 +13,9 @@ oracle = []
 [dependencies]
 docxtpl-compat = { path = "../docxtpl-compat" }
 docxtpl-opc = { path = "../docxtpl-opc" }
+docxtpl-rich = { path = "../docxtpl-rich" }
 docxtpl-template = { path = "../docxtpl-template" }
 docxtpl-xml = { path = "../docxtpl-xml" }
 serde_json = "1"
+sha1 = "0.10"
 thiserror = "2"

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 docxtpl-compat = { path = "../docxtpl-compat" }
+docxtpl-rich = { path = "../docxtpl-rich" }
 docxtpl-xml = { path = "../docxtpl-xml" }
 minijinja = { version = "2", features = ["fuel"] }
 regex = "1"

@@ -12,11 +12,15 @@
 //! 7. [`fix_tables::fix_tables`] 与 [`fix_tables::fix_docpr_ids`]；
 //! 8. lxml 风格序列化。
 
+mod context;
 mod core_props;
 mod error;
 mod fix_tables;
 mod render;
 
-pub use core_props::render_core_properties;
+pub use context::{
+    ImageRegistry, ImageRels, ImageResolveError, NullRegistry, RenderContext, RenderValue,
+};
+pub use core_props::{render_core_properties, render_core_properties_ctx};
 pub use error::{RenderError, TemplateErrorKind};
-pub use render::{render_document_xml, RenderOptions, RenderOutcome};
+pub use render::{render_document_xml, render_document_xml_ctx, RenderOptions, RenderOutcome};

@@ -20,6 +20,7 @@ Always exits 0 when fixtures were run (exits 1 only for a bad --only id).
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from datetime import datetime
@@ -36,6 +37,20 @@ EXPECTED_DIR = SCRIPT_DIR / "expected"
 MANIFEST_PATH = FIXTURES_DIR / "manifest.json"
 
 
+def load_context(fx, tpl):
+    """按 context_kind 构建渲染上下文：json 或 python(build_context)。"""
+    if not fx.get("context"):
+        return {}
+    path = FIXTURES_DIR / fx["context"]
+    if fx.get("context_kind") == "python":
+        spec = importlib.util.spec_from_file_location(
+            "docxtplrs_ctx_" + fx["id"], path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.build_context(tpl)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def run_fixture(fx):
     template_path = FIXTURES_DIR / fx["template"]
     out_path = EXPECTED_DIR / (fx["id"] + ".docx")
@@ -48,11 +63,8 @@ def run_fixture(fx):
     }
     try:
         if fx["mode"] == "render":
-            context = {}
-            if fx.get("context"):
-                context = json.loads(
-                    (FIXTURES_DIR / fx["context"]).read_text(encoding="utf-8"))
             tpl = DocxTemplate(str(template_path))
+            context = load_context(fx, tpl)
             tpl.render(context)
             tpl.save(str(out_path))
         else:

@@ -66,4 +66,4 @@ pub use crate::limits::PackageLimits;
 pub use crate::package::Package;
 pub use crate::part::Part;
 pub use crate::rels::{Relationship, Relationships, TargetMode};
-pub use crate::uri::PartUri;
+pub use crate::uri::{relationships_path_of, resolve_part_target, PartUri};

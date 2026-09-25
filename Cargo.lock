@@ -376,14 +376,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "docxtpl-rich"
+version = "0.1.0-alpha"
+dependencies = [
+ "sha1",
+ "thiserror",
+]
+
+[[package]]
 name = "docxtpl-rs"
 version = "0.1.0-alpha"
 dependencies = [
  "docxtpl-compat",
  "docxtpl-opc",
+ "docxtpl-rich",
  "docxtpl-template",
  "docxtpl-xml",
  "serde_json",
+ "sha1",
  "thiserror",
 ]
 
@@ -392,6 +402,7 @@ name = "docxtpl-template"
 version = "0.1.0-alpha"
 dependencies = [
  "docxtpl-compat",
+ "docxtpl-rich",
  "docxtpl-xml",
  "minijinja",
  "regex",

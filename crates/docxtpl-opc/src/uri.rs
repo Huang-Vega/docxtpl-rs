@@ -105,6 +105,41 @@ impl PartUri {
     }
 }
 
+/// 解析内部关系目标为包内 part URI（公开入口）。
+///
+/// - `base` 为 owner part **所在目录**（[`PartUri::parent`] 的结果），
+///   `None` 表示包根（根 rels 的场景）；
+/// - 目标以 `/` 开头时为包内绝对路径，忽略 `base`；
+/// - 逃出包根、空目标或非法 URI 返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use docxtpl_opc::{PartUri, resolve_part_target};
+/// let doc = PartUri::new("word/document.xml")?;
+/// let base = doc.parent();
+/// assert_eq!(
+///     resolve_part_target(base.as_ref(), "media/image1.png").unwrap().as_str(),
+///     "word/media/image1.png"
+/// );
+/// assert_eq!(
+///     resolve_part_target(None, "word/document.xml").unwrap().as_str(),
+///     "word/document.xml"
+/// );
+/// # Ok::<(), docxtpl_opc::OpcError>(())
+/// ```
+#[must_use]
+pub fn resolve_part_target(base: Option<&PartUri>, target: &str) -> Option<PartUri> {
+    resolve_relative_to(base, target)
+}
+
+/// part 的关系文件路径（公开入口）：
+/// `word/document.xml` → `word/_rels/document.xml.rels`。
+#[must_use]
+pub fn relationships_path_of(part: &PartUri) -> String {
+    rels_path_for(part)
+}
+
 /// 校验 ZIP 条目名是否为合法 part URI（规则见 [`PartUri`] 类型级文档）。
 pub(crate) fn validate_part_uri(name: &str) -> Result<(), OpcError> {
     let invalid = |reason: &str| OpcError::InvalidUri {

@@ -67,9 +67,25 @@
 | render_properties 核心属性（6 字符串属性 Jinja 渲染，缺省 dc:identifier/dc:language 元素补齐） | compatible 目标（随每次 render 无条件执行） | 全部 48 个成功 fixture 逐字节覆盖 |
 | 渲染错误（语法等）错误类别对齐 | compatible 目标 | r2_syntax_error |
 
-### P4–P6（规划，非 MVP）
+### P4（RichText 与图片，0.1.0-alpha 增量，ADR-005）
 
-RichText / RichTextParagraph、Listing 对象、InlineImage、图片与 media、
+| 功能 | 级别 | fixture 类别 |
+|---|---|---|
+| RichText run 属性（bold/italic/u/strike/color/size/highlight/style/font 区域语法/sup/sub/rtl/lang）与多 run 拼接、空值语义 | compatible 目标 | p4_rt_basic / p4_rt_style_font / p4_rt_in_table |
+| RichText 外部超链接（`tpl.build_url_id` 预登记 external rel → `w:hyperlink r:id`） | compatible 目标 | p4_rt_url |
+| RichTextParagraph（parastyle 有/无、富文本入段、空段） | compatible 目标 | p4_rtp_basic |
+| Listing（`\n \t \a \f` 经 resolve_listing 展开；与 RichText 混排） | compatible 目标 | p4_listing_basic / p4_listing_after_rt / p4_combo_rich |
+| InlineImage 原生尺寸（png/jpg/bmp/gif/tiff 头解析、EMU 换算） | compatible 目标 | p4_img_png / p4_img_wh / p4_img_formats |
+| InlineImage 单边缩放（纵横比银行家舍入） | compatible 目标 | p4_img_scale_w |
+| 图片 sha1 去重（同字节复用 part 与 rId） | compatible 目标 | p4_img_dup / p4_img_in_table / p4_combo_rich |
+| 多张不同图片（imageN 编号/rId 空洞回填） | compatible 目标 | p4_img_two / p4_img_formats |
+| 图片超链接锚点（图片 rId 先于 anchor external rId） | compatible 目标 | p4_img_anchor |
+| 表格行循环内图片（同一值多次解析幂等） | compatible 目标 | p4_img_in_table |
+| media part 注入 + document rels 与 [Content_Types].xml 的 python-docx 风格重建 | compatible 目标（逐字节，DEV-0003 不触发） | 全部含图 p4 fixture |
+| 坏图片错误类别对齐（UnrecognizedImageError，probe 先于任何 part/rId 分配） | compatible 目标 | p4_img_bad |
+
+### P5–P6（规划）
+
 header/footer 渲染、footnotes 渲染、subdoc 合并。
 
 ### unsupported（明确拒绝）
@@ -86,11 +102,13 @@ header/footer 渲染、footnotes 渲染、subdoc 合并。
 | DEV-0002 | libxml2 recover 的长尾行为仅以 corpus 钉死为限；未钉死输入按保守策略处理并记录诊断 | ADR-002 |
 | DEV-0003 | ZIP 时间戳/条目顺序、`[Content_Types].xml` 与 rels 的**条目顺序**视为非语义差异，由 canonicalization 归一化 | 规划文档 §9.5 |
 | DEV-0004 | 不复制 python-docx 的包重写行为：未修改 part 尽量原样保留字节（优于上游，语义等价经 c14n 证明） | ADR-002 |
+| DEV-0005 | `autoescape=True` 下富内容值（RichText/Listing/InlineImage）的转义口径未与上游对齐：上游经 `__html__` 仍原样注入 XML，本侧 MiniJinja 可能按 HTML 规则转义。P4 全部 fixture 固定 `autoescape=False`，该路径不在 oracle 覆盖内；需开启 autoescape 又渲染富值时不要依赖当前行为 | ADR-005 |
 
 ## 6. fixture 基线
 
-见 `tests/fixtures/manifest.json`（P0 生成：20 个往返 + 49 个渲染用例，全部标注
-id/feature/phase/mode/expected/允许归一化/owner）。差分实测结果见 §7。
+见 `tests/fixtures/manifest.json`（P0：20 个往返 + 48 个 P2/P3 渲染用例；
+P4 增量：17 个 `p4_*` 渲染用例，共 65 个 render；全部标注
+id/feature/phase/mode/context_kind/expected/owner）。差分实测结果见 §7。
 
 ## 7. 差分结果（0.1.0-alpha 实测）
 
@@ -107,15 +125,22 @@ exclusive C14N sha256 一致（docProps/core.xml 时间戳归一化）。
 | r2_* 渲染（变量/过滤器/undefined/if/for/trim/注释/拆分/字面转义/特殊字符值/listing/智能引号/实体/空循环） | 26 | 26 MATCH |
 | r2_syntax_error（jinja2 TemplateSyntaxError） | 1 | 错误类别一致（Syntax） |
 | r3_* 渲染（p/tr/tc/r 结构标签、嵌套表、colspan/cellbg/vm/hm、fix_add/remove、docpr、combo） | 22 | 22 MATCH |
+| p4_rt_* / p4_rtp_* 渲染（RichText 全属性/超链接、RichTextParagraph、表格单元格富文本） | 5 | 5 MATCH |
+| p4_listing_* 渲染（Listing 控制符与富文本混排） | 2 | 2 MATCH |
+| p4_img_* 渲染（png/jpg/bmp/gif/tiff、缩放、sha1 去重、多图、锚点、行循环、格式扩展） | 8 | 8 MATCH |
+| p4_combo_rich（RichText + Listing + 图片 + 行循环组合） | 1 | 1 MATCH |
+| p4_img_bad（UnrecognizedImageError） | 1 | 错误类别一致（Image） |
 | rt_* 真实 docx OPC 往返（docxtpl-opc fixture_roundtrip） | 20 | 20 逐 part 字节一致 |
-| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 49 | 49 字节一致 |
-| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 48 | 48 一致 |
-| **合计** | **166 项断言/用例** | **全部通过，无偏差、无未支持** |
+| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 66 | 66 字节一致 |
+| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 64 | 64 一致 |
+| **合计** | **216 项断言/用例** | **全部通过，无偏差、无未支持** |
 
-结论：0.1.0-alpha 范围内（§4 P2/P3 矩阵 + render_properties）与 Python
+结论：0.1.0-alpha 范围内（§4 P2/P3/P4 矩阵 + render_properties）与 Python
 oracle **逐字节等价**（DEV-0003 的条目顺序/时间戳归一化未被触发：实际输出连
-原始 part 字节都已一致）。错误用例的稳定类别（`TemplateErrorKind::Syntax`）
-对齐 jinja2 异常分类。
+原始 part 字节都已一致——含 P4 新增的 media part、document rels 与
+[Content_Types].xml 重建）。错误用例的稳定类别（`TemplateErrorKind::Syntax`
+/ `TemplateErrorKind::Image`）对齐上游异常分类。
 
-已知边界（不属本阶段验收项）：P4–P6 功能未实现；DEV-0002 的 libxml2 recover
-长尾仅以 corpus 与探针规则钉死；corpus 之外的输入不承诺字节等价。
+已知边界（不属本阶段验收项）：P5–P6 功能未实现；DEV-0002 的 libxml2 recover
+长尾仅以 corpus 与探针规则钉死；DEV-0005 的 autoescape + 富值路径不在
+oracle 覆盖内；corpus 之外的输入不承诺字节等价。

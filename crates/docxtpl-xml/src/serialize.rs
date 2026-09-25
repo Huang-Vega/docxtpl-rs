@@ -56,6 +56,15 @@ fn serialize_element(doc: &XmlDocument, id: NodeId, out: &mut String) {
         out.push_str(local);
     }
     for (prefix, uri) in &node.nsdecls {
+        // lxml 语义：祖先轴上已有同前缀同 URI 的绑定时，本元素输出省略
+        // 该声明（冗余裁剪，见 ADR-005 §2）；其余声明保持原有顺序。
+        let parent = node.parent;
+        if doc
+            .ancestor_ns_binding(parent, prefix)
+            .is_some_and(|u| u == uri)
+        {
+            continue;
+        }
         out.push(' ');
         if prefix.is_empty() {
             out.push_str("xmlns=\"");

@@ -33,6 +33,24 @@ docs/compatibility.md §7）。
 
 ## [Unreleased]
 
+- **P4：RichText / RichTextParagraph / Listing / InlineImage（ADR-005）**。
+  新增 17 个 `p4_*` oracle fixture，差分 16 个逐字节 MATCH + 1 个错误类别
+  一致（UnrecognizedImageError），详见 docs/compatibility.md §4/§7。
+  - 新 crate `docxtpl-rich`：富文本 run（全属性、`html.escape` 五字符
+    转义、空串 falsy 语义）、富文本段落、Listing 转义文本；png/jpeg/gif/
+    bmp/tiff 图片头解析（sha1、像素、dpi、扩展名/content-type）与 EMU 换算
+    （单边缩放银行家舍入）；`wp:inline` XML 与上游 pretty 输出逐字符一致。
+  - docxtpl-template：渲染管线泛化为类型化 `RenderContext`/`RenderValue` +
+    `ImageRegistry` trait；渲染前对原始 document 计算共享 shape_id；
+    新增 `TemplateErrorKind::Image`（oracle 异常 UnrecognizedImageError）。
+  - docxtpl-opc：document rels 与 `[Content_Types].xml` 的 python-docx 风格
+    重建 API（保序尾插、rId/编号空洞回填、Default/Override 排序仅发生在
+    序列化）；新增 part 追加（Deflate）、part 目标相对路径解析。
+  - docxtpl-rs：新门面 API `render_ctx(&RenderContext, ..)` 与一次性
+    `render_session()`/`RenderSession::build_url_id(url)`（对齐上游
+    `tpl.build_url_id`）；图片注入实现全包 DFS 基线收集、sha1 去重、
+    `word/media/imageN.ext` 跨扩展名编号、图片 rId 先于锚点外链；
+    media/rels/CT 变更渲染后一次性落定，未涉及 part 原字节保留。
 - 收紧默认 OPC 限额，并在门面增加 128 MiB 压缩输入、64 MiB 渲染 XML
   及 MiniJinja 10 000 000 fuel 限额；超限返回明确错误。
 - 锁定与 Rust 1.85 兼容的 `time`、`deflate64`；固定 golden XML 的换行字节，

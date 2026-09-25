@@ -9,8 +9,9 @@ use docxtpl_xml::XmlLimits;
 use minijinja::Environment;
 use serde_json::Value as JsonValue;
 
+use crate::context::{ImageRegistry, NullRegistry, RenderContext};
 use crate::error::RenderError;
-use crate::render::{build_jinja_env, render_inline};
+use crate::render::{build_jinja_env, context_to_minijinja, render_inline_value};
 
 /// Dublin Core 元素命名空间（dc:title 等）。
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
@@ -37,6 +38,20 @@ pub fn render_core_properties(
     context: &JsonValue,
     autoescape: bool,
 ) -> Result<String, RenderError> {
+    let ctx = RenderContext::from_json(context);
+    let mut null_registry = NullRegistry;
+    render_core_properties_ctx(src_xml, &ctx, autoescape, &mut null_registry)
+}
+
+/// 富内容版本（P4）：核心属性与主文档共用同一上下文（上游
+/// `render_properties` 即如此）。RichText 的 XML 会原样注入 dc 元素；
+/// 图片值在该 part 无意义但解析幂等（关系仍归属主文档）。
+pub fn render_core_properties_ctx(
+    src_xml: &str,
+    context: &RenderContext,
+    autoescape: bool,
+    registry: &mut dyn ImageRegistry,
+) -> Result<String, RenderError> {
     let mut doc = XmlDocument::parse_strict(src_xml, &XmlLimits::default()).map_err(|e| {
         RenderError::Xml {
             part: CORE_PART.to_string(),
@@ -45,10 +60,12 @@ pub fn render_core_properties(
     })?;
 
     let env: Environment<'static> = build_jinja_env(autoescape);
-    let root = doc.root();
+    // core.xml 不会出现真正的 drawing，shape_id 固定 1 即可。
+    let jinja_root = context_to_minijinja(context, registry, 1, CORE_PART)?;
+    let doc_root = doc.root();
 
     for (_python_name, local) in PROPERTIES {
-        let existing = doc.children(root).iter().copied().find(|&c| {
+        let existing = doc.children(doc_root).iter().copied().find(|&c| {
             doc.tag(c)
                 .is_some_and(|q| q.ns == DC_NS && q.local == local)
         });
@@ -57,7 +74,7 @@ pub fn render_core_properties(
             doc.element_text(id)
                 .map_or_else(String::new, str::to_string)
         });
-        let rendered = render_inline(&env, &initial, context, CORE_PART)?;
+        let rendered = render_inline_value(&env, &initial, jinja_root.clone(), CORE_PART)?;
         let element = match existing {
             Some(id) => id,
             None => {
@@ -68,7 +85,7 @@ pub fn render_core_properties(
                         part: CORE_PART.to_string(),
                         source: e,
                     })?;
-                doc.append_child(root, new_id);
+                doc.append_child(doc_root, new_id);
                 new_id
             }
         };

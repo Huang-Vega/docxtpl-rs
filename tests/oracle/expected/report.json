@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-24T16:41:13+08:00",
+  "generated_at": "2026-09-25T11:19:11+08:00",
   "versions": {
     "docxtpl": "0.20.2",
     "jinja2": "3.1.6",
@@ -485,6 +485,125 @@
     },
     {
       "id": "r3_combo_invoice",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_rt_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_rt_style_font",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_rt_url",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_rt_in_table",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_rtp_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_listing_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_listing_after_rt",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_png",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_scale_w",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_wh",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_dup",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_two",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_anchor",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_formats",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_in_table",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p4_img_bad",
+      "mode": "render",
+      "status": "error",
+      "error_type": "UnrecognizedImageError",
+      "error_message": ""
+    },
+    {
+      "id": "p4_combo_rich",
       "mode": "render",
       "status": "ok",
       "error_type": null,

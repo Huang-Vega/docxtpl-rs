@@ -4,6 +4,11 @@
 //! fixture，用 Rust 门面渲染，再调用 `tests/oracle/compare.py` 与固定版本
 //! Python docxtpl 0.20.2 的输出做语义（c14n + part/rels/content-types）比较。
 //!
+//! - `context_kind="json"`（或缺省）：从 manifest 指向的 JSON 文件加载上下文；
+//! - `context_kind="python"`（p4_*）：上下文在本测试中用 Rust 富内容类型
+//!   1:1 复刻 `tests/fixtures/contexts/<id>.py` 的 `build_context(tpl)`
+//!   （含 tpl.build_url_id 预登记外链），不执行 Python。
+//!
 //! error 预期 fixture：比较错误类别（oracle error_type vs Rust
 //! TemplateErrorKind::oracle_exception）。
 
@@ -12,7 +17,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use docxtpl_rs::{DocxTemplate, RenderOptions, TemplateErrorKind};
+use docxtpl_rs::{
+    DocxTemplate, InlineImage, Listing, RenderContext, RenderOptions, RenderSession, RenderValue,
+    RichText, RichTextParagraph, RichTextProps, TemplateErrorKind,
+};
 use serde_json::Value;
 
 fn fixtures_root() -> PathBuf {
@@ -43,6 +51,243 @@ fn load_json(path: &Path) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("解析 {} 失败: {e}", path.display()))
 }
 
+/// 1 mm 对应的 EMU（python-docx `Mm`：914400/25.4 = 36000）。
+const EMU_PER_MM: i64 = 36_000;
+
+/// 构造 RichTextProps 的测试辅助（对齐 Python 关键字参数）。
+fn props(build: impl FnOnce(&mut RichTextProps)) -> RichTextProps {
+    let mut p = RichTextProps::new();
+    build(&mut p);
+    p
+}
+
+/// 从 tests/fixtures/media 读取图片构造 InlineImage
+/// （对齐 contexts/*.py 的 `InlineImage(tpl, _img(name), ...)`）。
+fn media_image(
+    root: &Path,
+    name: &str,
+    width: Option<i64>,
+    height: Option<i64>,
+    anchor: Option<&str>,
+) -> InlineImage {
+    let path = root.join("media").join(name);
+    InlineImage::from_path(
+        path.to_str().expect("媒体路径合法 UTF-8"),
+        width,
+        height,
+        anchor.map(str::to_string),
+    )
+    .unwrap_or_else(|e| panic!("读取图片 {} 失败: {e}", path.display()))
+}
+
+/// 1:1 复刻 contexts/<id>.py 的 build_context(tpl)。
+///
+/// 仅 p4_*（context_kind="python"）fixture 调用；新增 fixture 时必须在此
+/// 同步添加分支（未知 id 直接 panic，防止漏构造）。
+fn build_python_context(id: &str, root: &Path, session: &mut RenderSession) -> RenderContext {
+    let mut ctx = RenderContext::new();
+    match id {
+        "p4_rt_basic" => {
+            // RichText("中文<b>粗", bold=True, color="#FF0000", size="20")
+            // 再 add 斜体/下划线(strikethrough? no: underline=True)/删除线/高亮
+            let mut rt = RichText::text_with(
+                "中文<b>粗",
+                &props(|p| {
+                    p.bold = true;
+                    p.color = Some("#FF0000".to_owned());
+                    p.size = Some("20".to_owned());
+                }),
+            );
+            rt.add_with("斜体", &props(|p| p.italic = true));
+            // 上游 underline=True（非合法字符串）归一为 "single"
+            rt.add_with(
+                "下划线",
+                &props(|p| p.underline = Some("single".to_owned())),
+            );
+            rt.add_with("删除线", &props(|p| p.strike = true));
+            rt.add_with("高亮", &props(|p| p.highlight = Some("#FFFF00".to_owned())));
+            ctx.insert("rt", rt);
+            ctx.insert("empty", RichText::new());
+        }
+        "p4_rt_style_font" => {
+            let mut rt1 =
+                RichText::text_with("样式", &props(|p| p.style = Some("Emphasis".to_owned())));
+            rt1.add_with(
+                "区域字体",
+                &props(|p| p.font = Some("eastAsia:SimSun".to_owned())),
+            );
+            let rt2 = RichText::text_with(
+                "上标",
+                &props(|p| {
+                    p.superscript = true;
+                    p.lang = Some("zh-CN".to_owned());
+                }),
+            );
+            let mut rt3 = RichText::text_with(
+                "RTL",
+                &props(|p| {
+                    p.bold = true;
+                    p.rtl = true;
+                }),
+            );
+            rt3.add_with("下标", &props(|p| p.subscript = true));
+            ctx.insert("rt1", rt1);
+            ctx.insert("rt2", rt2);
+            ctx.insert("rt3", rt3);
+        }
+        "p4_rt_url" => {
+            // url_id = tpl.build_url_id("https://docxtpl.readthedocs.io/")
+            let url_id = session.build_url_id("https://docxtpl.readthedocs.io/");
+            let rt = RichText::text_with(
+                "链接文本",
+                &props(|p| {
+                    p.url_id = Some(url_id);
+                    p.color = Some("0563C1".to_owned());
+                    p.underline = Some("single".to_owned());
+                }),
+            );
+            ctx.insert("rt", rt);
+        }
+        "p4_rt_in_table" => {
+            let rt = RichText::text_with(
+                "单元格",
+                &props(|p| {
+                    p.bold = true;
+                    p.size = Some("18".to_owned());
+                }),
+            );
+            ctx.insert("rt", rt);
+        }
+        "p4_rtp_basic" => {
+            // RichTextParagraph("首段", parastyle="ListBullet")
+            // rp.add(RichText("次段粗体", bold=True), parastyle=None)
+            let mut rp = RichTextParagraph::with_text("首段", "ListBullet");
+            let bold = RichText::text_with("次段粗体", &props(|p| p.bold = true));
+            rp.add_rich(&bold, "");
+            ctx.insert("rp", rp);
+        }
+        "p4_listing_basic" => {
+            ctx.insert("lst", Listing::new("L1\nL2\tT3\u{7}P4\u{c}PAGE"));
+        }
+        "p4_listing_after_rt" => {
+            ctx.insert("rt", RichText::text("前"));
+            ctx.insert("lst", Listing::new("X\nY"));
+        }
+        "p4_img_png" => {
+            ctx.insert("img", media_image(root, "p4_dot2x1.png", None, None, None));
+        }
+        "p4_img_scale_w" => {
+            // width=Mm(20)
+            ctx.insert(
+                "img",
+                media_image(root, "p4_wide4x1.png", Some(20 * EMU_PER_MM), None, None),
+            );
+        }
+        "p4_img_wh" => {
+            // width=Mm(10), height=Mm(3)
+            ctx.insert(
+                "img",
+                media_image(
+                    root,
+                    "p4_rect4x2.jpg",
+                    Some(10 * EMU_PER_MM),
+                    Some(3 * EMU_PER_MM),
+                    None,
+                ),
+            );
+        }
+        "p4_img_dup" => {
+            // 两个独立 InlineImage 对象、字节相同：sha1 去重复用同一 part/rId
+            ctx.insert("i1", media_image(root, "p4_dot2x1.png", None, None, None));
+            ctx.insert("i2", media_image(root, "p4_dot2x1.png", None, None, None));
+        }
+        "p4_img_two" => {
+            ctx.insert("i1", media_image(root, "p4_dot2x1.png", None, None, None));
+            ctx.insert("i2", media_image(root, "p4_rect4x2.jpg", None, None, None));
+        }
+        "p4_img_anchor" => {
+            ctx.insert(
+                "img",
+                media_image(
+                    root,
+                    "p4_dot2x1.png",
+                    None,
+                    None,
+                    Some("https://example.com/"),
+                ),
+            );
+        }
+        "p4_img_formats" => {
+            ctx.insert(
+                "bmp",
+                media_image(root, "p4_brick4x2.bmp", None, None, None),
+            );
+            ctx.insert(
+                "gif",
+                media_image(root, "p4_arrow4x2.gif", None, None, None),
+            );
+            ctx.insert(
+                "tif",
+                media_image(root, "p4_tile4x2.tiff", None, None, None),
+            );
+        }
+        "p4_img_in_table" => {
+            // 同一个 InlineImage 值在两行中复用（渲染期解析两次，幂等）
+            let img = media_image(root, "p4_dot2x1.png", None, None, None);
+            let rows = RenderValue::array(vec![
+                RenderValue::object(vec![
+                    ("n".to_owned(), "r1".into()),
+                    ("img".to_owned(), img.clone().into()),
+                ]),
+                RenderValue::object(vec![
+                    ("n".to_owned(), "r2".into()),
+                    ("img".to_owned(), img.into()),
+                ]),
+            ]);
+            ctx.insert("rows", rows);
+        }
+        "p4_img_bad" => {
+            // 文件可读但字节不是受支持图片：渲染期 probe 报 UnrecognizedImageError
+            ctx.insert("img", media_image(root, "p4_bad.png", None, None, None));
+        }
+        "p4_combo_rich" => {
+            let title = RichText::text_with(
+                "INV-2026-001",
+                &props(|p| {
+                    p.bold = true;
+                    p.color = Some("1F4E79".to_owned());
+                    p.size = Some("24".to_owned());
+                }),
+            );
+            let img1 = media_image(root, "p4_dot2x1.png", None, None, None);
+            let img2 = media_image(root, "p4_dot2x1.png", None, None, None);
+            let rows = RenderValue::array(vec![
+                RenderValue::object(vec![
+                    (
+                        "name".to_owned(),
+                        RichText::text_with("Alpha", &props(|p| p.bold = true)).into(),
+                    ),
+                    ("qty".to_owned(), 1_i64.into()),
+                    ("img".to_owned(), img1.into()),
+                ]),
+                RenderValue::object(vec![
+                    (
+                        "name".to_owned(),
+                        RichText::text_with("Beta", &props(|p| p.italic = true)).into(),
+                    ),
+                    ("qty".to_owned(), 2_i64.into()),
+                    ("img".to_owned(), img2.into()),
+                ]),
+            ]);
+            ctx.insert("title", title);
+            ctx.insert("rows", rows);
+            ctx.insert("notes", Listing::new("first line\nsecond line\tlast"));
+        }
+        other => panic!("未实现的 python 上下文 fixture: {other}"),
+    }
+    ctx
+}
+
 /// 调用 compare.py，返回 (退出成功?, stdout)。
 fn run_compare(expected: &Path, actual: &Path) -> (bool, String) {
     let script = oracle_dir().join("compare.py");
@@ -71,9 +316,10 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
+    // P0–P3 48 个 + P4 17 个 = 65 个 render fixture。
     assert!(
-        render_ids.len() >= 48,
-        "render fixture 不足 48 个（实际 {}）",
+        render_ids.len() >= 65,
+        "render fixture 不足 65 个（实际 {}）",
         render_ids.len()
     );
 
@@ -101,14 +347,29 @@ fn oracle_differential_render_fixtures() {
             .and_then(|f| f["error_type"].as_str())
             .map(str::to_string);
 
-        let ctx = match fx.get("context").and_then(Value::as_str) {
-            Some(rel) => load_json(&root.join(rel)),
-            None => Value::Object(serde_json::Map::new()),
-        };
+        let is_python_context = fx
+            .get("context_kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "python");
 
         let tpl = DocxTemplate::open(&template_path)
             .unwrap_or_else(|e| panic!("{id}: 打开模板失败: {e}"));
-        let rendered = tpl.render(&ctx, &RenderOptions::compat());
+
+        // python 上下文走富内容渲染会话（build_url_id 在会话内预登记）；
+        // 其余走纯 JSON 路径。
+        let rendered = if is_python_context {
+            let mut session = tpl
+                .render_session(&RenderOptions::compat())
+                .unwrap_or_else(|e| panic!("{id}: 开启渲染会话失败: {e}"));
+            let ctx = build_python_context(id, &root, &mut session);
+            session.finish(&ctx)
+        } else {
+            let ctx = match fx.get("context").and_then(Value::as_str) {
+                Some(rel) => load_json(&root.join(rel)),
+                None => Value::Object(serde_json::Map::new()),
+            };
+            tpl.render(&ctx, &RenderOptions::compat())
+        };
 
         if let Some(expected_type) = expected_error_type {
             // error 预期：只比较稳定错误类别。
