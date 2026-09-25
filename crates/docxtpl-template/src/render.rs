@@ -1,10 +1,11 @@
 //! 渲染主管线：patch → MiniJinja → resolve_listing → recover → fix → serialize。
 
 use docxtpl_compat::{patch_xml, resolve_listing};
-use docxtpl_xml::{Recovery, XmlDocument, XmlLimits};
+use docxtpl_xml::{ns_uri, Recovery, XmlDocument, XmlLimits};
 use minijinja::{Environment, ErrorKind, UndefinedBehavior, Value};
 use regex::Regex;
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 
@@ -528,6 +529,82 @@ fn map_jinja_error(err: &minijinja::Error, prepared: &str, part: &str) -> Render
         line: err.line(),
         message: err.to_string(),
         context,
+    }
+}
+
+/// 上游 `DocxTemplate.get_undeclared_template_variables`（0.20.2，
+/// template.py L894–927）的静态分析：
+///
+/// 1. 主文档 `w:body` 子树 `xml_to_string` 等价输出后跑 [`patch_xml`]
+///    （上游 `self.patch_xml(self.xml_to_string(temp_doc._element.body))`）；
+/// 2. 依次追加主 rels 中每个 blob 非空的 header/footer **根元素**
+///    （w:hdr / w:ftr）的 patch 输出（上游两遍 rels：先 header 后
+///    footer；拼接顺序不影响集合结果）；
+/// 3. 裸 jinja 环境 parse 后收集未声明变量——循环变量/宏参数等由
+///    jinja 元分析自动排除。
+///
+/// 返回排序集合以便稳定展示。上游可选的 `context` 差集参数不提供
+/// （Rust 侧由调用方对返回集合自行做差集）；不支持自定义 jinja_env。
+pub fn find_undeclared_variables(
+    doc_xml: &str,
+    story_xmls: &[String],
+) -> Result<BTreeSet<String>, RenderError> {
+    let mut combined = patched_body_xml(doc_xml)?;
+    for story in story_xmls {
+        combined.push_str(&patched_root_xml(story)?);
+    }
+    let env = build_jinja_env(false);
+    let template = env
+        .template_from_str(&combined)
+        .map_err(|e| map_jinja_error(&e, &combined, MAIN_PART))?;
+    Ok(template.undeclared_variables(false).into_iter().collect())
+}
+
+/// 解析主文档，取 w:body 子树序列化并 patch（自省专用，不剥空白）。
+fn patched_body_xml(src_xml: &str) -> Result<String, RenderError> {
+    let doc = parse_for_introspect(src_xml, MAIN_PART)?;
+    // 解析树根节点即顶层 w:document（不存在虚拟 Document 层）。
+    let document = doc.root();
+    if !is_word_tag(&doc, document, "document") {
+        return Err(introspect_structure_error());
+    }
+    let body = doc
+        .children(document)
+        .iter()
+        .copied()
+        .find(|&id| is_word_tag(&doc, id, "body"))
+        .ok_or_else(introspect_structure_error)?;
+    Ok(patch_xml(&doc.serialize_subtree(body)))
+}
+
+/// 解析 header/footer 等 story part，取其根元素（w:hdr / w:ftr）序列化并 patch。
+fn patched_root_xml(src_xml: &str) -> Result<String, RenderError> {
+    let doc = parse_for_introspect(src_xml, MAIN_PART)?;
+    Ok(patch_xml(&doc.serialize_subtree(doc.root())))
+}
+
+/// 自省路径的严格解析（良构 docx 必通过；失败按 XML 错误上报）。
+fn parse_for_introspect(src_xml: &str, part: &str) -> Result<XmlDocument, RenderError> {
+    XmlDocument::parse_strict(src_xml, &XmlLimits::default()).map_err(|source| RenderError::Xml {
+        part: part.to_string(),
+        source,
+    })
+}
+
+/// 节点是否为指定本地名的 w: 命名空间元素。
+fn is_word_tag(doc: &XmlDocument, id: docxtpl_xml::NodeId, local: &str) -> bool {
+    doc.tag(id)
+        .is_some_and(|q| q.ns == ns_uri::W && q.local == local)
+}
+
+/// 自省输入结构畸形（缺 document/body 等，正常 docx 不可达）。
+fn introspect_structure_error() -> RenderError {
+    RenderError::Template {
+        kind: TemplateErrorKind::Other,
+        part: MAIN_PART.to_string(),
+        line: None,
+        message: "自省失败：文档缺少 w:document/w:body 结构".to_string(),
+        context: Vec::new(),
     }
 }
 

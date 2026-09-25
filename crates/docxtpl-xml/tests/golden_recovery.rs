@@ -60,8 +60,8 @@ fn golden_recovery_all_pairs() {
     }
 
     assert_eq!(
-        checked, 76,
-        "golden fixture 对数应为 76（48 P2/P3 + 16 P4 + 7 P5 + 5 P6；p5_hf_syntax_error 失败在 jinja 阶段，body 的 pre/recover 仍存在）"
+        checked, 83,
+        "golden fixture 对数应为 83（85 个 render fixture 中 r2_syntax_error/p4_img_bad 仅导出 patched；p5_hf_syntax_error 与 P7 save 阶段错误的 body pre/recover 仍存在）"
     );
     assert!(
         failures.is_empty(),

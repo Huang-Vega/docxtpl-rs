@@ -4,6 +4,7 @@
 提供 build_context(tpl)：返回渲染上下文，可包含 RichText/RichTextParagraph/
 Listing/InlineImage/Subdoc 等类型化值（对齐上游 docxtpl 0.20.2 用法）。
 """
+import io
 import os
 
 from docx.shared import Mm
@@ -18,6 +19,17 @@ def _img(name):
 
 def _sub(name):
     return os.path.join(_HERE, os.pardir, "templates", name)
+
+
+def _media_path(name):
+    """tests/fixtures/media 下素材的绝对路径（P7：replace_* 的路径入参）。"""
+    return os.path.join(_HERE, os.pardir, "media", name)
+
+
+def _media_bytes(name):
+    """tests/fixtures/media 下素材的字节（P7：file-like 入参用 BytesIO 包）。"""
+    with open(_media_path(name), "rb") as fh:
+        return fh.read()
 
 def build_context(tpl):
     return {"i1": InlineImage(tpl, _img("p4_dot2x1.png")),

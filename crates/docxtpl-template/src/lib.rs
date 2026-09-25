@@ -29,6 +29,6 @@ pub use context::{
 pub use core_props::{render_core_properties, render_core_properties_ctx};
 pub use error::{RenderError, TemplateErrorKind};
 pub use render::{
-    render_document_xml, render_document_xml_ctx, render_footnotes_xml_ctx, render_story_xml_ctx,
-    shape_id_of, RenderOptions, RenderOutcome,
+    find_undeclared_variables, render_document_xml, render_document_xml_ctx,
+    render_footnotes_xml_ctx, render_story_xml_ctx, shape_id_of, RenderOptions, RenderOutcome,
 };

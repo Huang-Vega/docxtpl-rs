@@ -11,6 +11,7 @@ license.workspace = true
 oracle = []
 
 [dependencies]
+crc32fast = "1.5"
 docxtpl-compat = { path = "../docxtpl-compat" }
 docxtpl-opc = { path = "../docxtpl-opc" }
 docxtpl-rich = { path = "../docxtpl-rich" }

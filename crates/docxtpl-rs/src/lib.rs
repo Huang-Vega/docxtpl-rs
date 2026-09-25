@@ -56,21 +56,24 @@
 //! [`DocxTemplate`] 只读且可复用：每次渲染都从原始模板字节重新开包，
 //! 渲染临时状态不会跨次污染。
 
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use docxtpl_opc::{resolve_part_target, OpcError, Package, PackageLimits, PartUri, TargetMode};
 use docxtpl_template::{
-    render_core_properties_ctx, render_document_xml_ctx, render_footnotes_xml_ctx,
-    render_story_xml_ctx, RenderError,
+    find_undeclared_variables, render_core_properties_ctx, render_document_xml_ctx,
+    render_footnotes_xml_ctx, render_story_xml_ctx, RenderError,
 };
 // 同时作为内部类型与对外重导出（底部 pub use 列表不再重复）。
 pub use docxtpl_template::RenderContext;
 
 mod images;
+mod replacements;
 mod subdoc;
 
 use images::ImageInjections;
+use replacements::Replacements;
 
 const MAX_INPUT_DOCX_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -163,6 +166,26 @@ impl DocxTemplate {
         RenderSession::new(pkg, options)
     }
 
+    /// 上游 `DocxTemplate.get_undeclared_template_variables()`（P7）：
+    /// 对模板正文 body 与主 rels 中全部非空页眉/页脚做 patch_xml 后做
+    /// jinja 元分析，返回模板引用但未被 `{% for %}`/宏参数等声明的
+    /// 变量名集合（排序返回以便稳定展示）。
+    ///
+    /// 纯静态自省，不修改模板、不产生输出文档；上游可选的 `context`
+    /// 差集参数未提供，调用方可对返回集合自行做差集。
+    pub fn undeclared_variables(&self) -> Result<BTreeSet<String>, Error> {
+        let pkg = self.open_package()?;
+        let main_name = pkg.main_document_uri()?.as_str().to_string();
+        let doc_xml = read_part_utf8(&pkg, &main_name)?;
+        // 复用渲染的 story 枚举：先 header 后 footer、内部目标、blob 非空。
+        // 上游 rels 遍历不去重，但求并集时去重不影响结果。
+        let story_xmls = story_parts(&pkg, &main_name)?
+            .iter()
+            .map(|name| read_part_utf8(&pkg, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        find_undeclared_variables(&doc_xml, &story_xmls).map_err(Error::Render)
+    }
+
     /// 每次渲染独立开包并校验。
     fn open_package(&self) -> Result<Package, Error> {
         let pkg = Package::from_reader(Cursor::new(&self.data), &PackageLimits::default())?;
@@ -181,6 +204,8 @@ pub struct RenderSession {
     pkg: Package,
     options: RenderOptions,
     injections: ImageInjections,
+    /// P7 媒体/嵌入替换注册表（replace_* 系列，finish 时落定）。
+    replacements: Replacements,
 }
 
 impl RenderSession {
@@ -192,6 +217,7 @@ impl RenderSession {
             pkg,
             options: *options,
             injections,
+            replacements: Replacements::new(),
         })
     }
 
@@ -223,6 +249,51 @@ impl RenderSession {
         subdoc::new_subdoc(&mut self.pkg, &mut self.injections, docpath.as_ref())
     }
 
+    /// 上游 `DocxTemplate.replace_media`（P7）：注册按源字节 CRC32
+    /// 命中的 media 替换（`word/media/` 条目，含正文/页眉/页脚图片）。
+    ///
+    /// 仅换最终 zip 条目字节：part 名、[Content_Types].xml、rels 与
+    /// wp:extent 版式均保持模板原样。源/目标传已读入的字节（上游的
+    /// 文件路径/file-like 两种形态在此统一为字节）。
+    pub fn replace_media(&mut self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> &mut Self {
+        self.replacements.replace_media(src.as_ref(), dst.as_ref());
+        self
+    }
+
+    /// 上游 `DocxTemplate.replace_embedded`（P7）：注册按源字节 CRC32
+    /// 命中的嵌入对象替换（`word/embeddings/` 条目）。
+    pub fn replace_embedded(&mut self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> &mut Self {
+        self.replacements
+            .replace_embedded(src.as_ref(), dst.as_ref());
+        self
+    }
+
+    /// 上游 `DocxTemplate.replace_zipname`（P7）：按 zip 条目全名
+    /// （不带前导 `/`，如 `word/embeddings/x.xlsx`）精确替换。
+    pub fn replace_zipname(&mut self, zipname: &str, dst: impl AsRef<[u8]>) -> &mut Self {
+        self.replacements.replace_zipname(zipname, dst.as_ref());
+        self
+    }
+
+    /// 上游 `DocxTemplate.replace_pic`（P7）：按图片 cNvPr 的
+    /// name/title/descr 标识注册替换，作用于渲染后正文与页眉/页脚
+    /// pic 图形引用的 media part blob。
+    ///
+    /// 标识在所有扫描 part 中均未命中时，[`RenderSession::finish`] /
+    /// [`RenderSession::finish_without_render`] 返回
+    /// `ValueError` 类错误（[`docxtpl_template::TemplateErrorKind::InvalidArgument`]）。
+    pub fn replace_pic(&mut self, pic_id: &str, dst: impl AsRef<[u8]>) -> &mut Self {
+        self.replacements.replace_pic(pic_id, dst.as_ref());
+        self
+    }
+
+    /// 上游 `DocxTemplate.reset_replacements`（P7）：清空本会话全部
+    /// media/embedded/zipname/pic 替换注册。
+    pub fn reset_replacements(&mut self) -> &mut Self {
+        self.replacements.reset();
+        self
+    }
+
     /// 渲染全部 part（正文 → 页眉 → 页脚 → 核心属性 → 脚注，P5），
     /// 落定 media part / 各作用域 rels / Content Types 变更，并做最终包校验。
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
@@ -230,7 +301,30 @@ impl RenderSession {
 
         // 先写 media part，再回写各 owner rels/CT，保证最终校验无悬空关系/类型。
         self.injections.apply(&mut self.pkg)?;
+        self.finish_replacements()
+    }
+
+    /// 上游「不 render 直接 save」路径（P7，save() L887–889）：不跑
+    /// 模板渲染管线（不 patch/不渲染、不 fix_tables/fix_docpr_ids，
+    /// docPr id 等保持模板原字节），仅执行 pre/post 替换后落盘。
+    ///
+    /// 对齐上游 `is_rendered=False` 时 save 重新打开模板的语义：本
+    /// 出口不应与 [`RenderSession::build_url_id`] /
+    /// [`RenderSession::new_subdoc`] 混用（其暂存/合并内容不应用）。
+    pub fn finish_without_render(self) -> Result<RenderedDocument, Error> {
+        self.finish_replacements()
+    }
+
+    /// pre_processing（replace_pic）→ CT 归一（python-docx 每次保存都
+    /// 重建 CT）→ post_processing（CRC/zipname 字节替换）→ 最终校验。
+    fn finish_replacements(mut self) -> Result<RenderedDocument, Error> {
+        let main_name = self.pkg.main_document_uri()?.as_str().to_string();
+        // pre_processing：在最终 XML 上换图片 part blob（docx.save 之前）。
+        self.replacements
+            .apply_pic_replacements(&mut self.pkg, &main_name)?;
         canonicalize_content_types(&mut self.pkg)?;
+        // post_processing：最终 part 集合上的 CRC/zipname 字节替换。
+        self.replacements.apply_byte_replacements(&mut self.pkg)?;
         self.pkg.validate()?;
 
         Ok(RenderedDocument { pkg: self.pkg })

@@ -105,3 +105,31 @@ docs/compatibility.md §7）。
     非确定路径（nsid/主缺 numbering/restart 实触发）、
     SmartArt/VML/脚注引用、两侧多节均为不支持并返回带 part 名错误。
   - oracle 侧锁定 docxcompose==2.2.0（tests/oracle/requirements.txt）。
+- **P7：媒体/嵌入替换族与模板自省（ADR-008）**。对齐 docxtpl 0.20.2
+  `replace_media`/`replace_embedded`/`replace_zipname`/`replace_pic`/
+  `reset_replacements` 与 `get_undeclared_template_variables`；新增 7 个
+  `p7_*` oracle fixture（含 1 个 `skip_render` 不渲染直存、8 个固定字节
+  替换素材），差分 6 个逐字节 MATCH + 1 个错误类别一致
+  （ValueError），render fixture 基线达 85（81 MATCH + 4 错误类别），
+  golden 85/83，详见 docs/compatibility.md §4/§7。
+  - docxtpl-template：新增公开函数
+    `find_undeclared_variables(doc_xml, story_xmls) ->
+    Result<BTreeSet<String>, _>`（body 与 story 分别 patch 后拼接，
+    minijinja 元分析，循环变量自动排除）；新增
+    `TemplateErrorKind::InvalidArgument`（oracle 异常 ValueError）。
+  - docxtpl-rs：新增 `crates/docxtpl-rs/src/replacements.rs`，
+    `Replacements` 四张注册表（media/embedded key=CRC32、zipname
+    精确全名、pics 保序 Vec 对齐上游 dict 插入序/命中即 break）；
+    pre 路径 `apply_pic_replacements`（主文档 + 主 rels 中
+    header/footer 目标出现序不去重；仅 pic:graphicData；结构缺失
+    整体跳过；缺失标识 ValueError）与 post 路径
+    `apply_byte_replacements`（zipname 精确 > media CRC >
+    embeddings CRC，仅换 blob）；新门面 API
+    `RenderSession::replace_media/replace_embedded/replace_zipname/
+    replace_pic/reset_replacements`（链式）、
+    `RenderSession::finish_without_render()`（不渲染直存，不跑
+    fix_tables/fix_docpr_ids）、`DocxTemplate::undeclared_variables()`；
+    DEV-0013：自省不提供 context 差集/自定义 jinja_env、
+    allow_missing_pics 恒为 False。
+  - 新依赖 `crc32fast = "1.5"`（与 Python `binascii.crc32` 同
+    IEEE 多项式，fixture 差分钉死）。

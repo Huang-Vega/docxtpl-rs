@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-25T21:52:38+08:00",
+  "generated_at": "2026-09-25T23:54:56+08:00",
   "versions": {
     "docxtpl": "0.20.2",
     "jinja2": "3.1.6",
@@ -688,6 +688,55 @@
     },
     {
       "id": "p6_subdoc_untagged",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_media_body",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_media_header",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_pic_match",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_pic_missing",
+      "mode": "render",
+      "status": "error",
+      "error_type": "ValueError",
+      "error_message": "Picture nope.png not found in the docx template"
+    },
+    {
+      "id": "p7_embedded_zipname",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_replace_only",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7_undeclared_vars",
       "mode": "render",
       "status": "ok",
       "error_type": null,

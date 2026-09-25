@@ -80,11 +80,23 @@ fn media_image(
     .unwrap_or_else(|e| panic!("读取图片 {} 失败: {e}", path.display()))
 }
 
+/// 读取 tests/fixtures/media/<name> 的原始字节（P7 替换素材：源/目标字节）。
+fn media_bytes(root: &Path, name: &str) -> Vec<u8> {
+    let path = root.join("media").join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("读取素材 {} 失败: {e}", path.display()))
+}
+
 /// 1:1 复刻 contexts/<id>.py 的 build_context(tpl)。
 ///
-/// 仅 p4_*（context_kind="python"）fixture 调用；新增 fixture 时必须在此
-/// 同步添加分支（未知 id 直接 panic，防止漏构造）。
-fn build_python_context(id: &str, root: &Path, session: &mut RenderSession) -> RenderContext {
+/// p4 起的 context_kind="python" fixture 均在此复刻；新增 fixture 时必须
+/// 在此同步添加分支（未知 id 直接 panic，防止漏构造）。`tpl` 供 P7
+/// 模板自省（undeclared_variables）等 DocxTemplate 级调用使用。
+fn build_python_context(
+    id: &str,
+    root: &Path,
+    tpl: &DocxTemplate,
+    session: &mut RenderSession,
+) -> RenderContext {
     let mut ctx = RenderContext::new();
     match id {
         "p4_rt_basic" => {
@@ -353,6 +365,61 @@ fn build_python_context(id: &str, root: &Path, session: &mut RenderSession) -> R
                 .unwrap_or_else(|e| panic!("{id}: new_subdoc 合并失败: {e}"));
             ctx.insert("sd", sd);
         }
+
+        // ---------- P7 媒体/嵌入替换族（ADR-008）----------
+        "p7_media_body" => {
+            // 1:1 复刻 contexts/p7_media_body.py 的 tpl.replace_media(...)。
+            session.replace_media(
+                media_bytes(root, "p7_dummy.png"),
+                media_bytes(root, "p7_media3x2.png"),
+            );
+            ctx.insert("x", "正文媒体替换");
+        }
+        "p7_media_header" => {
+            session.replace_media(
+                media_bytes(root, "p7_dummy.png"),
+                media_bytes(root, "p7_media3x2.png"),
+            );
+            ctx.insert("y", "页眉媒体替换");
+        }
+        "p7_pic_match" => {
+            // 注册序即上游 dict 插入序：image.png 命中第一张、
+            // my-title 命中第二张（第二张 cNvPr name 已改名避免遮蔽）。
+            session.replace_pic("image.png", media_bytes(root, "p7_media3x2.png"));
+            session.replace_pic("my-title", media_bytes(root, "p7_new4x4.png"));
+            ctx.insert("z", "图片标识替换");
+        }
+        "p7_pic_missing" => {
+            // 模板无 nope.png 标识 → finish 的 pre_processing 报 ValueError。
+            session.replace_pic("nope.png", media_bytes(root, "p7_media3x2.png"));
+            ctx.insert("w", "缺失标识");
+        }
+        "p7_embedded_zipname" => {
+            // ole1 走 CRC（word/embeddings/ 前缀），ole2 走 zipname 精确命中。
+            session.replace_embedded(
+                media_bytes(root, "p7_embed_orig1.bin"),
+                media_bytes(root, "p7_embed_new1.bin"),
+            );
+            session.replace_zipname(
+                "word/embeddings/p7_ole2.bin",
+                media_bytes(root, "p7_embed_new2.bin"),
+            );
+            ctx.insert("e", "嵌入替换");
+        }
+        "p7_replace_only" => {
+            // 不渲染直接保存（skip_render）：仅注册 CRC 媒体替换。
+            session.replace_media(
+                media_bytes(root, "p7_dummy.png"),
+                media_bytes(root, "p7_media3x2.png"),
+            );
+        }
+        "p7_undeclared_vars" => {
+            // 对齐 ctx：vars = ",".join(sorted(get_undeclared_template_variables()))
+            let names = tpl
+                .undeclared_variables()
+                .unwrap_or_else(|e| panic!("{id}: undeclared_variables 失败: {e}"));
+            ctx.insert("vars", names.into_iter().collect::<Vec<_>>().join(","));
+        }
         other => panic!("未实现的 python 上下文 fixture: {other}"),
     }
     ctx
@@ -386,10 +453,10 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
-    // P0–P3 49 个 + P4 17 个 + P5 7 个 + P6 5 个 = 78 个 render fixture。
+    // P0–P3 49 + P4 17 + P5 7 + P6 5 + P7 7 = 85 个 render fixture。
     assert!(
-        render_ids.len() >= 78,
-        "render fixture 不足 78 个（实际 {}）",
+        render_ids.len() >= 85,
+        "render fixture 不足 85 个（实际 {}）",
         render_ids.len()
     );
 
@@ -425,14 +492,25 @@ fn oracle_differential_render_fixtures() {
         let tpl = DocxTemplate::open(&template_path)
             .unwrap_or_else(|e| panic!("{id}: 打开模板失败: {e}"));
 
+        // P7：skip_render=true 对齐上游不 render 直接 save（仍先
+        // build_context 以注册 replace_*，随后走 finish_without_render）。
+        let skip_render = fx
+            .get("skip_render")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
         // python 上下文走富内容渲染会话（build_url_id 在会话内预登记）；
         // 其余走纯 JSON 路径。
         let rendered = if is_python_context {
             let mut session = tpl
                 .render_session(&RenderOptions::compat())
                 .unwrap_or_else(|e| panic!("{id}: 开启渲染会话失败: {e}"));
-            let ctx = build_python_context(id, &root, &mut session);
-            session.finish(&ctx)
+            let ctx = build_python_context(id, &root, &tpl, &mut session);
+            if skip_render {
+                session.finish_without_render()
+            } else {
+                session.finish(&ctx)
+            }
         } else {
             let ctx = match fx.get("context").and_then(Value::as_str) {
                 Some(rel) => load_json(&root.join(rel)),

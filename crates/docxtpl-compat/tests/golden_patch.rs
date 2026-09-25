@@ -14,7 +14,8 @@ const TEMPLATES_DIR: &str = concat!(
 );
 
 const GOLDEN_SUFFIX: &str = ".full_patched.xml";
-const EXPECTED_GOLDEN_COUNT: usize = 78;
+// P0–P3 49 + P4 17 + P5 7 + P6 5 + P7 7 = 85。
+const EXPECTED_GOLDEN_COUNT: usize = 85;
 
 /// 枚举 stages 目录下全部 `<id>.full_patched.xml`，按 id 排序。
 fn list_golden_ids() -> Vec<String> {

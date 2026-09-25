@@ -13,6 +13,9 @@ pub enum TemplateErrorKind {
     /// 图片字节无法识别（对齐 docxtpl `UnrecognizedImageError`，
     /// 由 InlineImage 的 probe/尺寸换算失败触发）。
     Image,
+    /// 替换参数不合法（对齐 docxtpl 0.20.2 直接抛出的 Python
+    /// `ValueError`，P7：`replace_pic` 注册的图片标识在模板中未命中）。
+    InvalidArgument,
     /// 其他模板执行错误。
     Other,
 }
@@ -25,6 +28,7 @@ impl TemplateErrorKind {
             TemplateErrorKind::Syntax => "TemplateSyntaxError",
             TemplateErrorKind::Undefined => "UndefinedError",
             TemplateErrorKind::Image => "UnrecognizedImageError",
+            TemplateErrorKind::InvalidArgument => "ValueError",
             TemplateErrorKind::Other => "TemplateError",
         }
     }

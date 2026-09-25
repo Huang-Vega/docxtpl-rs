@@ -39,6 +39,8 @@ from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import Part
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
@@ -56,9 +58,15 @@ EXPECTED_OVERRIDES = {
     "r2_syntax_error": "error",
     "p4_img_bad": "error",
     "p5_hf_syntax_error": "error",
+    # P7：replace_pic 标识全程未命中，save 的 pre_processing 抛 ValueError。
+    "p7_pic_missing": "error",
 }
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+# P7：手工挂载的嵌入对象（oleObject）part CT 与 reltype（探针实证可达）。
+CT_OLEOBJECT = "application/vnd.openxmlformats-officedocument.oleObject"
+REL_OLEOBJECT = ("http://schemas.openxmlformats.org/officeDocument/2006/"
+                 "relationships/oleObject")
 CT_CUSTOMXML = "application/vnd.openxmlformats-officedocument.customXmlProperties+xml"
 REL_CUSTOMXML = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
 CT_FOOTNOTES = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
@@ -68,13 +76,14 @@ FIXTURES = []
 
 
 def fixture(fid, feature, phase, mode, context=None, post=None,
-            context_kind="json", context_src=None, sub_build=None):
+            context_kind="json", context_src=None, sub_build=None,
+            skip_render=False):
     def deco(build):
         FIXTURES.append({
             "id": fid, "feature": feature, "phase": phase, "mode": mode,
             "context": context, "post": post, "build": build,
             "context_kind": context_kind, "context_src": context_src,
-            "sub_build": sub_build,
+            "sub_build": sub_build, "skip_render": skip_render,
         })
         return build
     return deco
@@ -957,6 +966,21 @@ MEDIA_FILES = {
     "p4_tile4x2.tiff": lambda: make_tiff(4, 2, 150),
     # 非图片：用于 UnrecognizedImageError
     "p4_bad.png": lambda: b"this is not an image at all\n",
+    # ---- P7 媒体替换族素材（ADR-008）----
+    # dummy 1x1（同 minimal_png，CRC 0x2da0f51）：模板中被替换的源图。
+    "p7_dummy.png": minimal_png,
+    # 3x2：正文/页眉 replace_media 与 replace_pic(name) 的替换目标。
+    "p7_media3x2.png": lambda: make_png(3, 2),
+    # 2x2：p7_pic_match 第二张图源字节（异 sha1，避开 image part 去重）。
+    "p7_pic2x2.png": lambda: make_png(2, 2),
+    # 4x4：title="my-title" 图片的替换目标。
+    "p7_new4x4.png": lambda: make_png(4, 4),
+    # embeddings：orig/new 各两份（通用二进制 part，非 OLE 真格式无碍，
+    # python-docx 按 blob 原样保存；探针已实证可达）。
+    "p7_embed_orig1.bin": lambda: b"P7-EMBED-ONE-original-bytes-0001\n",
+    "p7_embed_new1.bin": lambda: b"P7-EMBED-ONE-replaced-bytes-9999\n",
+    "p7_embed_orig2.bin": lambda: b"P7-EMBED-TWO-original-bytes-0002\n",
+    "p7_embed_new2.bin": lambda: b"P7-EMBED-TWO-replaced-bytes-8888\n",
 }
 
 
@@ -971,6 +995,7 @@ _CTX_HEADER = '''\
 提供 build_context(tpl)：返回渲染上下文，可包含 RichText/RichTextParagraph/
 Listing/InlineImage/Subdoc 等类型化值（对齐上游 docxtpl 0.20.2 用法）。
 """
+import io
 import os
 
 from docx.shared import Mm
@@ -985,6 +1010,17 @@ def _img(name):
 
 def _sub(name):
     return os.path.join(_HERE, os.pardir, "templates", name)
+
+
+def _media_path(name):
+    """tests/fixtures/media 下素材的绝对路径（P7：replace_* 的路径入参）。"""
+    return os.path.join(_HERE, os.pardir, "media", name)
+
+
+def _media_bytes(name):
+    """tests/fixtures/media 下素材的字节（P7：file-like 入参用 BytesIO 包）。"""
+    with open(_media_path(name), "rb") as fh:
+        return fh.read()
 
 '''
 
@@ -1453,6 +1489,146 @@ def p6_subdoc_untagged(doc):
 
 
 # ===========================================================================
+# P7 -- media/embedded replacement family + variable introspection (ADR-008)
+#
+# 路径 B（post_processing，zip 层）：replace_media / replace_embedded /
+# replace_zipname，只换 blob，partname/CT/rels/wp:extent 全部不动。
+# 路径 A（pre_processing，渲染后 part blob）：replace_pic 按 cNvPr
+# name/title/descr 匹配；未命中 ValueError。skip_render 钉「不 render
+# 直接 save」（docPr 不重编号）。
+# ===========================================================================
+
+# 99
+@fixture("p7_media_body", "render: replace_media by CRC (body picture, partname/CT/extent unchanged)",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    tpl.replace_media(io.BytesIO(_media_bytes("p7_dummy.png")),
+                      io.BytesIO(_media_bytes("p7_media3x2.png")))
+    return {"x": "正文媒体替换"}
+''')
+def p7_media_body(doc):
+    doc.add_paragraph("媒体替换正文 {{ x }}")
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+
+
+# 100
+@fixture("p7_media_header", "render: replace_media by CRC hits header dummy picture",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    tpl.replace_media(io.BytesIO(_media_bytes("p7_dummy.png")),
+                      io.BytesIO(_media_bytes("p7_media3x2.png")))
+    return {"y": "页眉媒体替换"}
+''')
+def p7_media_header(doc):
+    # 页眉占位 dummy 图（replace_media 的招牌场景：页眉无法 add 模板图片）。
+    sec = doc.sections[0]
+    sec.header.paragraphs[0].add_run().add_picture(
+        io.BytesIO(minimal_png()), width=Inches(0.5))
+    doc.add_paragraph("页眉图替换正文 {{ y }}")
+
+
+# 101
+@fixture("p7_pic_match", "render: replace_pic by cNvPr name and title (two body pictures)",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    tpl.replace_pic("image.png", io.BytesIO(_media_bytes("p7_media3x2.png")))
+    tpl.replace_pic("my-title", io.BytesIO(_media_bytes("p7_new4x4.png")))
+    return {"z": "图片标识替换"}
+''')
+def p7_pic_match(doc):
+    doc.add_paragraph("图片标识替换 {{ z }}")
+    # 两图异字节 → 独立 media part。第一张保留 python-docx 默认 name
+    # "image.png"；第二张手工改名+title（name 用不参与注册的值，
+    # 否则按上游 dict 插入序/命中即 break，image.png key 会先遮蔽
+    # title key，导致 my-title 永不命中）。
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+    doc.add_picture(io.BytesIO(make_png(2, 2)), width=Inches(0.8))
+    cnvprs = doc.element.body.xpath("//pic:cNvPr")
+    cnvprs[1].set("name", "titled-2x2.png")
+    cnvprs[1].set("title", "my-title")
+
+
+# 102（error 预期：ValueError）
+@fixture("p7_pic_missing", "render: replace_pic id never matched -> ValueError at save",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    tpl.replace_pic("nope.png", io.BytesIO(_media_bytes("p7_media3x2.png")))
+    return {"w": "缺失标识"}
+''')
+def p7_pic_missing(doc):
+    doc.add_paragraph("缺失标识 {{ w }}")
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+
+
+# 103
+@fixture("p7_embedded_zipname",
+         "render: replace_embedded (CRC) + replace_zipname (exact) on manual oleObject parts",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    # 上游 replace_embedded 的 dst 只收文件路径；src 可 file-like。
+    tpl.replace_embedded(io.BytesIO(_media_bytes("p7_embed_orig1.bin")),
+                         _media_path("p7_embed_new1.bin"))
+    tpl.replace_zipname("word/embeddings/p7_ole2.bin",
+                        _media_path("p7_embed_new2.bin"))
+    return {"e": "嵌入替换"}
+''')
+def p7_embedded_zipname(doc):
+    doc.add_paragraph("嵌入对象替换 {{ e }}")
+    package = doc.part.package
+    # 探针实证：Part + relate_to 挂上的 embeddings part 会被
+    # python-docx 保存（图遍历可达，CT Override 同步保留）。
+    part1 = Part(PackURI("/word/embeddings/p7_ole1.bin"),
+                 CT_OLEOBJECT, _p7_media("p7_embed_orig1.bin"), package)
+    doc.part.relate_to(part1, REL_OLEOBJECT)
+    part2 = Part(PackURI("/word/embeddings/p7_ole2.bin"),
+                 CT_OLEOBJECT, _p7_media("p7_embed_orig2.bin"), package)
+    doc.part.relate_to(part2, REL_OLEOBJECT)
+
+
+def _p7_media(name):
+    """与生成素材同源的字节（build 期挂 Part 用；读取 media/ 已写出文件）。"""
+    return (Path(__file__).resolve().parent / "media" / name).read_bytes()
+
+
+# 104（skip_render：不 render 直接 save，docPr 保持模板原 id=1）
+@fixture("p7_replace_only", "save without render: replace_media only (no docPr renumber)",
+         "P7", "render", context_kind="python", skip_render=True,
+         context_src='''
+def build_context(tpl):
+    tpl.replace_media(io.BytesIO(_media_bytes("p7_dummy.png")),
+                      io.BytesIO(_media_bytes("p7_media3x2.png")))
+    return {}
+''')
+def p7_replace_only(doc):
+    doc.add_paragraph("纯替换静态段落（无 jinja 标签）")
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+
+
+# 105
+@fixture("p7_undeclared_vars",
+         "render: get_undeclared_template_variables feeds the variable list into ctx",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    names = sorted(tpl.get_undeclared_template_variables())
+    return {"vars": ",".join(names)}
+''')
+def p7_undeclared_vars(doc):
+    doc.add_paragraph("{{ a }}")
+    doc.add_paragraph("{% if b %}有B {{ c }}{% endif %}")
+    # p 标签必须独占段落（同段写 for/endfor 会被 jinja 判 unknown tag）。
+    doc.add_paragraph("{%p for item in items %}")
+    doc.add_paragraph("{{ item.name }}")
+    doc.add_paragraph("{%p endfor %}")
+    doc.add_paragraph("变量清单: {{ vars }}")
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
@@ -1493,7 +1669,7 @@ def main():
                     encoding="utf-8")
                 context_field = "contexts/%s.json" % fx["id"]
 
-        records.append({
+        record = {
             "id": fx["id"],
             "feature": fx["feature"],
             "phase": fx["phase"],
@@ -1506,7 +1682,11 @@ def main():
             "known_deviations": [],
             "owner": "vegah",
             "issue": "",
-        })
+        }
+        # P7：仅 True 时落字段（runner/oracle 双侧按缺省 false 处理）。
+        if fx["skip_render"]:
+            record["skip_render"] = True
+        records.append(record)
 
     manifest = {"upstream": UPSTREAM, "fixtures": records}
     MANIFEST_PATH.write_text(

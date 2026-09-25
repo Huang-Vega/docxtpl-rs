@@ -105,6 +105,18 @@
 | 子文档图片合并（扩展名取源 part 后缀、CT 取源包声明、字节 sha1 去重；media/主 rels/CT 经 ImageInjections 随 finish 落定）与 external 超链接关系迁移 | compatible 目标（逐字节） | p6_subdoc_image |
 | 引用部件递归复制（partname/rId 空洞回填）、bookmark/docPr/cNvPr 重编号、页眉页脚引用剥离、分节守卫（语料内均走 no-op 路径，由字节基线钉死） | compatible 目标 | 全部 p6 fixture |
 
+### P7（媒体/嵌入替换族与模板自省，0.1.0-alpha 增量，ADR-008）
+
+| 功能 | 级别 | fixture 类别 |
+|---|---|---|
+| `replace_media` 按源字节 CRC32 替换 `word/media/` 条目（post 路径仅换 blob；页眉引用的同一 media part 全局命中） | compatible 目标（逐字节） | p7_media_body / p7_media_header |
+| `replace_pic` 按 cNvPr name/title/descr 标识替换图片 blob（主文档 + 主 rels 中 header/footer 目标出现序；pic:graphicData only；同 part 多引用一份；注册插入序匹配、命中即 break） | compatible 目标（逐字节） | p7_pic_match |
+| `replace_pic` 标识全部未命中 → ValueError（allow_missing_pics=False，错误类别对齐） | compatible 目标 | p7_pic_missing |
+| `replace_embedded`（`word/embeddings/` CRC）+ `replace_zipname`（zip 条目全名精确，前导 `/` strip；优先级高于 CRC） | compatible 目标（逐字节） | p7_embedded_zipname |
+| 不渲染直接保存（`finish_without_render`：不跑 fix_tables/fix_docpr_ids，docPr id 保持模板原值；pre/post 替换照常） | compatible 目标（逐字节） | p7_replace_only（skip_render） |
+| `reset_replacements` 清空四类注册表 | compatible 目标 | 由库单测/会话路径覆盖 |
+| `get_undeclared_template_variables` 模板自省（body + 全部 header/footer patch 后裸 jinja 元分析；循环变量自动排除） | compatible 目标（BTreeSet 排序等价 Python sorted） | p7_undeclared_vars |
+
 ### unsupported（明确拒绝）
 
 - 传入自定义 `jinja_env` / Jinja2 扩展 / line statements / 任意 Python 对象与可调用。
@@ -127,13 +139,16 @@
 | DEV-0010 | 子文档编号合并的非确定性/隐式建部件路径不支持，检测到即返回带 part 名错误：复制的 `w:abstractNum` 含 `w:nsid`（上游按 `random.random()` 重写，输出非确定）；主包缺 `word/numbering.xml` 而子文档引用编号（上游从内置默认模板新建该 part）；`restart_first_numbering` 穿过全部 guard 后实际触发编号重启修改块。guard 链正常退出（标题 outlineLvl / bullet / 无 pStyle / 无 numId）仍为 no-op，与上游一致 | ADR-007 |
 | DEV-0011 | 子文档 SmartArt（`dgm:relIds[@r:dm]`）、VML 形状图片（`v:shape`/`v:imagedata`）、脚注引用（`w:footnoteReference`）的部件合并不支持，检测到即返回错误；P6 fixture 全域规避 | ADR-007 |
 | DEV-0012 | 主文档与子文档均含多个分节时，`fix_section_types` 需改写主分节起始类型，本侧返回错误；任一侧 section≤1 时上游本就 no-op，行为一致 | ADR-007 |
+| DEV-0013 | `undeclared_variables` 不提供上游可选的 `context` 差集参数（返回全量未声明集合，由调用方自行差集）与自定义 `jinja_env`；CRC/zipname 替换未命中与上游同为静默无操作；replace_pic 的 `allow_missing_pics=True` 宽松开关不提供（恒为上游默认 False） | ADR-008 |
 
 ## 6. fixture 基线
 
 见 `tests/fixtures/manifest.json`（P0：20 个往返；P2/P3：48 个成功 +
 1 个 error 预期 = 49 个；P4：16 个成功 + 1 个 error 预期 = 17 个；
 P5：6 个成功 + 1 个 error 预期 = 7 个；P6：5 个成功 = 5 个
-（另各带 `templates/<id>_sub.docx` 子文档）；共 78 个 `mode=render`
+（另各带 `templates/<id>_sub.docx` 子文档）；P7：6 个成功 +
+1 个 error 预期 = 7 个（其中 p7_replace_only 标 `skip_render: true`，
+另带 8 个 `media/p7_*` 替换素材）；共 85 个 `mode=render`
 条目；全部标注 id/feature/phase/mode/context_kind/expected/owner）。
 差分实测结果见 §7。
 
@@ -165,22 +180,30 @@ exclusive C14N sha256 一致（docProps/core.xml 时间戳归一化）。
 | p6_subdoc_basic / p6_subdoc_verbatim / p6_subdoc_untagged（子文档普通段落片段、字面 jinja 标签不二次求值、空 body 片段） | 3 | 3 MATCH |
 | p6_subdoc_style（样式 name 映射复用 + 自定义样式 deepcopy append + 编号/linked 链） | 1 | 1 MATCH |
 | p6_subdoc_image（子文档图片字节 sha1 合并、media/主 rels/CT 落定 + external 超链接关系迁移） | 1 | 1 MATCH |
+| p7_media_body / p7_media_header（CRC32 媒体替换，正文/页眉引用同一 media part 全局命中） | 2 | 2 MATCH |
+| p7_pic_match（cNvPr name/title 标识替换两图，注册插入序匹配） | 1 | 1 MATCH |
+| p7_pic_missing（replace_pic 标识未命中 ValueError） | 1 | 错误类别一致（Value） |
+| p7_embedded_zipname（embeddings CRC 替换 + zipname 精确替换 OLE part） | 1 | 1 MATCH |
+| p7_replace_only（skip_render 不渲染直接保存，docPr id 保持原值 + CRC 媒体替换） | 1 | 1 MATCH |
+| p7_undeclared_vars（body+story 未声明变量自省，循环变量自动排除） | 1 | 1 MATCH |
 | rt_* 真实 docx OPC 往返（docxtpl-opc fixture_roundtrip） | 20 | 20 逐 part 字节一致 |
-| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 78 | 78 字节一致 |
-| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 76 | 76 一致 |
-| **合计** | **252 项断言/用例** | **全部通过，无偏差、无未支持** |
+| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 85 | 85 字节一致 |
+| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 83 | 83 一致 |
+| **合计** | **273 项断言/用例** | **全部通过，无偏差、无未支持** |
 
-结论：0.1.0-alpha 范围内（§4 P2/P3/P4/P5/P6 矩阵 + render_properties）与
+结论：0.1.0-alpha 范围内（§4 P2/P3/P4/P5/P6/P7 矩阵 + render_properties）与
 Python oracle **逐字节等价**（DEV-0003 的条目顺序/时间戳归一化未被触发：
 实际输出连原始 part 字节都已一致——含 P4 新增的 media part、document rels
-与 [Content_Types].xml 重建，P5 多 owner story rels 与 CT 排序归一，以及
-P6 子文档合并写入的样式/图片 part、主 rels 与 CT 变更）。
+与 [Content_Types].xml 重建，P5 多 owner story rels 与 CT 排序归一，
+P6 子文档合并写入的样式/图片 part、主 rels 与 CT 变更，以及 P7 就地
+替换的 media/embeddings blob 与不渲染直存路径）。
 错误用例的稳定类别（`TemplateErrorKind::Syntax` /
-`TemplateErrorKind::Image`）对齐上游异常分类，story/subdoc 错误带具体
-part 名。
+`TemplateErrorKind::Image` / `TemplateErrorKind::InvalidArgument`）
+对齐上游异常分类，story/subdoc/替换错误带具体 part 名。
 
 已知边界（不属本阶段验收项）：DEV-0006 脚注图片、DEV-0007 同 part 双
 rel/endnotes/外部 story 不支持；DEV-0008～DEV-0012 的 Subdoc 借用模式/
-custom.xml/编号非确定路径/SmartArt/VML/脚注/两侧多节不支持；DEV-0002 的
-libxml2 recover 长尾仅以 corpus 与探针规则钉死；DEV-0005 的 autoescape +
-富值路径不在 oracle 覆盖内；corpus 之外的输入不承诺字节等价。
+custom.xml/编号非确定路径/SmartArt/VML/脚注/两侧多节不支持；DEV-0013 的
+自省差集参数/自定义 jinja_env/allow_missing_pics 宽松开关不提供；
+DEV-0002 的 libxml2 recover 长尾仅以 corpus 与探针规则钉死；DEV-0005 的
+autoescape + 富值路径不在 oracle 覆盖内；corpus 之外的输入不承诺字节等价。
