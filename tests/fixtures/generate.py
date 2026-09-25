@@ -54,6 +54,7 @@ UPSTREAM = {"docxtpl": "0.20.2", "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6c
 EXPECTED_OVERRIDES = {
     "r2_syntax_error": "error",
     "p4_img_bad": "error",
+    "p5_hf_syntax_error": "error",
 }
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -198,6 +199,33 @@ def postprocess_footnotes(path):
     rewrite_zip(
         path,
         add_parts={"word/footnotes.xml": FOOTNOTES_XML},
+        transform={
+            "[Content_Types].xml": _add_content_type_override("/word/footnotes.xml", CT_FOOTNOTES),
+            "word/_rels/document.xml.rels": _add_relationship(REL_FOOTNOTES, "footnotes.xml"),
+            "word/document.xml": _append_footnote_reference,
+        },
+    )
+
+
+# P5：与 FOOTNOTES_XML 同构，但正文脚注里带 jinja 标签（变量 + RichText +
+# Listing）；上游把 footnotes 当通用二进制 part，渲染字符串原样写回。
+FOOTNOTES_TAGS_XML = (
+    "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n"
+    '<w:footnotes xmlns:w="' + W_NS + '">'
+    '<w:footnote w:type="separator" w:id="-1">'
+    "<w:p><w:r><w:separator/></w:r></w:p></w:footnote>"
+    '<w:footnote w:type="continuationSeparator" w:id="0">'
+    "<w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>"
+    "<w:footnote w:id=\"1\"><w:p><w:r><w:t>FN {{fn}} {{rt}} {{lst}}</w:t></w:r>"
+    "</w:p></w:footnote>"
+    "</w:footnotes>"
+).encode("utf-8")
+
+
+def postprocess_footnotes_tags(path):
+    rewrite_zip(
+        path,
+        add_parts={"word/footnotes.xml": FOOTNOTES_TAGS_XML},
         transform={
             "[Content_Types].xml": _add_content_type_override("/word/footnotes.xml", CT_FOOTNOTES),
             "word/_rels/document.xml.rels": _add_relationship(REL_FOOTNOTES, "footnotes.xml"),
@@ -1184,6 +1212,127 @@ def p4_combo_rich(doc):
     fill_row(t, 2, ["{{r.name}}", "{{r.qty}}", "{{r.img}}"])
     t.cell(3, 0).text = "{%tr endfor %}"
     doc.add_paragraph("N: {{notes}}")
+
+
+# ===========================================================================
+# P5 -- headers / footers / footnotes multi-part rendering (ADR-006)
+# ===========================================================================
+
+def _unlink_part(part):
+    """让 header/footer 脱离"链接到上一节"并生成独立 part（python-docx）。"""
+    part.is_linked_to_previous = False
+    return part
+
+
+# 87
+@fixture("p5_hf_basic", "render: header vars/if/for + footer var + body", "P5",
+         "render", context={"htitle": "页眉标题", "hshow": True,
+                             "hitems": ["甲", "乙", "丙"],
+                             "ftitle": "页脚标题", "pageno": 7,
+                             "btitle": "正文标题"})
+def p5_hf_basic(doc):
+    sec = doc.sections[0]
+    header = _unlink_part(sec.header)
+    header.paragraphs[0].text = "HDR {{htitle}}"
+    header.add_paragraph("{% if hshow %}VISIBLE{% endif %}")
+    header.add_paragraph("{%p for it in hitems %}")
+    header.add_paragraph("ITEM {{it}}")
+    header.add_paragraph("{%p endfor %}")
+    footer = _unlink_part(sec.footer)
+    footer.paragraphs[0].text = "FTR {{ftitle}} / P{{pageno}}"
+    doc.add_paragraph("BODY {{btitle}}")
+
+
+# 88
+@fixture("p5_hf_multi", "render: two sections with independent headers/footers",
+         "P5", "render", context={"h1": "头一", "f1": "脚一", "b1": "节一正文",
+                                   "h2": "头二", "f2": "脚二", "b2": "节二正文"})
+def p5_hf_multi(doc):
+    sec0 = doc.sections[0]
+    _unlink_part(sec0.header).paragraphs[0].text = "H1 {{h1}}"
+    _unlink_part(sec0.footer).paragraphs[0].text = "F1 {{f1}}"
+    doc.add_paragraph("SEC1 {{b1}}")
+
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    sec1 = doc.sections[1]
+    _unlink_part(sec1.header).paragraphs[0].text = "H2 {{h2}}"
+    _unlink_part(sec1.footer).paragraphs[0].text = "F2 {{f2}}"
+    doc.add_paragraph("SEC2 {{b2}}")
+
+
+# 89
+@fixture("p5_footnotes_basic", "render: footnotes part vars + RichText + Listing",
+         "P5", "render", context_kind="python", post=postprocess_footnotes_tags,
+         context_src='''
+def build_context(tpl):
+    return {"bn": "正文引用", "fn": "脚注值",
+            "rt": RichText("富文本", bold=True),
+            "lst": Listing("L1\\nL2\\tT2")}
+''')
+def p5_footnotes_basic(doc):
+    doc.add_paragraph("MAIN {{bn}}")
+
+
+# 90
+@fixture("p5_hf_image",
+         "render: same image in body/header/footer (package dedup, 3 rels scopes)",
+         "P5", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {
+        "ht": "页眉",
+        "himg": InlineImage(tpl, _img("p4_dot2x1.png")),
+        "himg2": InlineImage(tpl, _img("p4_dot2x1.png"),
+                             anchor="https://example.com/anchor"),
+        "ft": "页脚",
+        "fimg": InlineImage(tpl, _img("p4_dot2x1.png")),
+        "bt": "正文",
+        "bimg": InlineImage(tpl, _img("p4_dot2x1.png")),
+    }
+''')
+def p5_hf_image(doc):
+    sec = doc.sections[0]
+    _unlink_part(sec.header).paragraphs[0].text = "HDR {{ht}} {{himg}} {{himg2}}"
+    _unlink_part(sec.footer).paragraphs[0].text = "FTR {{ft}} {{fimg}}"
+    doc.add_paragraph("BODY {{bt}} {{bimg}}")
+
+
+# 91
+@fixture("p5_hf_richtext", "render: RichText/Listing in header, RichText in footer",
+         "P5", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    url_id = tpl.build_url_id("https://docxtpl.readthedocs.io/p5")
+    return {"hrt": RichText("页眉富", bold=True, color="1F4E79"),
+            "hlst": Listing("HL1\\nHL2"),
+            "frt": RichText("页脚富", italic=True),
+            "brt": RichText("正文链接", url_id=url_id,
+                            underline="single", color="0563C1")}
+''')
+def p5_hf_richtext(doc):
+    sec = doc.sections[0]
+    _unlink_part(sec.header).paragraphs[0].text = "H {{hrt}} {{hlst}}"
+    _unlink_part(sec.footer).paragraphs[0].text = "F {{frt}}"
+    doc.add_paragraph("B {{brt}}")
+
+
+# 92
+@fixture("p5_hf_syntax_error", "render: jinja syntax error in header part", "P5",
+         "render", context={"x": True})
+def p5_hf_syntax_error(doc):
+    sec = doc.sections[0]
+    _unlink_part(sec.header).paragraphs[0].text = "HDR {% if x %}missing endif"
+    doc.add_paragraph("BODY {{x}}")
+
+
+# 93
+@fixture("p5_hf_untagged", "render: untagged header/footer roundtrip (lxml reserialize)",
+         "P5", "render", context={"unused": "未使用"})
+def p5_hf_untagged(doc):
+    sec = doc.sections[0]
+    _unlink_part(sec.header).paragraphs[0].text = "Plain Header 无标签"
+    _unlink_part(sec.footer).paragraphs[0].text = "Plain Footer 无标签"
+    doc.add_paragraph("Plain body without tags")
 
 
 # ===========================================================================

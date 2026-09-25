@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use crate::context::{ImageRegistry, ImageResolveError, NullRegistry, RenderContext, RenderValue};
 use crate::error::{RenderError, TemplateErrorKind};
 use crate::fix_tables::{fix_docpr_ids, fix_tables};
+use docxtpl_rich::InlineImage;
 
 const MAX_RENDERED_XML_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TEMPLATE_FUEL: u64 = 10_000_000;
@@ -122,11 +123,123 @@ pub fn render_document_xml_ctx(
     options: &RenderOptions,
     registry: &mut dyn ImageRegistry,
 ) -> Result<RenderOutcome, RenderError> {
-    // 0. shape_id：上游对渲染前的原始 document 树执行 next_id
-    // （xpath("//@id")：只命中无命名空间前缀的 id 属性，w:id/r:id 不命中），
-    // 取纯数字 id 的最大值 +1，无则 1。字符串渲染不改树，多图共享同一 id。
-    let shape_id = next_shape_id(src_xml);
+    render_part_xml(
+        src_xml,
+        context,
+        options,
+        registry,
+        MAIN_PART,
+        PartKind::Document,
+    )
+}
 
+/// 页眉/页脚 story part 渲染（P5，ADR-006）：与正文共用
+/// patch → jinja → resolve_listing 管线，但**不做 fix_tables /
+/// fix_docpr_ids**；shape_id 取自本 part 原始 XML（part 级作用域，
+/// docPr 保留本地 id，不像正文被重编为 1001 起）。
+///
+/// 输出为 lxml 风格完整序列化（单引号 XML 声明），对齐上游把页眉/页脚
+/// 重新映射为 XmlPart 后的落盘字节。
+pub fn render_story_xml_ctx(
+    src_xml: &str,
+    context: &RenderContext,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+) -> Result<RenderOutcome, RenderError> {
+    render_part_xml(
+        src_xml,
+        context,
+        options,
+        registry,
+        part_name,
+        PartKind::Story,
+    )
+}
+
+/// 脚注 part 渲染（P5，ADR-006）：patch → jinja → resolve_listing 后
+/// **直接返回字符串**，不做 XML 解析/重序列化——上游脚注 part 是通用
+/// 二进制 Part，`part._blob = rendered.encode()` 原样保留模板声明与未改
+/// 字节。调用方把返回值按 UTF-8 写回原 part。
+///
+/// 脚注中的 InlineImage 不被支持（上游在通用 Part 上调用
+/// new_pic_inline 会 AttributeError，见 DEV-0006）；此入口使用
+/// [`NullRegistry`]，出现图片值即报错。
+pub fn render_footnotes_xml_ctx(
+    src_xml: &str,
+    context: &RenderContext,
+    options: &RenderOptions,
+    part_name: &str,
+) -> Result<String, RenderError> {
+    let mut null_registry = NullRegistry;
+    // 脚注不允许图片，shape_id 不会被消费，传 0 即可。
+    render_part_string(src_xml, context, options, &mut null_registry, part_name, 0)
+}
+
+/// 管线处理的 part 种类：决定 shape_id 作用域与渲染后处理（P5，ADR-006）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartKind {
+    /// 正文 word/document.xml：fix_tables + fix_docpr_ids（docPr 1001 起）。
+    Document,
+    /// 页眉/页脚：只解析愈合后序列化，不动表格与 docPr。
+    Story,
+}
+
+/// 按 part 种类跑完整管线并返回序列化 XML。
+fn render_part_xml(
+    src_xml: &str,
+    context: &RenderContext,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+    kind: PartKind,
+) -> Result<RenderOutcome, RenderError> {
+    // shape_id 作用域为单个 part（上游 StoryPart.next_id 对原始树取
+    // xpath("//@id") 最大值 +1；正文也在渲染前对原始 document 计算）。
+    let shape_id = shape_id_of(src_xml);
+
+    let dst = render_part_string(src_xml, context, options, registry, part_name, shape_id)?;
+
+    // 宽松(recover)解析愈合（安全限额仍强制）。
+    let outcome =
+        XmlDocument::parse_lenient(&dst, &XmlLimits::default()).map_err(|e| RenderError::Xml {
+            part: part_name.to_string(),
+            source: e,
+        })?;
+    let mut doc = outcome.doc;
+
+    if kind == PartKind::Document {
+        // 仅正文执行 fix_tables / fix_docpr_ids（上游 render() 只对 body tree
+        // 调这两个后处理）。
+        fix_tables(&mut doc)?;
+        fix_docpr_ids(&mut doc);
+        Ok(RenderOutcome {
+            xml: doc.serialize(),
+            recoveries: outcome.diagnostics,
+        })
+    } else {
+        // 页眉/页脚映射为新 XmlPart 时按 remove_blank_text 解析（剥除注入
+        // 图片 XML 的换行/缩进），且无换挂过程，wp:inline 自带的冗余
+        // xmlns:wp/xmlns:r 声明原样保留（ADR-006）。
+        doc.strip_blank_text();
+        Ok(RenderOutcome {
+            xml: doc.serialize_story(),
+            recoveries: outcome.diagnostics,
+        })
+    }
+}
+
+/// 管线的字符串阶段：patch → 段落换行 → MiniJinja 渲染 → 还原
+/// （换行/字面转义）→ resolve_listing。正文、页眉页脚、脚注共用。
+#[allow(clippy::too_many_arguments)]
+fn render_part_string(
+    src_xml: &str,
+    context: &RenderContext,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+    shape_id: i64,
+) -> Result<String, RenderError> {
     // 1. patch_xml：13 步有界正则变换。
     let patched = patch_xml(src_xml);
 
@@ -136,10 +249,11 @@ pub fn render_document_xml_ctx(
         .into_owned();
 
     // 3. MiniJinja 渲染（默认对齐 jinja2：lenient undefined、autoescape=false）。
-    //    富值在此处整体转换（图片解析/关系分配随之发生）。
+    //    图片先以占位符参与渲染（对齐上游惰性 InlineImage.__str__：只解析
+    //    本 part 模板实际引用的图片，ADR-006），渲染后再按出现顺序落图。
     let env = build_jinja_env(options.autoescape());
-    let root = context_to_minijinja(context, registry, shape_id, MAIN_PART)?;
-    let rendered = render_inline_value(&env, &prepared, root, MAIN_PART)?;
+    let (root, pending_images) = context_to_minijinja(context);
+    let rendered = render_inline_value(&env, &prepared, root, part_name)?;
 
     // 4. 撤销换行 + 还原 {_{ }_} 字面转义。
     let dst = newline_before_p_remove()
@@ -153,36 +267,29 @@ pub fn render_document_xml_ctx(
 
     // 5. resolve_listing：\n \t \a \f → br/tab/换段/分页。
     let dst = resolve_listing(&dst);
+
+    // 5.5 图片占位符替换：按输出中的出现顺序解析（rId 由注册表按
+    //     reltype/目标/模式去重复用）。shape_id 对同一 part 的所有图片相同：
+    //     上游 StoryPart.next_id 每次对**未被渲染改动的原始 part 树**取
+    //     max(//@id)+1（无缓存，渲染只产字符串，不回写 part 元素），因此
+    //     多张图片拿到同一 id/name；正文再由 fix_docpr_ids 把 id 重排为
+    //     1001 起（name 保留 "Picture N"），页眉/页脚则原样保留。
+    let dst = substitute_images(&dst, registry, &pending_images, shape_id, part_name)?;
     if dst.len() > MAX_RENDERED_XML_BYTES {
         return Err(RenderError::Limit {
-            part: MAIN_PART.to_string(),
+            part: part_name.to_string(),
             kind: "rendered_xml_bytes",
             max: MAX_RENDERED_XML_BYTES as u64,
         });
     }
-
-    // 6. 宽松(recover)解析愈合（安全限额仍强制）。
-    let outcome =
-        XmlDocument::parse_lenient(&dst, &XmlLimits::default()).map_err(|e| RenderError::Xml {
-            part: MAIN_PART.to_string(),
-            source: e,
-        })?;
-    let mut doc = outcome.doc;
-
-    // 7. fix_tables / fix_docpr_ids。
-    fix_tables(&mut doc)?;
-    fix_docpr_ids(&mut doc);
-
-    Ok(RenderOutcome {
-        xml: doc.serialize(),
-        recoveries: outcome.diagnostics,
-    })
+    Ok(dst)
 }
 
 /// 上游 `next_id`：原始 XML 中无前缀 `id="数字"` 属性的最大值 +1（无则 1）。
 ///
 /// 正则要求 `id` 前是空白，因此 `w:id` / `r:id`（冒号紧贴）不会误匹配。
-fn next_shape_id(src_xml: &str) -> i64 {
+/// 每个渲染 part 独立计算（P5，ADR-006：页眉/页脚 shape_id 为 part 级）。
+pub fn shape_id_of(src_xml: &str) -> i64 {
     fn shape_id_re() -> &'static Regex {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| Regex::new(r#"\sid="([0-9]+)""#).expect("invalid regex"))
@@ -198,44 +305,104 @@ fn next_shape_id(src_xml: &str) -> i64 {
     max_id + 1
 }
 
+/// 图片占位符前缀/后缀（转换期写入，渲染后由 [`substitute_images`] 替换）。
+///
+/// 只含 `@`、字母、数字，不含 XML/Jinja 特殊字符：autoescape 不转义，
+/// patch_xml/resolve_listing 不触碰；用户文本几乎不可能恰好构成该 token。
+const IMAGE_TOKEN_PREFIX: &str = "\u{1}DOXTPLRSIMG";
+const IMAGE_TOKEN_SUFFIX: &str = "@\u{1}";
+
+/// 图片占位符替换正则（index 为 pending_images 中的下标）。
+fn image_token_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(
+            "{}(\\d+){}",
+            regex::escape(IMAGE_TOKEN_PREFIX),
+            regex::escape(IMAGE_TOKEN_SUFFIX)
+        ))
+        .expect("invalid regex")
+    })
+}
+
 /// 把 [`RenderContext`] 转换为 MiniJinja 根值。
-pub(crate) fn context_to_minijinja(
-    context: &RenderContext,
-    registry: &mut dyn ImageRegistry,
-    shape_id: i64,
-    part: &str,
-) -> Result<Value, RenderError> {
+///
+/// InlineImage 不立即解析，而是替换为占位符（对齐上游惰性
+/// `InlineImage.__str__`：只有模板实际引用的图片才在当前 part 的关系作用域
+/// 内解析，ADR-006）；返回的 `pending_images` 按下标与占位符对应，
+/// [`substitute_images`] 按渲染输出中的出现顺序消费。
+pub(crate) fn context_to_minijinja(context: &RenderContext) -> (Value, Vec<&InlineImage>) {
+    let mut pending = Vec::new();
     let mut pairs = Vec::with_capacity(context.len());
     for (key, value) in context.iter() {
-        pairs.push((
-            Value::from(key),
-            value_to_minijinja(value, registry, shape_id, part)?,
-        ));
+        pairs.push((Value::from(key), value_to_minijinja(value, &mut pending)));
     }
-    Ok(Value::from_iter(pairs))
+    (Value::from_iter(pairs), pending)
 }
 
 /// 递归把 [`RenderValue`] 转换为 MiniJinja 值。
 ///
 /// RichText/RichTextParagraph/Listing 直接给出生成的 XML 字符串（对齐上游
-/// `__str__`，autoescape 缺省关闭）；InlineImage 经注册表解析后生成
-/// `wp:inline` 字符串。
-fn value_to_minijinja(
-    value: &RenderValue,
+/// `__str__`，autoescape 缺省关闭）；InlineImage 登记到 `pending` 并以
+/// 占位符参与渲染。
+fn value_to_minijinja<'a>(value: &'a RenderValue, pending: &mut Vec<&'a InlineImage>) -> Value {
+    match value {
+        RenderValue::Json(json) => Value::from_serialize(json),
+        RenderValue::RichText(rich) => Value::from(rich.to_xml()),
+        RenderValue::RichTextParagraph(paragraph) => Value::from(paragraph.to_xml()),
+        RenderValue::Listing(listing) => Value::from(listing.to_xml()),
+        RenderValue::Image(image) => {
+            let index = pending.len();
+            pending.push(image);
+            Value::from(format!("{IMAGE_TOKEN_PREFIX}{index}{IMAGE_TOKEN_SUFFIX}"))
+        }
+        RenderValue::Array(items) => Value::from_iter(
+            items
+                .iter()
+                .map(|item| value_to_minijinja(item, pending))
+                .collect::<Vec<_>>(),
+        ),
+        RenderValue::Object(entries) => Value::from_iter(
+            entries
+                .iter()
+                .map(|(key, item)| (Value::from(key.as_str()), value_to_minijinja(item, pending))),
+        ),
+    }
+}
+
+/// 把渲染输出中的图片占位符替换为真实 `wp:inline`/锚点 XML。
+///
+/// 按占位符在输出中**出现的顺序**逐次解析（对齐上游 jinja 渲染期惰性
+/// `__str__` 的调用顺序）：同一图片出现多次就解析多次——rId 由注册表
+/// 按（reltype/目标/模式）去重复用；docPr 的 id/name 全部使用同一个
+/// `shape_id`（见 [`shape_id_of`] 与上游无缓存的 `StoryPart.next_id`）。
+/// 未被模板引用的图片占位符不会出现，也就不会解析，关系只落在实际引用
+/// 它的 part 作用域。
+pub(crate) fn substitute_images(
+    rendered: &str,
     registry: &mut dyn ImageRegistry,
+    pending: &[&InlineImage],
     shape_id: i64,
     part: &str,
-) -> Result<Value, RenderError> {
-    match value {
-        RenderValue::Json(json) => Ok(Value::from_serialize(json)),
-        RenderValue::RichText(rich) => Ok(Value::from(rich.to_xml())),
-        RenderValue::RichTextParagraph(paragraph) => Ok(Value::from(paragraph.to_xml())),
-        RenderValue::Listing(listing) => Ok(Value::from(listing.to_xml())),
-        RenderValue::Image(image) => {
+) -> Result<String, RenderError> {
+    let mut last_error: Option<RenderError> = None;
+    let result = image_token_re().replace_all(rendered, |captures: &regex::Captures| {
+        if last_error.is_some() {
+            // 前一次解析已失败：保持剩余占位符不动（最终整体返回错误）。
+            return captures.get(0).unwrap().as_str().to_string();
+        }
+        let index: usize = match captures[1].parse() {
+            Ok(value) => value,
+            Err(_) => return captures.get(0).unwrap().as_str().to_string(),
+        };
+        let Some(image) = pending.get(index).copied() else {
+            return captures.get(0).unwrap().as_str().to_string();
+        };
+        let resolve = (|| {
             let rels = registry
                 .resolve_image(image)
                 .map_err(|err| image_error(&err, part))?;
-            let xml = docxtpl_rich::render_inline_image(
+            docxtpl_rich::render_inline_image(
                 image,
                 shape_id,
                 &rels.blip_rid,
@@ -248,26 +415,19 @@ fn value_to_minijinja(
                     },
                     part,
                 )
-            })?;
-            Ok(Value::from(xml))
-        }
-        RenderValue::Array(items) => {
-            let mut converted = Vec::with_capacity(items.len());
-            for item in items {
-                converted.push(value_to_minijinja(item, registry, shape_id, part)?);
+            })
+        })();
+        match resolve {
+            Ok(xml) => xml,
+            Err(err) => {
+                last_error = Some(err);
+                captures.get(0).unwrap().as_str().to_string()
             }
-            Ok(Value::from_iter(converted))
         }
-        RenderValue::Object(entries) => {
-            let mut converted = Vec::with_capacity(entries.len());
-            for (key, item) in entries {
-                converted.push((
-                    Value::from(key.as_str()),
-                    value_to_minijinja(item, registry, shape_id, part)?,
-                ));
-            }
-            Ok(Value::from_iter(converted))
-        }
+    });
+    match last_error {
+        Some(err) => Err(err),
+        None => Ok(result.into_owned()),
     }
 }
 
@@ -300,7 +460,7 @@ pub(crate) fn render_inline_value(
     env: &Environment,
     template_src: &str,
     root: Value,
-    part: &'static str,
+    part: &str,
 ) -> Result<String, RenderError> {
     let template = env
         .template_from_str(template_src)
@@ -438,14 +598,14 @@ mod context_render_tests {
 
     #[test]
     fn shape_id_scans_unprefixed_id_only() {
-        assert_eq!(next_shape_id("<w:document/>"), 1);
+        assert_eq!(shape_id_of("<w:document/>"), 1);
         // w:id / r:id 带前缀，不计数；docPr id=1 → 2
         let src = r#"<w:document><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:id="99"/></w:numPr></w:pPr>
 <w:drawing><wp:inline><wp:docPr id="1" name="Picture 1"/></wp:inline></w:drawing></w:document>"#;
-        assert_eq!(next_shape_id(src), 2);
+        assert_eq!(shape_id_of(src), 2);
         // 取最大 +1
         let src = r#"<wp:docPr id="1"/><wp:docPr id="5"/><a:hlinkClick r:id="rId9"/>"#;
-        assert_eq!(next_shape_id(src), 6);
+        assert_eq!(shape_id_of(src), 6);
     }
 
     #[test]
@@ -518,5 +678,111 @@ mod context_render_tests {
             error.kind().unwrap().oracle_exception(),
             "UnrecognizedImageError"
         );
+    }
+
+    /// P5：页眉 story part 渲染后不重编 docPr，新图取本 part 的 next_id
+    /// （既有 id=5 → 新图 id=6），既有 docPr 原样保留。
+    #[test]
+    fn story_part_keeps_local_docpr_ids_without_renumber() {
+        let png_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_dot2x1.png"
+        );
+        let image1 = InlineImage::from_path(png_path, None, None, None).unwrap();
+        let image2 = InlineImage::from_path(png_path, None, None, None).unwrap();
+        let mut ctx = RenderContext::new();
+        ctx.insert("x", "HX");
+        ctx.insert("img", image1);
+        ctx.insert("img2", image2);
+
+        let src = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:p><w:r><w:t>{{x}}{{img}}{{img2}}</w:t></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="5" name="Existing"/></wp:inline></w:drawing></w:r></w:p></w:hdr>"#;
+        let mut registry = StubRegistry {
+            fail: false,
+            calls: 0,
+        };
+        let outcome = render_story_xml_ctx(
+            src,
+            &ctx,
+            &RenderOptions::compat(),
+            &mut registry,
+            "word/header1.xml",
+        )
+        .unwrap();
+        // 既有 docPr id=5 保留（正文模式会被 fix_docpr_ids 改成 1003）
+        assert!(
+            outcome.xml.contains(r#"<wp:docPr id="5""#),
+            "{}",
+            outcome.xml
+        );
+        // 两张新图 shape_id 相同（上游 next_id 对原始树无缓存重复求值，
+        // 均为 max(5)+1=6），正文 fix_docpr_ids 不作用于 story part。
+        assert_eq!(
+            outcome.xml.matches(r#"<wp:docPr id="6""#).count(),
+            2,
+            "{}",
+            outcome.xml
+        );
+        assert!(outcome.xml.contains("HX"), "{}", outcome.xml);
+        assert_eq!(registry.calls, 2);
+    }
+
+    /// P5：页眉语法错误带上具体 part 名，类别为 Syntax。
+    #[test]
+    fn story_syntax_error_carries_header_part_name() {
+        let ctx = RenderContext::new();
+        let src = r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>{% if x %}open</w:t></w:r></w:p></w:hdr>"#;
+        let mut registry = StubRegistry {
+            fail: false,
+            calls: 0,
+        };
+        let error = render_story_xml_ctx(
+            src,
+            &ctx,
+            &RenderOptions::compat(),
+            &mut registry,
+            "word/header1.xml",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), Some(TemplateErrorKind::Syntax));
+        assert!(error.to_string().contains("word/header1.xml"), "{error}");
+    }
+
+    /// P5：脚注输出为原始字符串——模板声明/格式保留，仅做 jinja 替换与
+    /// resolve_listing，不经 XML 解析重序列化。
+    #[test]
+    fn footnotes_render_keeps_raw_declaration_and_bytes() {
+        let mut ctx = RenderContext::new();
+        ctx.insert("z", "ZZ");
+        let src = "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n".to_string()
+            + r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="1"><w:p><w:r><w:t>FN {{z}}</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
+        let out =
+            render_footnotes_xml_ctx(&src, &ctx, &RenderOptions::compat(), "word/footnotes.xml")
+                .unwrap();
+        // 声明原样保留（story/document 模式会统一重写声明）
+        assert!(
+            out.starts_with("<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n"),
+            "{out}"
+        );
+        assert!(out.contains("FN ZZ"), "{out}");
+    }
+
+    /// P5：脚注里出现 InlineImage → NullRegistry 拒绝（DEV-0006）。
+    #[test]
+    fn footnotes_reject_inline_image() {
+        let png_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_dot2x1.png"
+        );
+        let image = InlineImage::from_path(png_path, None, None, None).unwrap();
+        let mut ctx = RenderContext::new();
+        ctx.insert("img", image);
+        let src = r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="1"><w:p><w:r><w:t>{{img}}</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
+        assert!(render_footnotes_xml_ctx(
+            src,
+            &ctx,
+            &RenderOptions::compat(),
+            "word/footnotes.xml"
+        )
+        .is_err());
     }
 }

@@ -1,0 +1,12 @@
+{
+  "htitle": "页眉标题",
+  "hshow": true,
+  "hitems": [
+    "甲",
+    "乙",
+    "丙"
+  ],
+  "ftitle": "页脚标题",
+  "pageno": 7,
+  "btitle": "正文标题"
+}

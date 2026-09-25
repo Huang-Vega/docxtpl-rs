@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-25T11:19:11+08:00",
+  "generated_at": "2026-09-25T14:57:51+08:00",
   "versions": {
     "docxtpl": "0.20.2",
     "jinja2": "3.1.6",
@@ -604,6 +604,55 @@
     },
     {
       "id": "p4_combo_rich",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_hf_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_hf_multi",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_footnotes_basic",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_hf_image",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_hf_richtext",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p5_hf_syntax_error",
+      "mode": "render",
+      "status": "error",
+      "error_type": "TemplateSyntaxError",
+      "error_message": "Unexpected end of template. Jinja was looking for the following tags: 'elif' or 'else' or 'endif'. The innermost block that needs to be closed is 'if'."
+    },
+    {
+      "id": "p5_hf_untagged",
       "mode": "render",
       "status": "ok",
       "error_type": null,

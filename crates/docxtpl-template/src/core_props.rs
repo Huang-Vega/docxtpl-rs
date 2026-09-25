@@ -11,7 +11,9 @@ use serde_json::Value as JsonValue;
 
 use crate::context::{ImageRegistry, NullRegistry, RenderContext};
 use crate::error::RenderError;
-use crate::render::{build_jinja_env, context_to_minijinja, render_inline_value};
+use crate::render::{
+    build_jinja_env, context_to_minijinja, render_inline_value, substitute_images,
+};
 
 /// Dublin Core 元素命名空间（dc:title 等）。
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
@@ -61,7 +63,7 @@ pub fn render_core_properties_ctx(
 
     let env: Environment<'static> = build_jinja_env(autoescape);
     // core.xml 不会出现真正的 drawing，shape_id 固定 1 即可。
-    let jinja_root = context_to_minijinja(context, registry, 1, CORE_PART)?;
+    let (jinja_root, pending_images) = context_to_minijinja(context);
     let doc_root = doc.root();
 
     for (_python_name, local) in PROPERTIES {
@@ -75,6 +77,9 @@ pub fn render_core_properties_ctx(
                 .map_or_else(String::new, str::to_string)
         });
         let rendered = render_inline_value(&env, &initial, jinja_root.clone(), CORE_PART)?;
+        // 属性值中引用图片的病态场景：按出现顺序解析（关系归属当前注册表
+        // 作用域，与主流程一致）；正常文档不会在 dc 元素里放图片。
+        let rendered = substitute_images(&rendered, registry, &pending_images, 1, CORE_PART)?;
         let element = match existing {
             Some(id) => id,
             None => {

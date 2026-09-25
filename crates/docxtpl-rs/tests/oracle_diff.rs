@@ -283,6 +283,66 @@ fn build_python_context(id: &str, root: &Path, session: &mut RenderSession) -> R
             ctx.insert("rows", rows);
             ctx.insert("notes", Listing::new("first line\nsecond line\tlast"));
         }
+        "p5_footnotes_basic" => {
+            // footnotes part 走通用二进制 part 路径（原始字符串写回）
+            ctx.insert("bn", "正文引用");
+            ctx.insert("fn", "脚注值");
+            ctx.insert(
+                "rt",
+                RichText::text_with("富文本", &props(|p| p.bold = true)),
+            );
+            ctx.insert("lst", Listing::new("L1\nL2\tT2"));
+        }
+        "p5_hf_image" => {
+            // 同字节图片在正文/页眉/页脚：包级 media 去重，三套独立 rels。
+            // 插入序与各 part 模板引用序一致（惰性解析，关系只落在引用它的 part）。
+            ctx.insert("ht", "页眉");
+            ctx.insert("himg", media_image(root, "p4_dot2x1.png", None, None, None));
+            ctx.insert(
+                "himg2",
+                media_image(
+                    root,
+                    "p4_dot2x1.png",
+                    None,
+                    None,
+                    Some("https://example.com/anchor"),
+                ),
+            );
+            ctx.insert("ft", "页脚");
+            ctx.insert("fimg", media_image(root, "p4_dot2x1.png", None, None, None));
+            ctx.insert("bt", "正文");
+            ctx.insert("bimg", media_image(root, "p4_dot2x1.png", None, None, None));
+        }
+        "p5_hf_richtext" => {
+            // url_id 恒登记在主文档 rels（build_url_id），正文 RichText 引用
+            let url_id = session.build_url_id("https://docxtpl.readthedocs.io/p5");
+            ctx.insert(
+                "hrt",
+                RichText::text_with(
+                    "页眉富",
+                    &props(|p| {
+                        p.bold = true;
+                        p.color = Some("1F4E79".to_owned());
+                    }),
+                ),
+            );
+            ctx.insert("hlst", Listing::new("HL1\nHL2"));
+            ctx.insert(
+                "frt",
+                RichText::text_with("页脚富", &props(|p| p.italic = true)),
+            );
+            ctx.insert(
+                "brt",
+                RichText::text_with(
+                    "正文链接",
+                    &props(|p| {
+                        p.url_id = Some(url_id);
+                        p.underline = Some("single".to_owned());
+                        p.color = Some("0563C1".to_owned());
+                    }),
+                ),
+            );
+        }
         other => panic!("未实现的 python 上下文 fixture: {other}"),
     }
     ctx
@@ -316,10 +376,10 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
-    // P0–P3 48 个 + P4 17 个 = 65 个 render fixture。
+    // P0–P3 49 个 + P4 17 个 + P5 7 个 = 73 个 render fixture。
     assert!(
-        render_ids.len() >= 65,
-        "render fixture 不足 65 个（实际 {}）",
+        render_ids.len() >= 73,
+        "render fixture 不足 73 个（实际 {}）",
         render_ids.len()
     );
 

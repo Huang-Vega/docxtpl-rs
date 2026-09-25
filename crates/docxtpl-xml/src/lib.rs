@@ -77,9 +77,62 @@ impl XmlDocument {
         lenient::parse(xml, limits)
     }
 
-    /// 按 lxml 风格序列化整棵文档。
+    /// 按 lxml 风格序列化整棵文档（裁剪元素上与祖先重复的 xmlns 声明，
+    /// 对应正文换挂后的 lxml 行为）。
     #[must_use]
     pub fn serialize(&self) -> String {
         serialize::serialize(self)
+    }
+
+    /// 页眉/页脚专用序列化：保留元素开标签词法自带的 xmlns 声明（即使与
+    /// 祖先重复），对齐 story part 经 `XmlPart.load` 独立解析、无换挂的
+    /// lxml 输出（ADR-006）。
+    #[must_use]
+    pub fn serialize_story(&self) -> String {
+        serialize::serialize_with(
+            self,
+            serialize::SerializeOptions {
+                retain_redundant_ns: true,
+            },
+        )
+    }
+
+    /// 删除仅由 XML 空白字符组成、且不在 `xml:space="preserve"` 作用域内
+    /// 的文本节点。
+    ///
+    /// 对齐 python-docx oxml 解析器的 `remove_blank_text=True`：页眉/页脚
+    /// 映射为新 `XmlPart` 时按该选项解析，注入图片 XML 里 python-docx
+    /// 模板自带的换行/缩进空白会被剥除（ADR-006）；但 `w:t` 等元素显式
+    /// 标注 `xml:space="preserve"` 时，其中的空白文本必须保留（libxml2
+    /// 对该解析选项的语义：沿祖先轴追踪 xml:space，`preserve` 保留、
+    /// `default` 恢复裁剪）。
+    pub fn strip_blank_text(&mut self) {
+        let root = self.root();
+        let mut blank = Vec::new();
+        let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
+        while let Some((id, preserved)) = stack.pop() {
+            let mut preserved = preserved;
+            if self.node_kind(id) == NodeKind::Element {
+                if let Some(mode) = self.attr(id, ns_uri::XML, "space") {
+                    preserved = mode == "preserve";
+                }
+            } else if self.node_kind(id) == NodeKind::Text
+                && !preserved
+                && !self.node_value(id).is_empty()
+                && self
+                    .node_value(id)
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+            {
+                blank.push(id);
+            }
+            // 栈后进先出，反转子序以文档顺序处理（顺序对结果无影响，仅便于调试）。
+            for child in self.children(id).iter().rev() {
+                stack.push((*child, preserved));
+            }
+        }
+        for id in blank {
+            self.detach(id);
+        }
     }
 }

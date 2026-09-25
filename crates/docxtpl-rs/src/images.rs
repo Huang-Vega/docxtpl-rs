@@ -1,17 +1,22 @@
-//! P4 包级图片注册表（ADR-005）。
+//! 包级图片注册表（P4 ADR-005；P5 ADR-006 扩展多 part 关系作用域）。
 //!
 //! [`ImageInjections`] 实现 docxtpl-template 的 [`ImageRegistry`]，把渲染期
 //! 遇到的 [`InlineImage`] 落实为 OPC 包变更，语义逐一对齐 docxtpl 0.20.2 /
 //! python-docx 1.2.0：
 //!
+//! - **多 owner 独立关系作用域（P5）**：正文、每个页眉/页脚各持一份克隆的
+//!   part rels；图片 rId/锚点外链条目只落在**当前渲染 part** 的作用域
+//!   （`current_rendering_part.relate_to`）；模板无 rels 文件的 part
+//!   （如新建页眉）渲染期按需新建 `word/_rels/headerN.xml.rels`；
 //! - **全包 DFS** 收集既有 image 关系目标（`OpcPackage.iter_rels`，external
 //!   跳过、visited 去重），作为编号与 sha1 去重的基线；
-//! - **sha1 去重**：同字节图片复用既有 part（`ImageParts._get_by_sha1`）；
+//! - **sha1 去重跨 part 共享**：同字节图片在正文与页眉复用同一个 media
+//!   part（`Package.get_or_add_image_part` 包级去重），各 owner 再各自建 rel；
 //! - **编号**：`word/media/imageN.ext`，N 从 1 起回填空洞，跨扩展名计数
 //!   （`ImageParts._next_image_partname`，PackURI.idx 正则
 //!   `^([a-zA-Z]+)([1-9][0-9]*)?`）；
-//! - **rId**：rId1 起回填第一个空洞（含外部关系计数）；`reltype + 目标 +
-//!   模式` 全等复用（`_Relationships.get_or_add(_ext)`）；
+//! - **rId**：每个作用域 rId1 起回填第一个空洞（含外部关系计数）；
+//!   `reltype + 目标 + 模式` 全等复用（`_Relationships.get_or_add(_ext)`）；
 //! - **顺序**：图片 rId 先于其锚点 hyperlink 外链条目（上游
 //!   `new_pic_anchor` 的分配次序）；
 //! - **[Content_Types].xml**：新扩展名追加 Default（rels/xml 两 Default
@@ -38,19 +43,34 @@ const IMAGE_REL_TYPE: &str =
 const HYPERLINK_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 
-/// 渲染期暂存的图片/关系/Content Types 变更。
-pub(crate) struct ImageInjections {
-    /// 主文档 part 名（如 `word/document.xml`）。
-    main_name: String,
-    /// 主文档 rels part 名（如 `word/_rels/document.xml.rels`）。
+/// 单个渲染 part 的关系作用域（P5，ADR-006）。
+///
+/// 对齐上游 `current_rendering_part`：图片与锚点关系分配在**当前 story
+/// part 自己的 rels** 上；正文/页眉/页脚互不共享 rId 计数。
+struct OwnerState {
+    /// owner part 名（如 `word/document.xml`、`word/header1.xml`）。
+    name: String,
+    /// 该 part 的 rels part 名（如 `word/_rels/header1.xml.rels`）。
     rels_name: String,
-    /// 主文档关系（从模板克隆，新增条目尾插）。
+    /// 关系集合（模板有 rels 则克隆；无则空集合，按需新建）。
     rels: Relationships,
-    /// rels 是否被改过（决定是否回写）。
-    rels_dirty: bool,
-    /// 已占用的 imageN 编号集合（含模板既有图片）。
+    /// 模板中是否已存在该 rels part（决定回写走 set_part_bytes 还是 add_part）。
+    rels_existed: bool,
+    /// 是否新增过关系（无变更的 rels 不回写，保留原字节）。
+    dirty: bool,
+}
+
+/// 渲染期暂存的图片/关系/Content Types 变更（多 owner 版）。
+pub(crate) struct ImageInjections {
+    /// 主文档 owner 在 owners 中的下标（恒为 0；build_url_id 永远作用于它）。
+    main_index: usize,
+    /// 各渲染 part 的关系作用域；owners[0] 为主文档，其余按渲染顺序加入。
+    owners: Vec<OwnerState>,
+    /// 当前渲染 part 的作用域下标（resolve_image 使用）。
+    current: usize,
+    /// 已占用的 imageN 编号集合（含模板既有图片，包级共享）。
     used_numbers: BTreeSet<u64>,
-    /// sha1 → 绝对 part 名（模板既有 + 本次新增）。
+    /// sha1 → 绝对 part 名（模板既有 + 本次新增，包级共享）。
     by_sha1: HashMap<String, String>,
     /// 待新增 part：（绝对 part 名，字节）。
     pending_parts: Vec<(String, Vec<u8>)>,
@@ -63,14 +83,16 @@ pub(crate) struct ImageInjections {
 impl ImageInjections {
     /// 从已打开的包构造：克隆主文档 rels，DFS 收集既有图片 part 编号与 sha1。
     pub(crate) fn new(pkg: &Package, main_name: &str) -> Result<Self, OpcError> {
-        let main_uri = PartUri::new(main_name)?;
-        let rels_name = relationships_path_of(&main_uri);
-        let rels = pkg
-            .relationships_of(main_name)
-            .cloned()
-            .ok_or_else(|| OpcError::Malformed {
-                reason: format!("主文档缺少关系文件 {rels_name}"),
-            })?;
+        // 主文档必须有 rels 文件（与 P4 行为一致，缺失即包畸形）。
+        if pkg.relationships_of(main_name).is_none() {
+            return Err(OpcError::Malformed {
+                reason: format!(
+                    "主文档缺少关系文件 {}",
+                    relationships_path_of(&PartUri::new(main_name)?)
+                ),
+            });
+        }
+        let main = load_owner(pkg, main_name)?;
 
         let existing_images = collect_image_parts(pkg);
         let mut used_numbers = BTreeSet::new();
@@ -93,10 +115,9 @@ impl ImageInjections {
             .collect();
 
         Ok(Self {
-            main_name: main_name.to_string(),
-            rels_name,
-            rels,
-            rels_dirty: false,
+            main_index: 0,
+            owners: vec![main],
+            current: 0,
             used_numbers,
             by_sha1,
             pending_parts: Vec::new(),
@@ -105,11 +126,29 @@ impl ImageInjections {
         })
     }
 
+    /// 切换（或登记）当前渲染 part 的关系作用域（P5）。
+    ///
+    /// 页眉/页脚渲染前调用；同一 part 名幂等复用。模板没有 rels 文件的
+    /// part 以空集合开始，新增关系时在 apply 阶段创建 rels part。
+    pub(crate) fn begin_owner(&mut self, pkg: &Package, part_name: &str) -> Result<(), OpcError> {
+        if let Some(index) = self.owners.iter().position(|owner| owner.name == part_name) {
+            self.current = index;
+            return Ok(());
+        }
+        let owner = load_owner(pkg, part_name)?;
+        self.owners.push(owner);
+        self.current = self.owners.len() - 1;
+        Ok(())
+    }
+
     /// 上游 `DocxTemplate.build_url_id`：在渲染前登记外部超链接关系。
     ///
-    /// 同 URL（reltype+External）复用既有 rId；否则尾插新关系并回填 Id 空洞。
+    /// 恒作用于**主文档 rels**（上游 `docx._part.relate_to`），与当前
+    /// 正在渲染哪个 part 无关。
     pub(crate) fn build_url_id(&mut self, url: &str) -> String {
-        self.get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External)
+        self.current = self.main_index;
+        self.current_owner_mut()
+            .get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External)
     }
 
     /// 分配下一个图片编号：1 起回填空洞，否则最大值 +1
@@ -124,6 +163,43 @@ impl ImageInjections {
         }
     }
 
+    /// 当前渲染 part 的作用域（可变）。
+    fn current_owner_mut(&mut self) -> &mut OwnerState {
+        &mut self.owners[self.current]
+    }
+
+    /// 把暂存变更写入包：先加 media part（消除悬空关系），再逐作用域回写
+    /// rels（新建 rels 先 add_part 挂载再 set_part_bytes），最后重建
+    /// [Content_Types].xml（保证 validate 能查到新 part 类型）。
+    pub(crate) fn apply(&mut self, pkg: &mut Package) -> Result<(), OpcError> {
+        for (name, bytes) in self.pending_parts.drain(..) {
+            pkg.add_part(&name, bytes)?;
+        }
+        for owner in &self.owners {
+            if !owner.dirty {
+                continue;
+            }
+            let rels_xml = owner.rels.to_xml();
+            if !owner.rels_existed && !pkg.contains(&owner.rels_name) {
+                // python-docx 等价行为：part.rels 在 relate_to 时物化为
+                // /word/_rels/xxx.xml.rels part（先占位挂载，set_part_bytes
+                // 会把解析出的关系绑到 owner part 上）。
+                pkg.add_part(&owner.rels_name, rels_xml.clone().into_bytes())?;
+            }
+            pkg.set_part_bytes(&owner.rels_name, rels_xml.into_bytes())?;
+        }
+        if !self.pending_defaults.is_empty() {
+            let mut content_types = pkg.content_types().clone();
+            for (extension, content_type) in &self.pending_defaults {
+                content_types.add_default(extension, content_type);
+            }
+            pkg.set_part_bytes("[Content_Types].xml", content_types.to_xml().into_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+impl OwnerState {
     /// 上游 `_Relationships.get_or_add` / `get_or_add_ext_rel`。
     fn get_or_add(&mut self, rel_type: &str, target: &str, mode: TargetMode) -> String {
         if let Some(rel) = self.rels.find_matching(rel_type, target, mode) {
@@ -136,28 +212,36 @@ impl ImageInjections {
             target: target.to_string(),
             target_mode: mode,
         });
-        self.rels_dirty = true;
+        self.dirty = true;
         id
     }
+}
 
-    /// 把暂存变更写入包：先加 media part（消除悬空关系），再回写 rels，
-    /// 最后重建 [Content_Types].xml（保证 validate 能查到新 part 类型）。
-    pub(crate) fn apply(&mut self, pkg: &mut Package) -> Result<(), OpcError> {
-        for (name, bytes) in self.pending_parts.drain(..) {
-            pkg.add_part(&name, bytes)?;
-        }
-        if self.rels_dirty {
-            let rels_xml = self.rels.to_xml();
-            pkg.set_part_bytes(&self.rels_name, rels_xml.into_bytes())?;
-        }
-        if !self.pending_defaults.is_empty() {
-            let mut content_types = pkg.content_types().clone();
-            for (extension, content_type) in &self.pending_defaults {
-                content_types.add_default(extension, content_type);
-            }
-            pkg.set_part_bytes("[Content_Types].xml", content_types.to_xml().into_bytes())?;
-        }
-        Ok(())
+/// 为一个渲染 part 装载关系作用域。
+///
+/// 模板已有 rels 文件则克隆（返回 rels_existed=true）；没有则以空
+/// Relationships 集合开始（rels_existed=false，渲染产生关系时才在包内
+/// 新建 .rels part）。
+fn load_owner(pkg: &Package, part_name: &str) -> Result<OwnerState, OpcError> {
+    let uri = PartUri::new(part_name)?;
+    let rels_name = relationships_path_of(&uri);
+    match pkg.relationships_of(part_name) {
+        Some(rels) => Ok(OwnerState {
+            name: part_name.to_string(),
+            rels_name,
+            rels: rels.clone(),
+            rels_existed: true,
+            dirty: false,
+        }),
+        None => Ok(OwnerState {
+            name: part_name.to_string(),
+            rels_name,
+            rels: Relationships::parse(
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+            )?,
+            rels_existed: false,
+            dirty: false,
+        }),
     }
 }
 
@@ -191,15 +275,19 @@ impl ImageRegistry for ImageInjections {
             }
         };
 
-        // 3. 主文档 rels：图片内部关系（Target 为相对主文档目录的路径）。
-        let rel_target = relative_to_owner(&self.main_name, &target_abs);
-        let blip_rid = self.get_or_add(IMAGE_REL_TYPE, &rel_target, TargetMode::Internal);
+        // 3. 当前渲染 part 的 rels：图片内部关系（Target 相对该 part 目录；
+        //    P5 页眉/页脚与正文各自一套 rels，rId 互不影响）。
+        let owner_name = self.owners[self.current].name.clone();
+        let rel_target = relative_to_owner(&owner_name, &target_abs);
+        let blip_rid =
+            self.current_owner_mut()
+                .get_or_add(IMAGE_REL_TYPE, &rel_target, TargetMode::Internal);
 
-        // 4. 锚点外链：上游在图片 rId 之后分配。
-        let hyperlink_rid = image
-            .anchor
-            .as_ref()
-            .map(|url| self.get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External));
+        // 4. 锚点外链：上游在图片 rId 之后分配（同一作用域）。
+        let hyperlink_rid = image.anchor.as_ref().map(|url| {
+            self.current_owner_mut()
+                .get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External)
+        });
 
         Ok(ImageRels {
             blip_rid,

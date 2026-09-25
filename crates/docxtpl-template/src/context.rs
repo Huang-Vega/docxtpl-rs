@@ -11,9 +11,11 @@
 //! （对齐上游 `RichText.__str__` / `Listing.__str__`）；图片则先经
 //! [`ImageRegistry`] 解析出关系 ID，再生成 `wp:inline` XML。
 //!
-//! 注意：图片解析在**构造 MiniJinja 根值时**整体进行（eager），即上下文中
-//! 的坏图片即使未被模板引用也会报错。P4 全部 fixture 的图片均被引用，
-//! 与上游惰性 `__str__` 可观测行为一致。
+//! 注意：图片按上游 `InlineImage.__str__` 语义**惰性解析**（P5/ADR-006
+//! 修订 P4 的 eager 方案）：转换期只写占位符，渲染后按占位符在输出中的
+//! 出现顺序经 [`ImageRegistry`] 解析。因此未被某 part 模板引用的图片不会
+//! 在该 part 产生关系（多 part 作用域正确性的关键），未被任何模板引用的
+//! 坏图片也不会报错（与上游一致）。
 
 use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph};
 use serde_json::Value as JsonValue;

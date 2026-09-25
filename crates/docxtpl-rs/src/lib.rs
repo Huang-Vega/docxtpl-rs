@@ -59,17 +59,25 @@
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use docxtpl_opc::{OpcError, Package, PackageLimits, TargetMode};
+use docxtpl_opc::{resolve_part_target, OpcError, Package, PackageLimits, PartUri, TargetMode};
 use docxtpl_template::{
-    render_core_properties, render_core_properties_ctx, render_document_xml,
-    render_document_xml_ctx, RenderError,
+    render_core_properties_ctx, render_document_xml_ctx, render_footnotes_xml_ctx,
+    render_story_xml_ctx, RenderError,
 };
+// 同时作为内部类型与对外重导出（底部 pub use 列表不再重复）。
+pub use docxtpl_template::RenderContext;
 
 mod images;
 
 use images::ImageInjections;
 
 const MAX_INPUT_DOCX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// footnotes part 的 content type（上游 render_footnotes 按此过滤
+/// package.parts；该 CT 未在 python-docx PartFactory 注册，故按通用
+/// 二进制 part 处理，渲染结果原样写回不重序列化，ADR-006）。
+const CT_FOOTNOTES: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 
 /// 一个可复用的 docx 模板（只读持有模板字节）。
 pub struct DocxTemplate {
@@ -106,8 +114,9 @@ impl DocxTemplate {
 
     /// 用纯 JSON 上下文渲染，返回独立的 [`RenderedDocument`]。
     ///
-    /// 只渲染主文档 part（word/document.xml）与核心属性；未修改 part
-    /// 原样保留。失败返回带 part 与行号上下文的 [`RenderError`]。
+    /// 按上游固定顺序渲染全部 part（P5，ADR-006）：正文 → 页眉 → 页脚 →
+    /// 核心属性 → 脚注；未修改 part 原样保留。失败返回带 part 与行号
+    /// 上下文的 [`RenderError`]。
     pub fn render(
         &self,
         context: &serde_json::Value,
@@ -115,21 +124,14 @@ impl DocxTemplate {
     ) -> Result<RenderedDocument, Error> {
         // 每次渲染独立开包：DocxTemplate 可复用，状态不跨次（规范 §2.2）。
         let mut pkg = self.open_package()?;
-
         let main_name = pkg.main_document_uri()?.as_str().to_string();
-        let src_xml = read_part_utf8(&pkg, &main_name)?;
+        let context = RenderContext::from_json(context);
+        let mut injections = ImageInjections::new(&pkg, &main_name)?;
 
-        let outcome = render_document_xml(&src_xml, context, options)?;
-        pkg.set_part_bytes(&main_name, outcome.xml.into_bytes())?;
-
-        // 核心属性：上游 render() 无条件执行 render_properties（会补齐
-        // dc:identifier/dc:language 等元素）。目标经根 rels 的
-        // core-properties 关系解析（标准 docx 即 docProps/core.xml）。
-        if let Some(core_name) = core_properties_part(&pkg) {
-            let core_src = read_part_utf8(&pkg, &core_name)?;
-            let rendered = render_core_properties(&core_src, context, options.autoescape())?;
-            pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
-        }
+        render_all_parts(&mut pkg, &context, options, &mut injections)?;
+        // JSON 上下文不含图片/外链，apply 实际为 no-op（无脏作用域）。
+        injections.apply(&mut pkg)?;
+        canonicalize_content_types(&mut pkg)?;
 
         // 写出前再过一次包校验：不得产生悬空关系/缺 part。
         pkg.validate()?;
@@ -177,7 +179,6 @@ impl DocxTemplate {
 pub struct RenderSession {
     pkg: Package,
     options: RenderOptions,
-    main_name: String,
     injections: ImageInjections,
 }
 
@@ -189,7 +190,6 @@ impl RenderSession {
         Ok(Self {
             pkg,
             options: *options,
-            main_name,
             injections,
         })
     }
@@ -204,34 +204,132 @@ impl RenderSession {
         self.injections.build_url_id(url)
     }
 
-    /// 渲染主文档与核心属性，落定 media part / rels / Content Types 变更，
-    /// 并做最终包校验。
+    /// 渲染全部 part（正文 → 页眉 → 页脚 → 核心属性 → 脚注，P5），
+    /// 落定 media part / 各作用域 rels / Content Types 变更，并做最终包校验。
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
-        let src_xml = read_part_utf8(&self.pkg, &self.main_name)?;
-        let outcome =
-            render_document_xml_ctx(&src_xml, context, &self.options, &mut self.injections)?;
-        self.pkg
-            .set_part_bytes(&self.main_name, outcome.xml.into_bytes())?;
+        render_all_parts(&mut self.pkg, context, &self.options, &mut self.injections)?;
 
-        // 核心属性：上游 render() 无条件执行 render_properties，与主文档
-        // 共用同一上下文/注册表（图片值在此解析幂等，关系仍归属主文档）。
-        if let Some(core_name) = core_properties_part(&self.pkg) {
-            let core_src = read_part_utf8(&self.pkg, &core_name)?;
-            let rendered = render_core_properties_ctx(
-                &core_src,
-                context,
-                self.options.autoescape(),
-                &mut self.injections,
-            )?;
-            self.pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
-        }
-
-        // 先写 media part，再回写 rels/CT，保证最终校验无悬空关系/类型。
+        // 先写 media part，再回写各 owner rels/CT，保证最终校验无悬空关系/类型。
         self.injections.apply(&mut self.pkg)?;
+        canonicalize_content_types(&mut self.pkg)?;
         self.pkg.validate()?;
 
         Ok(RenderedDocument { pkg: self.pkg })
     }
+}
+
+/// 上游 `DocxTemplate.render` 的 part 编排（顺序固定，ADR-006）：
+/// 正文 → 页眉（主文档 rels 序）→ 页脚（主文档 rels 序）→
+/// 核心属性 → footnotes（按包 part 枚举的 CT 过滤）。
+///
+/// 页眉/页脚的图片关系分配在各自 part 的作用域
+/// （[`ImageInjections::begin_owner`]）；脚注不允许图片且输出不重序列化。
+/// 变更只写回被渲染过的 part；rels/CT 的落定由调用方在渲染后执行
+/// [`ImageInjections::apply`] 完成。
+fn render_all_parts(
+    pkg: &mut Package,
+    context: &RenderContext,
+    options: &RenderOptions,
+    injections: &mut ImageInjections,
+) -> Result<(), Error> {
+    let main_name = pkg.main_document_uri()?.as_str().to_string();
+
+    // 1. 正文：fix_tables + fix_docpr_ids，图片关系归属主文档。
+    injections.begin_owner(pkg, &main_name)?;
+    let body_src = read_part_utf8(pkg, &main_name)?;
+    let body = render_document_xml_ctx(&body_src, context, options, injections)?;
+    pkg.set_part_bytes(&main_name, body.xml.into_bytes())?;
+
+    // 2/3. 页眉、页脚（两遍 rels 枚举，顺序对齐
+    // build_headers_footers_xml(HEADER_URI) 再 (FOOTER_URI)）：lxml 往返、
+    // resolve_listing 照跑，但不做 fix_tables / fix_docpr_ids。
+    let stories = story_parts(pkg, &main_name)?;
+    for name in stories {
+        injections.begin_owner(pkg, &name)?;
+        let src = read_part_utf8(pkg, &name)?;
+        let outcome = render_story_xml_ctx(&src, context, options, injections, &name)?;
+        pkg.set_part_bytes(&name, outcome.xml.into_bytes())?;
+    }
+
+    // 4. 核心属性：上游 render() 无条件执行 render_properties。目标经根
+    // rels 的 core-properties 关系解析（标准 docx 即 docProps/core.xml）。
+    if let Some(core_name) = core_properties_part(pkg) {
+        let core_src = read_part_utf8(pkg, &core_name)?;
+        let rendered =
+            render_core_properties_ctx(&core_src, context, options.autoescape(), injections)?;
+        pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
+    }
+
+    // 5. 脚注：通用二进制 part，渲染字符串原样写回（保留 XML 声明）。
+    for name in footnotes_parts(pkg) {
+        let src = read_part_utf8(pkg, &name)?;
+        let rendered = render_footnotes_xml_ctx(&src, context, options, &name)?;
+        pkg.set_part_bytes(&name, rendered.into_bytes())?;
+    }
+
+    Ok(())
+}
+
+/// 重建 `[Content_Types].xml` 为 python-docx 保存时的规范形态。
+///
+/// 上游 `PackageWriter._write_content_types_stream` 每次保存都从包 part
+/// 重新生成 CT 流：`Default` 按扩展名、`Override` 按 part 名 ASCII 排序。
+/// 模板若被手工/第三方工具追加了乱序 Override（如后处理插入的
+/// footnotes Override），渲染后必须归一；字节未变化时不写回。
+fn canonicalize_content_types(pkg: &mut Package) -> Result<(), Error> {
+    let canonical = pkg.content_types().to_xml().into_bytes();
+    let unchanged = pkg
+        .part("[Content_Types].xml")
+        .is_some_and(|part| part.bytes() == canonical.as_slice());
+    if !unchanged {
+        pkg.set_part_bytes("[Content_Types].xml", canonical)?;
+    }
+    Ok(())
+}
+
+/// 枚举主文档 rels 中的内部 header/footer 目标（P5）。
+///
+/// 对齐上游 `get_headers_footers` + 两遍 build：顺序为主文档 rels 解析序，
+/// 先全部 header 再全部 footer；只收 internal 关系、目标 part 存在且
+/// blob 非空；同一目标 part 去重（病态双 rel 场景见 DEV-0007）。
+fn story_parts(pkg: &Package, main_name: &str) -> Result<Vec<String>, Error> {
+    let main_uri = PartUri::new(main_name)?;
+    // 相对 Target 相对的是主文档 part 所在目录（word/），不是 part 路径本身。
+    let base_dir = main_uri.parent();
+    let Some(rels) = pkg.relationships_of(main_name) else {
+        return Ok(Vec::new());
+    };
+    let mut parts = Vec::new();
+    for rel_type_suffix in ["/header", "/footer"] {
+        for rel in rels.iter() {
+            if rel.target_mode != TargetMode::Internal || !rel.rel_type.ends_with(rel_type_suffix) {
+                continue;
+            }
+            let Some(target) = resolve_part_target(base_dir.as_ref(), &rel.target) else {
+                continue;
+            };
+            let name = target.as_str();
+            let Some(part) = pkg.part(name) else {
+                continue;
+            };
+            // 上游 `if val.target_part.blob`：空 blob 跳过。
+            if part.bytes().is_empty() || parts.iter().any(|existing| existing == name) {
+                continue;
+            }
+            parts.push(name.to_string());
+        }
+    }
+    Ok(parts)
+}
+
+/// 枚举包内 footnotes part（P5）：遍历包 part，content type 为
+/// wordprocessingml.footnotes+xml（endnotes 不在范围，DEV-0007）。
+fn footnotes_parts(pkg: &Package) -> Vec<String> {
+    pkg.parts()
+        .map(|part| part.uri())
+        .filter(|uri| pkg.content_types().content_type_of(uri) == Some(CT_FOOTNOTES))
+        .map(|uri| uri.as_str().to_string())
+        .collect()
 }
 
 /// 读取 part 字节并按 UTF-8 解码（模板 XML 必须为 UTF-8 文本）。
@@ -328,4 +426,4 @@ pub enum Error {
 }
 
 pub use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph, RichTextProps};
-pub use docxtpl_template::{RenderContext, RenderOptions, RenderValue, TemplateErrorKind};
+pub use docxtpl_template::{RenderOptions, RenderValue, TemplateErrorKind};

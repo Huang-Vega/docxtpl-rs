@@ -56,3 +56,25 @@ docs/compatibility.md §7）。
 - 锁定与 Rust 1.85 兼容的 `time`、`deflate64`；固定 golden XML 的换行字节，
   修复 Windows 测试受 Git 换行转换影响的问题。
 - 新增 LibreOffice 打开并另存的 CI 检查、MVP 使用指南和 P1 限额校准记录。
+- **P5：页眉/页脚/脚注多 part 渲染（ADR-006）**。新增 7 个 `p5_*` oracle
+  fixture，差分 6 个逐字节 MATCH + 1 个错误类别一致（页眉
+  TemplateSyntaxError，错误带 `word/header1.xml` part 名），详见
+  docs/compatibility.md §4/§7。
+  - docxtpl-template：渲染管线按 part 种类参数化为
+    Document（fix_tables/fix_docpr_ids）/ Story（无 fix，story 专用
+    序列化：剥除非 preserve 作用域空白文本、保留注入图片的冗余
+    `xmlns:wp/xmlns:r` 声明）/ Footnotes（仅字符串阶段，保留模板声明，
+    `NullRegistry` 拒绝脚注图片 = DEV-0006）；图片改为占位符惰性解析，
+    shape_id 修正为 part 级常数（对齐 python-docx 1.2.0 无缓存的
+    `StoryPart.next_id`，正文 docPr 仍由 fix_docpr_ids 重排为 1001 起）。
+  - docxtpl-xml：新增 `XmlDocument::strip_blank_text`（沿祖先轴尊重
+    `xml:space="preserve"`）与带 `retain_redundant_ns` 选项的
+    `serialize_story`。
+  - docxtpl-rs：`render_all_parts` 固定编排 正文 → 页眉 → 页脚 →
+    核心属性 → 脚注；story 经主文档 rels（按 part 所在目录解析 Internal
+    目标、非空、去重）枚举，footnotes 按 content type 枚举（DEV-0007：
+    同目标双 rel 只渲染一次、endnotes/外部 story 不支持）；
+    `ImageInjections` 泛化为多 owner 作用域（每 story 各自 rels，
+    新建 rels 先挂载再写回；sha1/media 编号包级共享；`build_url_id`
+    外链恒归主文档）；每次渲染后归一 `[Content_Types].xml`
+    （Default/Override ASCII 排序，字节未变不写回）。

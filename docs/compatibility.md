@@ -84,9 +84,20 @@
 | media part 注入 + document rels 与 [Content_Types].xml 的 python-docx 风格重建 | compatible 目标（逐字节，DEV-0003 不触发） | 全部含图 p4 fixture |
 | 坏图片错误类别对齐（UnrecognizedImageError，probe 先于任何 part/rId 分配） | compatible 目标 | p4_img_bad |
 
-### P5–P6（规划）
+### P5（页眉/页脚/脚注，0.1.0-alpha 增量，ADR-006）
 
-header/footer 渲染、footnotes 渲染、subdoc 合并。
+| 功能 | 级别 | fixture 类别 |
+|---|---|---|
+| 页眉/页脚 Jinja 渲染（变量、if、`{%p for%}` 段落循环；多节各自 header/footer；无标签 story 原样往返） | compatible 目标（lxml 往返、resolve_listing 照跑，不做 fix_tables/fix_docpr_ids） | p5_hf_basic / p5_hf_multi / p5_hf_untagged |
+| 页眉/页脚 RichText / Listing（外部超链接 build_url_id 作用于主文档 rels） | compatible 目标 | p5_hf_richtext |
+| 页眉/页脚 InlineImage（多图、anchor 超链接；rId/media 按 part 作用域分配、sha1 包级去重；docPr part 级常数 id/name；story 紧凑序列化与冗余 xmlns 保留） | compatible 目标（逐字节） | p5_hf_image |
+| 脚注 part 字符串渲染（保留模板 XML 声明与未改字节；RichText/Listing 同管线） | compatible 目标 | p5_footnotes_basic |
+| story 语法错误带具体 part 名（错误类别对齐 TemplateSyntaxError） | compatible 目标 | p5_hf_syntax_error |
+| `[Content_Types].xml` 渲染后归一（Default 按扩展名、Override 按 part 名排序） | compatible 目标 | p5_footnotes_basic 实证 |
+
+### P6（规划）
+
+subdoc（`{%p include_subdoc %}` / RichText 子文档）合并。
 
 ### unsupported（明确拒绝）
 
@@ -102,13 +113,17 @@ header/footer 渲染、footnotes 渲染、subdoc 合并。
 | DEV-0002 | libxml2 recover 的长尾行为仅以 corpus 钉死为限；未钉死输入按保守策略处理并记录诊断 | ADR-002 |
 | DEV-0003 | ZIP 时间戳/条目顺序、`[Content_Types].xml` 与 rels 的**条目顺序**视为非语义差异，由 canonicalization 归一化 | 规划文档 §9.5 |
 | DEV-0004 | 不复制 python-docx 的包重写行为：未修改 part 尽量原样保留字节（优于上游，语义等价经 c14n 证明） | ADR-002 |
-| DEV-0005 | `autoescape=True` 下富内容值（RichText/Listing/InlineImage）的转义口径未与上游对齐：上游经 `__html__` 仍原样注入 XML，本侧 MiniJinja 可能按 HTML 规则转义。P4 全部 fixture 固定 `autoescape=False`，该路径不在 oracle 覆盖内；需开启 autoescape 又渲染富值时不要依赖当前行为 | ADR-005 |
+| DEV-0005 | `autoescape=True` 下富内容值（RichText/Listing/InlineImage）的转义口径未与上游对齐：上游经 `__html__` 仍原样注入 XML，本侧 MiniJinja 可能按 HTML 规则转义。P4/P5 全部 fixture 固定 `autoescape=False`，该路径不在 oracle 覆盖内；需开启 autoescape 又渲染富值时不要依赖当前行为 | ADR-005 |
+| DEV-0006 | 脚注（及任何非 story 通用 Part）中使用 InlineImage 不支持：上游在未注册 PartFactory 的二进制 Part 上调用 `new_pic_inline` 会抛 `AttributeError`；本侧 `render_footnotes_xml_ctx` 以 `NullRegistry` 在占位符解析阶段返回带 part 名的错误。P5 fixture 未覆盖该错误路径（由单测钉死） | ADR-006 |
+| DEV-0007 | 同一 part 被主文档 rels 中多条 header/footer 关系引用时只渲染一次（按目标去重）；endnotes（`word/endnotes.xml`）不在 P5 范围；story part 枚举仅扫描主文档 rels 的 Internal 目标，外部/孤立 story 不渲染 | ADR-006 |
 
 ## 6. fixture 基线
 
-见 `tests/fixtures/manifest.json`（P0：20 个往返 + 48 个 P2/P3 渲染用例；
-P4 增量：17 个 `p4_*` 渲染用例，共 65 个 render；全部标注
-id/feature/phase/mode/context_kind/expected/owner）。差分实测结果见 §7。
+见 `tests/fixtures/manifest.json`（P0：20 个往返；P2/P3：48 个成功 +
+1 个 error 预期 = 49 个；P4：16 个成功 + 1 个 error 预期 = 17 个；
+P5：6 个成功 + 1 个 error 预期 = 7 个；共 73 个 `mode=render` 条目；
+全部标注 id/feature/phase/mode/context_kind/expected/owner）。差分实测
+结果见 §7。
 
 ## 7. 差分结果（0.1.0-alpha 实测）
 
@@ -130,17 +145,24 @@ exclusive C14N sha256 一致（docProps/core.xml 时间戳归一化）。
 | p4_img_* 渲染（png/jpg/bmp/gif/tiff、缩放、sha1 去重、多图、锚点、行循环、格式扩展） | 8 | 8 MATCH |
 | p4_combo_rich（RichText + Listing + 图片 + 行循环组合） | 1 | 1 MATCH |
 | p4_img_bad（UnrecognizedImageError） | 1 | 错误类别一致（Image） |
+| p5_hf_basic / p5_hf_multi / p5_hf_untagged（页眉页脚变量/if/段落循环、多节、无标签往返） | 3 | 3 MATCH |
+| p5_hf_richtext（页眉 RichText/Listing + 正文 RichText 外链） | 1 | 1 MATCH |
+| p5_hf_image（页眉 2 图含 anchor、页脚 1 图、正文 1 图，多 owner rels/sha1 共享） | 1 | 1 MATCH |
+| p5_footnotes_basic（脚注变量/RichText/Listing + CT 排序归一） | 1 | 1 MATCH |
+| p5_hf_syntax_error（页眉 TemplateSyntaxError） | 1 | 错误类别一致（Syntax，part=word/header1.xml） |
 | rt_* 真实 docx OPC 往返（docxtpl-opc fixture_roundtrip） | 20 | 20 逐 part 字节一致 |
-| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 66 | 66 字节一致 |
-| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 64 | 64 一致 |
-| **合计** | **216 项断言/用例** | **全部通过，无偏差、无未支持** |
+| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 73 | 73 字节一致 |
+| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 71 | 71 一致 |
+| **合计** | **237 项断言/用例** | **全部通过，无偏差、无未支持** |
 
-结论：0.1.0-alpha 范围内（§4 P2/P3/P4 矩阵 + render_properties）与 Python
+结论：0.1.0-alpha 范围内（§4 P2/P3/P4/P5 矩阵 + render_properties）与 Python
 oracle **逐字节等价**（DEV-0003 的条目顺序/时间戳归一化未被触发：实际输出连
 原始 part 字节都已一致——含 P4 新增的 media part、document rels 与
-[Content_Types].xml 重建）。错误用例的稳定类别（`TemplateErrorKind::Syntax`
-/ `TemplateErrorKind::Image`）对齐上游异常分类。
+[Content_Types].xml 重建，以及 P5 多 owner story rels 与 CT 排序归一）。
+错误用例的稳定类别（`TemplateErrorKind::Syntax` /
+`TemplateErrorKind::Image`）对齐上游异常分类，story 错误带具体 part 名。
 
-已知边界（不属本阶段验收项）：P5–P6 功能未实现；DEV-0002 的 libxml2 recover
-长尾仅以 corpus 与探针规则钉死；DEV-0005 的 autoescape + 富值路径不在
-oracle 覆盖内；corpus 之外的输入不承诺字节等价。
+已知边界（不属本阶段验收项）：P6 subdoc 未实现；DEV-0006 脚注图片、
+DEV-0007 同 part 双 rel/endnotes/外部 story 不支持；DEV-0002 的 libxml2
+recover 长尾仅以 corpus 与探针规则钉死；DEV-0005 的 autoescape + 富值路径
+不在 oracle 覆盖内；corpus 之外的输入不承诺字节等价。

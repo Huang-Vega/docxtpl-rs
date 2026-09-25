@@ -4,18 +4,40 @@
 use crate::model::ns_uri;
 use crate::model::{NodeId, NodeKind, XmlDocument};
 
+/// 序列化开关。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SerializeOptions {
+    /// 是否保留元素开标签上词法自带、但与祖先重复的 xmlns 声明。
+    ///
+    /// 正文渲染时 lxml 把渲染树**换挂**到原始 document 元素下，序列化会
+    /// 剥掉这类冗余声明（默认 `false` 的裁剪行为）；页眉/页脚则是
+    /// `XmlPart.load` 独立解析的新树（无换挂），注入图片 `wp:inline` 上
+    /// 的 `xmlns:wp/xmlns:r` 等冗余声明必须原样保留（ADR-006）。
+    pub retain_redundant_ns: bool,
+}
+
 /// 序列化整棵文档；有 XML 声明时输出 lxml 风格的单引号声明，
 /// 声明后带一个换行（与 python-docx 落盘的 document.xml 一致）。
 pub(crate) fn serialize(doc: &XmlDocument) -> String {
+    serialize_with(
+        doc,
+        SerializeOptions {
+            retain_redundant_ns: false,
+        },
+    )
+}
+
+/// 带选项的序列化（页眉/页脚使用，见 [`SerializeOptions`]）。
+pub(crate) fn serialize_with(doc: &XmlDocument, options: SerializeOptions) -> String {
     let mut out = String::new();
     if doc.has_decl {
         out.push_str("<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n");
     }
-    serialize_node(doc, doc.root(), &mut out);
+    serialize_node(doc, doc.root(), options, &mut out);
     out
 }
 
-fn serialize_node(doc: &XmlDocument, id: NodeId, out: &mut String) {
+fn serialize_node(doc: &XmlDocument, id: NodeId, options: SerializeOptions, out: &mut String) {
     let node = &doc.nodes[id.0 as usize];
     match node.kind {
         NodeKind::Text => {
@@ -35,11 +57,11 @@ fn serialize_node(doc: &XmlDocument, id: NodeId, out: &mut String) {
             }
             out.push_str("?>");
         }
-        NodeKind::Element => serialize_element(doc, id, out),
+        NodeKind::Element => serialize_element(doc, id, options, out),
     }
 }
 
-fn serialize_element(doc: &XmlDocument, id: NodeId, out: &mut String) {
+fn serialize_element(doc: &XmlDocument, id: NodeId, options: SerializeOptions, out: &mut String) {
     let node = &doc.nodes[id.0 as usize];
     out.push('<');
     let prefix = &node.prefix;
@@ -58,12 +80,14 @@ fn serialize_element(doc: &XmlDocument, id: NodeId, out: &mut String) {
     for (prefix, uri) in &node.nsdecls {
         // lxml 语义：祖先轴上已有同前缀同 URI 的绑定时，本元素输出省略
         // 该声明（冗余裁剪，见 ADR-005 §2）；其余声明保持原有顺序。
-        let parent = node.parent;
-        if doc
-            .ancestor_ns_binding(parent, prefix)
-            .is_some_and(|u| u == uri)
-        {
-            continue;
+        if !options.retain_redundant_ns {
+            let parent = node.parent;
+            if doc
+                .ancestor_ns_binding(parent, prefix)
+                .is_some_and(|u| u == uri)
+            {
+                continue;
+            }
         }
         out.push(' ');
         if prefix.is_empty() {
@@ -100,7 +124,7 @@ fn serialize_element(doc: &XmlDocument, id: NodeId, out: &mut String) {
     // 先拷贝子节点序列，避免递归借用冲突。
     let children = node.children.clone();
     for child in children {
-        serialize_node(doc, child, out);
+        serialize_node(doc, child, options, out);
     }
     out.push_str("</");
     if !prefix.is_empty() {
