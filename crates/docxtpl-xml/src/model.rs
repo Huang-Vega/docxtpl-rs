@@ -237,22 +237,6 @@ impl XmlDocument {
         None
     }
 
-    /// 祖先轴上某前缀的有效命名空间绑定（不含 `start` 元素自身声明）。
-    ///
-    /// 供序列化器裁剪冗余声明使用（对齐 lxml：与祖先同前缀同 URI 的
-    /// 自有声明在输出时被省略，见 ADR-005 §2）。
-    pub(crate) fn ancestor_ns_binding(&self, start: Option<NodeId>, prefix: &str) -> Option<&str> {
-        let mut cur = start;
-        while let Some(id) = cur {
-            let n = &self.nodes[id.0 as usize];
-            if let Some((_, uri)) = n.nsdecls.iter().rev().find(|(p, _)| p == prefix) {
-                return Some(uri.as_str());
-            }
-            cur = n.parent;
-        }
-        None
-    }
-
     /// 依据原始 (属性名, 值) 序列构建元素开标签信息。
     ///
     /// `strict` 为真时，未绑定前缀返回错误；宽松模式下未绑定前缀的

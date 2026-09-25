@@ -361,6 +361,69 @@ impl Package {
         Ok(())
     }
 
+    /// 按 python-docx `_ContentTypesItem.from_parts`（0.20.2）从当前包部件
+    /// 重建 content types 视图。
+    ///
+    /// 枚举除 [Content_Types].xml、`.rels` 与目录条目外的全部 part，按
+    /// 各自当前 content type 重排 Default/Override 归属（真实 Word 模板
+    /// 里 rels/customXml 的 Override 在此消失，rels/xml Default 恒在）。
+    /// 本方法只改内存视图；调用方随后取 [`Package::content_types`] 的
+    /// `to_xml()` 并 [`Package::set_part_bytes`] 落盘。
+    pub fn rebuild_content_types(&mut self) {
+        let entries: Vec<(String, String)> = self
+            .parts
+            .iter()
+            .filter(|part| {
+                !part.is_dir() && part.name() != "[Content_Types].xml" && !is_rels_path(part.uri())
+            })
+            .filter_map(|part| {
+                self.content_types
+                    .content_type_of(part.uri())
+                    .map(|ct| (part.name().to_string(), ct.to_string()))
+            })
+            .collect();
+        self.content_types
+            .rebuild_from_parts(entries.iter().map(|(a, b)| (a.as_str(), b.as_str())));
+    }
+
+    /// 把包内全部 `.rels`（根 rels 与每个挂接 part 的 rels）重写为模型
+    /// 规范序列化（lxml 单引号声明），对齐 python-docx `PackageWriter`
+    /// 保存时**始终重写** rels 流的行为（真实 Word 模板的双引号声明、
+    /// 尾部换行会被归一）。字节与当前条目一致时不写回、不标修改。
+    ///
+    /// # 失败情况
+    ///
+    /// 规范 XML 必须能通过 [`Relationships::parse_in`]（模型本身的输出
+    /// 恒可解析）；写回异常仅可能来自 [`Package::set_part_bytes`]。
+    pub fn normalize_relationships(&mut self) -> Result<(), OpcError> {
+        let root_xml = self.root_rels.to_xml();
+        if self
+            .part("_rels/.rels")
+            .is_none_or(|part| part.bytes() != root_xml.as_bytes())
+        {
+            self.set_part_bytes("_rels/.rels", root_xml.into_bytes())?;
+        }
+        // 先收集 (rels 路径, 规范字节) 再写回，避免遍历与 &mut 冲突。
+        let pending: Vec<(String, Vec<u8>)> = self
+            .parts
+            .iter()
+            .filter_map(|part| {
+                let rels = part.relationships()?;
+                let rels_path = rels_path_for(part.uri());
+                Some((rels_path, rels.to_xml().into_bytes()))
+            })
+            .collect();
+        for (rels_path, bytes) in pending {
+            if self
+                .part(&rels_path)
+                .is_none_or(|part| part.bytes() != bytes.as_slice())
+            {
+                self.set_part_bytes(&rels_path, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// 追加一个新 part（如渲染注入的 `word/media/imageN.*`）。
     ///
     /// 新 part 以 Deflate 压缩、默认 ZIP 时间戳写出（对齐 python-docx

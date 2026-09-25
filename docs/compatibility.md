@@ -117,6 +117,23 @@
 | `reset_replacements` 清空四类注册表 | compatible 目标 | 由库单测/会话路径覆盖 |
 | `get_undeclared_template_variables` 模板自省（body + 全部 header/footer patch 后裸 jinja 元分析；循环变量自动排除） | compatible 目标（BTreeSet 排序等价 Python sorted） | p7_undeclared_vars |
 
+### P7b（docxtpl 0.20.2 真实 Word 模板语料，ADR-009）
+
+语料：16 个上游仓库 `tests/templates/` 真实 Word 模板（LGPL-2.1，复制入
+`tests/fixtures/sources/`，fixture id 106-121）。验证目标不是新语法，而是
+真实 Word 2016 保存形态（双引号声明+CRLF、元素间缩进、局部命名空间、
+rels Override、customXml/footnotes/comments 部件）下的逐字节等价。
+
+| 功能/差异族 | 级别 | fixture 类别 |
+|---|---|---|
+| 真实 Word 结构渲染（if/for/嵌套表、`|count` 过滤器、run 拆分、`{_%-`/`{%-` 空白控制、标签周边空格保留、vm/hm/inline literal list、fix_tables 删单元格） | compatible 目标（逐字节） | p7b_order / p7b_dynamic_table / p7b_merge_paragraph / p7b_preserve_spaces / p7b_vm / p7b_hm / p7b_less_cells |
+| B2：patch 输入的 oxml 树往返（remove_blank_text、实体解码；header/footer 表达式内 `&quot;`/`&apos;`、`{#tr/tc#}` 注释删除） | compatible 目标（逐字节） | p7b_hf_entities / p7b_comments |
+| B6：真实 Word RichText（纯空格/Tab 值、{%p if%} 段落内 RichText、`eastAsia:` 字体前缀 rFonts w:eastAsia、cellbg 行 RichText 单元格） | compatible 目标（逐字节，零改动） | p7b_word2016 / p7b_richtext_if / p7b_eastasia / p7b_cellbg（均 python context） |
+| B1：保存期包级归一（CT from_parts 重建：rels Override 消失/rels+xml Default 恒在/spec 默认表落 Default；全部 rels 含 customXml 子 rels 重写；styles/settings/numbering 已知 XmlPart 恒 lxml 重序列化，通用 Part blob 透传） | compatible 目标（逐字节） | 全部 16 个 p7b（典型 p7b_nested_for 的 customXml/item1.xml 与 item1.xml.rels） |
+| B4：跨树换挂命名空间归并（段落局部 `xmlns:wp14` 与根 `xmlns:w14` 同 URI → 声明丢弃、元素/属性前缀重绑祖先前缀；纯 parse/tostring 的页眉页脚不归并） | compatible 目标（逐字节） | p7b_vm_nested |
+| B5：脚注通用 Part 原字节往返（无标签/有标签 footnotes 保留模板双引号声明；jinja lexer tnewline 把 CRLF/CR 规范为 LF） | compatible 目标（逐字节） | p7b_footnotes_real（有标签）；无标签脚注透传 p7b_comments / p7b_nested_for / p7b_eastasia |
+| B3：`{_% %_}` 字面转义还原（`{_%`→`{%`，修正历史错字 `{%_`） | compatible 目标（逐字节） | p7b_merge_paragraph 等 p7b 字面转义用例 |
+
 ### unsupported（明确拒绝）
 
 - 传入自定义 `jinja_env` / Jinja2 扩展 / line statements / 任意 Python 对象与可调用。
@@ -148,8 +165,11 @@
 P5：6 个成功 + 1 个 error 预期 = 7 个；P6：5 个成功 = 5 个
 （另各带 `templates/<id>_sub.docx` 子文档）；P7：6 个成功 +
 1 个 error 预期 = 7 个（其中 p7_replace_only 标 `skip_render: true`，
-另带 8 个 `media/p7_*` 替换素材）；共 85 个 `mode=render`
-条目；全部标注 id/feature/phase/mode/context_kind/expected/owner）。
+另带 8 个 `media/p7_*` 替换素材）；P7b：16 个成功 = 16 个
+（docxtpl 0.20.2 上游真实模板，`source` 自 `sources/p7b_*.docx`
+复制不 build，其中 4 个 context_kind="python"）；共 101 个
+`mode=render` 条目；全部标注
+id/feature/phase/mode/context_kind/expected/owner）。
 差分实测结果见 §7。
 
 ## 7. 差分结果（0.1.0-alpha 实测）
@@ -186,17 +206,20 @@ exclusive C14N sha256 一致（docProps/core.xml 时间戳归一化）。
 | p7_embedded_zipname（embeddings CRC 替换 + zipname 精确替换 OLE part） | 1 | 1 MATCH |
 | p7_replace_only（skip_render 不渲染直接保存，docPr id 保持原值 + CRC 媒体替换） | 1 | 1 MATCH |
 | p7_undeclared_vars（body+story 未声明变量自省，循环变量自动排除） | 1 | 1 MATCH |
+| p7b_* 真实 Word 模板（docxtpl 0.20.2 上游语料 16 个：if/for/嵌套表/过滤器/run 拆分/空白控制/空格保留/vm/hm/literal 7 个；实体与树往返 2 个；RichText python context 4 个；customXml 包级归一/B1 全域；冗余局部 xmlns 归并 vm_nested；脚注原字节往返 footnotes_real） | 16 | 16 MATCH |
 | rt_* 真实 docx OPC 往返（docxtpl-opc fixture_roundtrip） | 20 | 20 逐 part 字节一致 |
-| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 85 | 85 字节一致 |
-| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 83 | 83 一致 |
-| **合计** | **273 项断言/用例** | **全部通过，无偏差、无未支持** |
+| patch_xml golden（full_patched，docxtpl-compat golden_patch） | 101 | 101 字节一致 |
+| stages recover golden（树结构相等，docxtpl-xml golden_recovery） | 99 | 99 一致 |
+| **合计** | **321 项断言/用例** | **全部通过，无偏差、无未支持** |
 
-结论：0.1.0-alpha 范围内（§4 P2/P3/P4/P5/P6/P7 矩阵 + render_properties）与
+结论：0.1.0-alpha 范围内（§4 P2/P3/P4/P5/P6/P7/P7b 矩阵 + render_properties）与
 Python oracle **逐字节等价**（DEV-0003 的条目顺序/时间戳归一化未被触发：
 实际输出连原始 part 字节都已一致——含 P4 新增的 media part、document rels
 与 [Content_Types].xml 重建，P5 多 owner story rels 与 CT 排序归一，
-P6 子文档合并写入的样式/图片 part、主 rels 与 CT 变更，以及 P7 就地
-替换的 media/embeddings blob 与不渲染直存路径）。
+P6 子文档合并写入的样式/图片 part、主 rels 与 CT 变更，P7 就地
+替换的 media/embeddings blob 与不渲染直存路径，以及 P7b 真实 Word
+模板的 CT/rels/styles/settings/numbering 保存期归一、跨树命名空间
+归并与脚注原字节往返，ADR-009）。
 错误用例的稳定类别（`TemplateErrorKind::Syntax` /
 `TemplateErrorKind::Image` / `TemplateErrorKind::InvalidArgument`）
 对齐上游异常分类，story/subdoc/替换错误带具体 part 名。

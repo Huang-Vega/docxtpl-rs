@@ -49,6 +49,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
 CONTEXTS_DIR = SCRIPT_DIR / "contexts"
 MEDIA_DIR = SCRIPT_DIR / "media"
+# P7b：外部静态模板（手工/真实 Word 维护，不程序构建），原样复制入库。
+# 来源：docxtpl 0.20.2 tests/templates（LGPL-2.1，与本项目同许可证）。
+SOURCES_DIR = SCRIPT_DIR / "sources"
 MANIFEST_PATH = SCRIPT_DIR / "manifest.json"
 
 UPSTREAM = {"docxtpl": "0.20.2", "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd"}
@@ -77,13 +80,20 @@ FIXTURES = []
 
 def fixture(fid, feature, phase, mode, context=None, post=None,
             context_kind="json", context_src=None, sub_build=None,
-            skip_render=False):
+            skip_render=False, source=None, source_upstream=None):
+    """登记一个 fixture。
+
+    source 非 None 时为 P7b 静态模板：不执行 build，直接把
+    sources/<source> 原样复制为 templates/<id>.docx；source_upstream
+    记录上游原始路径（许可证归属，写入 manifest 的 source 字段）。
+    """
     def deco(build):
         FIXTURES.append({
             "id": fid, "feature": feature, "phase": phase, "mode": mode,
             "context": context, "post": post, "build": build,
             "context_kind": context_kind, "context_src": context_src,
             "sub_build": sub_build, "skip_render": skip_render,
+            "source": source, "source_upstream": source_upstream,
         })
         return build
     return deco
@@ -1629,6 +1639,248 @@ def p7_undeclared_vars(doc):
 
 
 # ===========================================================================
+# P7b -- 真实 Word 手工模板 corpus（静态外部模板，源 = docxtpl 0.20.2
+# tests/templates，LGPL-2.1；不程序构建，仅登记 context 与来源归属）
+# ===========================================================================
+
+# 106
+@fixture("p7b_order", "render: real-Word invoice (if/for/nested tables, raw rsids)",
+         "P7", "render",
+         context={
+             "customer_name": "Eric",
+             "items": [
+                 {"desc": "Python interpreters", "qty": 2, "price": "FREE"},
+                 {"desc": "Django projects", "qty": 5403, "price": "FREE"},
+                 {"desc": "Guido", "qty": 1, "price": "100,000,000.00"},
+             ],
+             "in_europe": True,
+             "is_paid": False,
+             "company_name": "The World Wide company",
+             "total_price": "100,000,000.00",
+         },
+         source="p7b_order.docx", source_upstream="tests/templates/order_tpl.docx")
+def _p7b_order(doc):
+    pass
+
+
+# 107
+@fixture("p7b_dynamic_table",
+         "render: real-Word dynamic table (|count filter, nested for)",
+         "P7", "render",
+         context={
+             "col_labels": ["fruit", "vegetable", "stone", "thing"],
+             "tbl_contents": [
+                 {"label": "yellow", "cols": ["banana", "capsicum", "pyrite", "taxi"]},
+                 {"label": "red", "cols": ["apple", "tomato", "cinnabar", "doubledecker"]},
+                 {"label": "green", "cols": ["guava", "cucumber", "aventurine", "card"]},
+             ],
+         },
+         source="p7b_dynamic_table.docx",
+         source_upstream="tests/templates/dynamic_table_tpl.docx")
+def _p7b_dynamic_table(doc):
+    pass
+
+
+# 108
+@fixture("p7b_merge_paragraph",
+         "render: real-Word run splits, literal {_%- text, {%- whitespace control",
+         "P7", "render", context={"living_in_town": True},
+         source="p7b_merge_paragraph.docx",
+         source_upstream="tests/templates/merge_paragraph_tpl.docx")
+def _p7b_merge_paragraph(doc):
+    pass
+
+
+# 109（python：两个 RichText 空格/Tab 值）
+@fixture("p7b_word2016",
+         "render: real-Word space/tab preservation with literal string expressions",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {
+        "test_space": "          ",
+        "test_tabs": 5 * "\\t",
+        "test_space_r": RichText("          "),
+        "test_tabs_r": RichText(5 * "\\t"),
+    }
+''',
+         source="p7b_word2016.docx",
+         source_upstream="tests/templates/word2016_tpl.docx")
+def _p7b_word2016(doc):
+    pass
+
+
+# 110
+@fixture("p7b_hf_entities",
+         "render: header/footer entities inside jinja expressions (default filter)",
+         "P7", "render", context={"title": "Header and footer test"},
+         source="p7b_hf_entities.docx",
+         source_upstream="tests/templates/header_footer_entities_tpl.docx")
+def _p7b_hf_entities(doc):
+    pass
+
+
+# 111
+@fixture("p7b_comments",
+         "render: real-Word {#tr/tc#} comment removal; comments part passthrough",
+         "P7", "render", context={},
+         source="p7b_comments.docx",
+         source_upstream="tests/templates/comments_tpl.docx")
+def _p7b_comments(doc):
+    pass
+
+
+# 112
+@fixture("p7b_nested_for", "render: real-Word nested for loops with customXml parts",
+         "P7", "render",
+         context={
+             "dishes": [
+                 {"name": "Pizza",
+                  "ingredients": ["bread", "tomato", "ham", "cheese"]},
+                 {"name": "Hamburger",
+                  "ingredients": ["bread", "chopped steak", "cheese", "sauce"]},
+                 {"name": "Apple pie",
+                  "ingredients": ["flour", "apples", "suggar", "quince jelly"]},
+             ],
+             "authors": [
+                 {"name": "Saint-Exupery", "books": [
+                     {"title": "Le petit prince"},
+                     {"title": "L'aviateur"},
+                     {"title": "Vol de nuit"}]},
+                 {"name": "Barjavel", "books": [
+                     {"title": "Ravage"},
+                     {"title": "La nuit des temps"},
+                     {"title": "Le grand secret"}]},
+             ],
+         },
+         source="p7b_nested_for.docx",
+         source_upstream="tests/templates/nested_for_tpl.docx")
+def _p7b_nested_for(doc):
+    pass
+
+
+# 113
+@fixture("p7b_preserve_spaces",
+         "render: spaces around tags must not be lost in real-Word runs",
+         "P7", "render", context={"tag_1": "looking", "tag_2": "too"},
+         source="p7b_preserve_spaces.docx",
+         source_upstream="tests/templates/preserve_spaces_tpl.docx")
+def _p7b_preserve_spaces(doc):
+    pass
+
+
+# 114
+@fixture("p7b_vm", "render: real-Word vertical merge with literal tag teaching text",
+         "P7", "render",
+         context={
+             "items": [
+                 {"desc": "Python interpreters", "qty": 2, "price": "FREE"},
+                 {"desc": "Django projects", "qty": 5403, "price": "FREE"},
+                 {"desc": "Guido", "qty": 1, "price": "100,000,000.00"},
+             ],
+             "total_price": "100,000,000.00",
+             "category": "Book",
+         },
+         source="p7b_vm.docx",
+         source_upstream="tests/templates/vertical_merge_tpl.docx")
+def _p7b_vm(doc):
+    pass
+
+
+# 115
+@fixture("p7b_vm_nested",
+         "render: real-Word nested vertical merge with redundant local xmlns",
+         "P7", "render", context={},
+         source="p7b_vm_nested.docx",
+         source_upstream="tests/templates/vertical_merge_nested_tpl.docx")
+def _p7b_vm_nested(doc):
+    pass
+
+
+# 116
+@fixture("p7b_hm", "render: real-Word horizontal merge with inline literal lists",
+         "P7", "render", context={},
+         source="p7b_hm.docx",
+         source_upstream="tests/templates/horizontal_merge_tpl.docx")
+def _p7b_hm(doc):
+    pass
+
+
+# 117（python：4 个 RichText desc）
+@fixture("p7b_cellbg", "render: real-Word cellbg rows with RichText cells",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"alerts": [
+        {"date": "2015-03-10",
+         "desc": RichText("Very critical alert", color="FF0000", bold=True),
+         "type": "CRITICAL", "bg": "FF0000"},
+        {"date": "2015-03-11", "desc": RichText("Just a warning"),
+         "type": "WARNING", "bg": "FFDD00"},
+        {"date": "2015-03-12", "desc": RichText("Information"),
+         "type": "INFO", "bg": "8888FF"},
+        {"date": "2015-03-13", "desc": RichText("Debug trace"),
+         "type": "DEBUG", "bg": "FF00FF"},
+    ]}
+''',
+         source="p7b_cellbg.docx",
+         source_upstream="tests/templates/cellbg_tpl.docx")
+def _p7b_cellbg(doc):
+    pass
+
+
+# 118（python：RichText + {%p if%}）
+@fixture("p7b_richtext_if",
+         "render: RichText value inside real-Word {%p if%} paragraph",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {"foobar": RichText("Foobar!", color="ff0000")}
+''',
+         source="p7b_richtext_if.docx",
+         source_upstream="tests/templates/richtext_and_if_tpl.docx")
+def _p7b_richtext_if(doc):
+    pass
+
+
+# 119（python：eastAsia 字体前缀）
+@fixture("p7b_eastasia", "render: RichText eastAsia: font prefix (rFonts w:eastAsia)",
+         "P7", "render", context_kind="python",
+         context_src='''
+def build_context(tpl):
+    return {
+        "example": RichText("测试TEST", font="eastAsia:Microsoft YaHei"),
+        "Chinese": RichText("测试TEST", font="eastAsia:微软雅黑"),
+        "simsun": RichText("测试TEST", font="eastAsia:SimSun"),
+    }
+''',
+         source="p7b_eastasia.docx",
+         source_upstream="tests/templates/richtext_eastAsia_tpl.docx")
+def _p7b_eastasia(doc):
+    pass
+
+
+# 120
+@fixture("p7b_less_cells",
+         "render: fix_tables cell removal with entities inside inline literal list",
+         "P7", "render", context={},
+         source="p7b_less_cells.docx",
+         source_upstream="tests/templates/less_cells_after_loop_tpl.docx")
+def _p7b_less_cells(doc):
+    pass
+
+
+# 121
+@fixture("p7b_footnotes_real",
+         "render: real-Word footnotes part round-trip through jinja",
+         "P7", "render", context={"a_jinja_variable": "A Jinja variable!"},
+         source="p7b_footnotes_real.docx",
+         source_upstream="tests/templates/footnotes_tpl.docx")
+def _p7b_footnotes_real(doc):
+    pass
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
@@ -1643,10 +1895,17 @@ def main():
 
     records = []
     for fx in FIXTURES:
-        doc = Document()
-        fx["build"](doc)
         template_path = TEMPLATES_DIR / (fx["id"] + ".docx")
-        doc.save(template_path)
+        if fx["source"] is not None:
+            # P7b 静态外部模板：原样复制，不程序构建。
+            src = SOURCES_DIR / fx["source"]
+            if not src.exists():
+                raise FileNotFoundError("缺少静态模板源文件: %s" % src)
+            shutil.copyfile(src, template_path)
+        else:
+            doc = Document()
+            fx["build"](doc)
+            doc.save(template_path)
         if fx["post"] is not None:
             fx["post"](template_path)
         if fx["sub_build"] is not None:
@@ -1686,6 +1945,9 @@ def main():
         # P7：仅 True 时落字段（runner/oracle 双侧按缺省 false 处理）。
         if fx["skip_render"]:
             record["skip_render"] = True
+        # P7b：静态外部模板的许可证/来源归属。
+        if fx["source"] is not None:
+            record["source"] = "docxtpl-0.20.2:%s" % fx["source_upstream"]
         records.append(record)
 
     manifest = {"upstream": UPSTREAM, "fixtures": records}

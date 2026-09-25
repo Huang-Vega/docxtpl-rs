@@ -80,30 +80,38 @@ fn serialize_node(doc: &XmlDocument, id: NodeId, options: SerializeOptions, out:
 fn serialize_element(doc: &XmlDocument, id: NodeId, options: SerializeOptions, out: &mut String) {
     let node = &doc.nodes[id.0 as usize];
     out.push('<');
-    let prefix = &node.prefix;
+    let lexical_prefix = &node.prefix;
     let local = node
         .qname
         .as_ref()
         .map(|q| q.local.as_str())
         .unwrap_or_default();
-    if prefix.is_empty() {
+    // 正文路径模拟 lxml 跨树换挂：元素名 URI 若在祖先轴已有绑定，
+    // 统一改用祖先前缀（局部冗余声明被裁，见下方 nsdecls 处理）。
+    let eff_prefix = if options.retain_redundant_ns {
+        lexical_prefix.clone()
+    } else {
+        node.qname
+            .as_ref()
+            .filter(|q| !q.ns.is_empty())
+            .and_then(|q| ancestor_uri_prefix(doc, node.parent, &q.ns))
+            .unwrap_or_else(|| lexical_prefix.clone())
+    };
+    if eff_prefix.is_empty() {
         out.push_str(local);
     } else {
-        out.push_str(prefix);
+        out.push_str(&eff_prefix);
         out.push(':');
         out.push_str(local);
     }
     for (prefix, uri) in &node.nsdecls {
-        // lxml 语义：祖先轴上已有同前缀同 URI 的绑定时，本元素输出省略
-        // 该声明（冗余裁剪，见 ADR-005 §2）；其余声明保持原有顺序。
-        if !options.retain_redundant_ns {
-            let parent = node.parent;
-            if doc
-                .ancestor_ns_binding(parent, prefix)
-                .is_some_and(|u| u == uri)
-            {
-                continue;
-            }
+        // 正文路径（retain=false）模拟 lxml 跨树换挂：祖先轴上已有**同
+        // URI**（任意前缀）绑定时，本元素丢弃该声明、子树引用重绑祖先
+        // 前缀（P7b B4：真实 Word 模板段落局部 `xmlns:wp14` 与根
+        // `xmlns:w14` 同 URI，输出仅保留 w14 形态）；页眉/页脚是整树
+        // parse/tostring（无换挂），全部词法保留（ADR-006）。
+        if !options.retain_redundant_ns && ancestor_uri_prefix(doc, node.parent, uri).is_some() {
+            continue;
         }
         out.push(' ');
         if prefix.is_empty() {
@@ -118,10 +126,18 @@ fn serialize_element(doc: &XmlDocument, id: NodeId, options: SerializeOptions, o
     }
     for (i, (qname, value)) in node.attrs.iter().enumerate() {
         out.push(' ');
-        // 隐式 xml 前缀；其余前缀走解析时记录的词法前缀。
+        // 隐式 xml 前缀；其余前缀走解析时记录的词法前缀，正文路径再按
+        // 跨树换挂规则重绑到祖先同 URI 前缀。
         let stored = node.attr_prefix.get(i).cloned().unwrap_or_default();
-        if !stored.is_empty() {
-            out.push_str(&stored);
+        let attr_prefix = if options.retain_redundant_ns {
+            stored
+        } else if !stored.is_empty() && !qname.ns.is_empty() {
+            ancestor_uri_prefix(doc, node.parent, &qname.ns).unwrap_or(stored)
+        } else {
+            stored
+        };
+        if !attr_prefix.is_empty() {
+            out.push_str(&attr_prefix);
             out.push(':');
         } else if qname.ns == ns_uri::XML {
             out.push_str("xml:");
@@ -143,12 +159,36 @@ fn serialize_element(doc: &XmlDocument, id: NodeId, options: SerializeOptions, o
         serialize_node(doc, child, options, out);
     }
     out.push_str("</");
-    if !prefix.is_empty() {
-        out.push_str(prefix);
+    if !eff_prefix.is_empty() {
+        out.push_str(&eff_prefix);
         out.push(':');
     }
     out.push_str(local);
     out.push('>');
+}
+
+/// 在 `start` 及其祖先轴（由近及远）上查找命名空间 URI 的**有效**绑定
+/// 前缀（P7b B4）。
+///
+/// 模拟 lxml 跨树换挂（渲染片段 `parse_xml` 后 append 进原 document 树）
+/// 的命名空间归并：元素上的局部 `xmlns:p="U"` 若其祖先轴已存在同 URI
+/// 绑定，则该声明被丢弃、前缀重绑到祖先；内层同前缀不同 URI 的遮蔽
+/// （shadowing）仍优先于更外层绑定，递归自然处理。
+fn ancestor_uri_prefix(doc: &XmlDocument, start: Option<NodeId>, uri: &str) -> Option<String> {
+    let mut current = start;
+    while let Some(id) = current {
+        let node = &doc.nodes[id.0 as usize];
+        if let Some((prefix, _)) = node.nsdecls.iter().find(|(_, u)| u == uri) {
+            // 该元素声明了同 URI：若其更上一层祖先也有同 URI 绑定，则本
+            // 声明被归并，祖先前缀胜出；否则本前缀即有效绑定。
+            return match ancestor_uri_prefix(doc, node.parent, uri) {
+                Some(ancestor) => Some(ancestor),
+                None => Some(prefix.clone()),
+            };
+        }
+        current = node.parent;
+    }
+    None
 }
 
 /// 文本转义：`& < >`，字面回车写成 `&#13;`；引号不转义。

@@ -133,3 +133,32 @@ docs/compatibility.md §7）。
     allow_missing_pics 恒为 False。
   - 新依赖 `crc32fast = "1.5"`（与 Python `binascii.crc32` 同
     IEEE 多项式，fixture 差分钉死）。
+- **P7b：docxtpl 0.20.2 真实 Word 模板语料字节对齐（ADR-009）**。
+  引入 16 个上游仓库真实 Word 模板（LGPL-2.1）作为 `p7b_*` render
+  fixture（其中 4 个 python context），关闭 6 个阻断差异族中的 5 个
+  （B6 富文本/eastAsia 零改动即支持）；render fixture 基线达 101
+  （97 MATCH + 4 错误类别），golden 101/99，85 存量零回归，详见
+  docs/compatibility.md §4/§7。
+  - docxtpl-template：新增公开 `normalize_part_xml(src, part_name)`
+    （strict 解析 + strip_blank_text + 恒单引号 lxml 声明），正文/
+    页眉页脚 patch 前输入做 oxml 树往返（实体解码、缩进剥除）；
+    脚注路径不做树往返（通用 Part 原字节直穿，保留 Word 双引号
+    声明）；渲染字符串入口统一 CRLF/CR→LF（对齐 Jinja2 lexer
+    tnewline）；修复 `{_% %_}` 字面转义还原错字（`{_%`→`{%`）。
+  - docxtpl-opc：新增 `ContentTypes::rebuild_from_parts`（移植
+    python-docx spec.py 默认内容类型表，rels/xml Default 恒在、
+    rels Override 消失）与 `Package::rebuild_content_types`、
+    `Package::normalize_relationships`（根/挂接 rels 全部重写为
+    规范字节，字节未变不写回）。
+  - docxtpl-rs：保存前归一升级为三步——styles/settings/numbering
+    已知 XmlPart 树往返（通用 Part blob 透传）→ rels 归一 → CT
+    from_parts 重建；render() 与 RenderSession::finish 共用。
+  - docxtpl-xml：正文序列化路径模拟 lxml 跨树换挂的命名空间归并
+    （元素局部 xmlns 与祖先同 URI 时丢弃声明，元素名/属性名/后代
+    前缀重绑到祖先前缀；页眉页脚整树 parse/tostring 路径保持
+    词法，ADR-006）。
+  - tests：`generate.py` 新增 `source`/`source_upstream` 机制
+    （从 `tests/fixtures/sources/` 复制真实模板不程序化 build，
+    manifest 记录上游出处）；oracle_diff 新增 4 个 P7b Rust
+    python-context arms；本机无 Office/LibreOffice 实机抽查，
+    逐 part 字节/c14n 差分替代。

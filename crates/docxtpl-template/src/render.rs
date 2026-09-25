@@ -173,8 +173,17 @@ pub fn render_footnotes_xml_ctx(
     part_name: &str,
 ) -> Result<String, RenderError> {
     let mut null_registry = NullRegistry;
-    // 脚注不允许图片，shape_id 不会被消费，传 0 即可。
-    render_part_string(src_xml, context, options, &mut null_registry, part_name, 0)
+    // 脚注不允许图片，shape_id 不会被消费，传 0 即可；normalize_input=false
+    // （通用 Part，原字节直穿，保留模板声明形态）。
+    render_part_string(
+        src_xml,
+        context,
+        options,
+        &mut null_registry,
+        part_name,
+        0,
+        false,
+    )
 }
 
 /// 管线处理的 part 种类：决定 shape_id 作用域与渲染后处理（P5，ADR-006）。
@@ -199,7 +208,9 @@ fn render_part_xml(
     // xpath("//@id") 最大值 +1；正文也在渲染前对原始 document 计算）。
     let shape_id = shape_id_of(src_xml);
 
-    let dst = render_part_string(src_xml, context, options, registry, part_name, shape_id)?;
+    let dst = render_part_string(
+        src_xml, context, options, registry, part_name, shape_id, true,
+    )?;
 
     // 宽松(recover)解析愈合（安全限额仍强制）。
     let outcome =
@@ -230,8 +241,14 @@ fn render_part_xml(
     }
 }
 
-/// 管线的字符串阶段：patch → 段落换行 → MiniJinja 渲染 → 还原
-/// （换行/字面转义）→ resolve_listing。正文、页眉页脚、脚注共用。
+/// 管线的字符串阶段：（正文/页眉页脚）树往返归一 → patch → 段落换行 →
+/// MiniJinja 渲染 → 还原（换行/字面转义）→ resolve_listing。
+///
+/// `normalize_input`：正文/页眉页脚为 true（上游 patch 输入来自
+/// remove_blank_text lxml 树）；脚注为 false——footnotes part 在
+/// python-docx PartFactory 未注册为 XmlPart，是通用二进制 Part，
+/// `part.blob` 即磁盘原字节（Word 双引号声明原样穿过 jinja，P7b B5
+/// 实证），patch 直接吃原字节、渲染字符串原样写回。
 #[allow(clippy::too_many_arguments)]
 fn render_part_string(
     src_xml: &str,
@@ -240,9 +257,25 @@ fn render_part_string(
     registry: &mut dyn ImageRegistry,
     part_name: &str,
     shape_id: i64,
+    normalize_input: bool,
 ) -> Result<String, RenderError> {
+    // 0. 正文/页眉页脚：树往返归一（P7b B2）——上游 patch_xml 的输入不是
+    //    磁盘原字节：正文是 `tostring(body)`、页眉页脚是
+    //    `tostring(parse_xml(part.blob))`，实体解码、缩进剥除、词法归一。
+    //    脚注保持原字节（通用 Part blob，声明形态不动）。
+    let raw = if normalize_input {
+        normalize_part_xml(src_xml, part_name)?
+    } else {
+        src_xml.to_string()
+    };
+    // Jinja2 词法器 tnewline=`\r\n|\r|\n` 统一产出 NEWLINE（渲染输出
+    // `\n`），即 jinja 往返会吃掉所有 CR（P7b B5：真实 Word 模板脚注
+    // 声明后是 `\r\n`，上游输出 `\n`）。lxml 树输出本就无 CR，此替换
+    // 只在脚注路径可观测。
+    let patch_source = raw.replace("\r\n", "\n").replace('\r', "\n");
+
     // 1. patch_xml：13 步有界正则变换。
-    let patched = patch_xml(src_xml);
+    let patched = patch_xml(&patch_source);
 
     // 2. 每个段落前插换行（仅用于错误定位，渲染后撤销）。
     let prepared = newline_before_p()
@@ -263,7 +296,10 @@ fn render_part_string(
     let dst = dst
         .replace("{_{", "{{")
         .replace("}_}", "}}")
-        .replace("{%_", "{%")
+        // 上游 template.py 的块标签转义是 "{%" 前插 "_" → "{_%"（patch 阶段
+        // "{% "→"{_%"），此前缀曾颠倒写成 "{%_"，真实模板的 {_%- 字面文本会
+        // 残留进输出（P7b merge_paragraph）。
+        .replace("{_%", "{%")
         .replace("%_}", "%}");
 
     // 5. resolve_listing：\n \t \a \f → br/tab/换段/分页。
@@ -284,6 +320,37 @@ fn render_part_string(
         });
     }
     Ok(dst)
+}
+
+/// XML part 的 python-docx oxml 树形态归一（P7b B1/B2）。
+///
+/// 两个使用点共用同一形态：
+/// 1. 渲染管线 patch_xml 前（B2）——正文/页眉页脚喂给 `patch_xml` 的 XML
+///    来自 python-docx oxml 解析树（`remove_blank_text=True`），而非包内
+///    磁盘原字节：正文 `tostring(body)`、页眉页脚
+///    `tostring(parse_xml(part.blob))`；
+/// 2. 保存期已知 XmlPart（styles/settings/numbering）的无条件重序列化
+///    （B1）——python-docx 保存时这些 part 恒由 lxml 树重写。
+///
+/// 脚注 part 不走此函数：它在 PartFactory 未注册为 XmlPart，是通用二进制
+/// Part，`blob` 即磁盘原字节（B5 实证 expected 保留 Word 双引号声明）。
+///
+/// 树往返使实体引用在文本节点中解码为字面字符（jinja 表达式里的
+/// `&quot;`/`&apos;` 不再残留）、元素间缩进空白剥除、属性与空元素词法
+/// 归一，输出 lxml 风格单引号 XML 声明 + `\n`。模板 part 必为良构 XML，
+/// 解析失败按 XML 错误上报（与上游打开文档即失败一致）。
+pub fn normalize_part_xml(src_xml: &str, part_name: &str) -> Result<String, RenderError> {
+    let mut doc = XmlDocument::parse_strict(src_xml, &XmlLimits::default()).map_err(|source| {
+        RenderError::Xml {
+            part: part_name.to_string(),
+            source,
+        }
+    })?;
+    doc.strip_blank_text();
+    Ok(format!(
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n{}",
+        doc.serialize_subtree(doc.root())
+    ))
 }
 
 /// 上游 `next_id`：原始 XML 中无前缀 `id="数字"` 属性的最大值 +1（无则 1）。

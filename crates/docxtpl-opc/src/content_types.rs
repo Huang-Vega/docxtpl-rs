@@ -44,6 +44,52 @@ pub struct ContentTypes {
     overrides: Vec<(String, String)>,
 }
 
+/// content type 可按扩展名走 `Default` 的 (扩展名小写, content type) 表。
+///
+/// 1:1 移植 python-docx `docx.opc.spec.default_content_types`（0.20.2）：
+/// `_ContentTypesItem.from_parts` 保存期重建 CT 时，命中此表的 part 落
+/// `Default`，其余落 `Override`；`rels`/`xml` 两行还会被无条件预置。
+const DEFAULT_CONTENT_TYPES: &[(&str, &str)] = &[
+    (
+        "bin",
+        "application/vnd.openxmlformats-officedocument.presentationml.printerSettings",
+    ),
+    (
+        "bin",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.printerSettings",
+    ),
+    (
+        "bin",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.printerSettings",
+    ),
+    ("bmp", "image/bmp"),
+    ("emf", "image/x-emf"),
+    ("fntdata", "application/x-fontdata"),
+    ("gif", "image/gif"),
+    ("jpe", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("jpg", "image/jpeg"),
+    ("png", "image/png"),
+    (
+        "rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+    ),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("wdp", "image/vnd.ms-photo"),
+    ("wmf", "image/x-wmf"),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    ("xml", "application/xml"),
+];
+
+/// OPC 关系部件的 content type（`Default Extension="rels"`）。
+const OPC_RELATIONSHIPS_CT: &str = "application/vnd.openxmlformats-package.relationships+xml";
+/// 通用 XML 部件的 content type（`Default Extension="xml"`）。
+const XML_CT: &str = "application/xml";
+
 impl ContentTypes {
     /// 解析 [Content_Types].xml 文本。
     ///
@@ -157,6 +203,40 @@ impl ContentTypes {
         }
         self.overrides
             .push((name.to_string(), content_type.to_string()));
+    }
+
+    /// 按 python-docx `_ContentTypesItem.from_parts`（0.20.2）从包部件
+    /// 重建登记：无条件预置 `Default rels/xml`；其余部件的 (扩展名小写,
+    /// content type) 命中 [`DEFAULT_CONTENT_TYPES`] 表时落 `Default`，
+    /// 否则落 `Override`。
+    ///
+    /// 真实 Word 模板常把 `_rels/*.rels` 与 `customXml/item*.xml` 登成
+    /// Override；python-docx 保存时 rels 不归入 parts 枚举（恒走预置
+    /// Default rels），`application/xml` 走 Default xml——这些 Override
+    /// 在重建中消失。入参不得包含 `[Content_Types].xml`、`.rels` 与目录
+    /// 条目（调用方 [`crate::Package::rebuild_content_types`] 已过滤）。
+    /// 排序在 [`ContentTypes::to_xml`] 时完成，本方法只重排归属。
+    pub fn rebuild_from_parts<'a>(&mut self, parts: impl Iterator<Item = (&'a str, &'a str)>) {
+        let mut fresh = ContentTypes::default();
+        fresh.add_default("rels", OPC_RELATIONSHIPS_CT);
+        fresh.add_default("xml", XML_CT);
+        for (uri, content_type) in parts {
+            let extension = uri
+                .rsplit('/')
+                .next()
+                .and_then(|file_name| file_name.rfind('.').map(|dot| &file_name[dot + 1..]))
+                .unwrap_or("")
+                .to_lowercase();
+            let is_default = DEFAULT_CONTENT_TYPES
+                .iter()
+                .any(|(ext, ct)| *ext == extension && *ct == content_type);
+            if is_default {
+                fresh.add_default(&extension, content_type);
+            } else {
+                fresh.add_override(uri, content_type);
+            }
+        }
+        *self = fresh;
     }
 
     /// 序列化为 python-docx 保存时的 `[Content_Types].xml` 字节。

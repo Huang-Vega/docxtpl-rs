@@ -62,8 +62,8 @@ use std::path::Path;
 
 use docxtpl_opc::{resolve_part_target, OpcError, Package, PackageLimits, PartUri, TargetMode};
 use docxtpl_template::{
-    find_undeclared_variables, render_core_properties_ctx, render_document_xml_ctx,
-    render_footnotes_xml_ctx, render_story_xml_ctx, RenderError,
+    find_undeclared_variables, normalize_part_xml, render_core_properties_ctx,
+    render_document_xml_ctx, render_footnotes_xml_ctx, render_story_xml_ctx, RenderError,
 };
 // 同时作为内部类型与对外重导出（底部 pub use 列表不再重复）。
 pub use docxtpl_template::RenderContext;
@@ -82,6 +82,18 @@ const MAX_INPUT_DOCX_BYTES: u64 = 128 * 1024 * 1024;
 /// 二进制 part 处理，渲染结果原样写回不重序列化，ADR-006）。
 const CT_FOOTNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
+
+/// python-docx PartFactory 注册为已知 XmlPart 子类、保存时**恒由 lxml 树
+/// 重序列化**的 part content type（P7b B1）：document/header/footer/core
+/// 已在渲染管线中重写；styles/settings/numbering 即使渲染未触碰也须做
+/// 树形态归一（真实 Word 模板里它们是双引号声明 + CRLF 的 Word 形态）。
+/// fontTable/webSettings/theme/footnotes/endnotes/comments/customXml 等
+/// 未注册的通用 Part 继续 blob 透传（DEV 分类见 compatibility.md）。
+const ALWAYS_REWRITTEN_XML_CTS: &[&str] = &[
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+];
 
 /// 一个可复用的 docx 模板（只读持有模板字节）。
 pub struct DocxTemplate {
@@ -383,19 +395,60 @@ fn render_all_parts(
     Ok(())
 }
 
-/// 重建 `[Content_Types].xml` 为 python-docx 保存时的规范形态。
+/// 保存前包级形态归一（P7b B1，对齐 python-docx `PackageWriter.write`）：
 ///
-/// 上游 `PackageWriter._write_content_types_stream` 每次保存都从包 part
-/// 重新生成 CT 流：`Default` 按扩展名、`Override` 按 part 名 ASCII 排序。
-/// 模板若被手工/第三方工具追加了乱序 Override（如后处理插入的
-/// footnotes Override），渲染后必须归一；字节未变化时不写回。
+/// 1. 已知 XmlPart（styles/settings/numbering）恒由 lxml 树重序列化
+///    （[`ALWAYS_REWRITTEN_XML_CTS`]）；通用 Part blob 透传；
+/// 2. 全部 `.rels`（含根 rels 与 customXml 子 rels）恒重写为模型规范
+///    XML（单引号声明）；
+/// 3. `[Content_Types].xml` 按 `_ContentTypesItem.from_parts` 重建：
+///    rels Override 消失、rels/xml Default 恒在，命中扩展名默认表的
+///    part 落 Default、其余落 Override，排序后写回。
+///
+/// 三类归一均为字节未变化时不写回。
 fn canonicalize_content_types(pkg: &mut Package) -> Result<(), Error> {
+    normalize_known_xml_parts(pkg)?;
+    pkg.normalize_relationships()?;
+
+    pkg.rebuild_content_types();
     let canonical = pkg.content_types().to_xml().into_bytes();
     let unchanged = pkg
         .part("[Content_Types].xml")
         .is_some_and(|part| part.bytes() == canonical.as_slice());
     if !unchanged {
         pkg.set_part_bytes("[Content_Types].xml", canonical)?;
+    }
+    Ok(())
+}
+
+/// 对 styles/settings/numbering 等已知 XmlPart 做无条件树形态归一
+/// （python-docx 保存时这些 part 恒重序列化，即使渲染未触碰）。
+fn normalize_known_xml_parts(pkg: &mut Package) -> Result<(), Error> {
+    // 先定位目标 part 名，再读+归一，避免遍历借用与 set_part_bytes 冲突。
+    let names: Vec<String> = pkg
+        .parts()
+        .filter(|part| {
+            !part.is_dir()
+                && pkg
+                    .content_types()
+                    .content_type_of(part.uri())
+                    .is_some_and(|ct| ALWAYS_REWRITTEN_XML_CTS.contains(&ct))
+        })
+        .map(|part| part.name().to_string())
+        .collect();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let src = read_part_utf8(pkg, name)?;
+        let normalized = normalize_part_xml(&src, name).map_err(Error::Render)?;
+        pending.push((name.clone(), normalized.into_bytes()));
+    }
+    for (name, bytes) in pending {
+        let unchanged = pkg
+            .part(&name)
+            .is_some_and(|part| part.bytes() == bytes.as_slice());
+        if !unchanged {
+            pkg.set_part_bytes(&name, bytes)?;
+        }
     }
     Ok(())
 }

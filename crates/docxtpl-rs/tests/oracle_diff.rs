@@ -420,6 +420,85 @@ fn build_python_context(
                 .unwrap_or_else(|e| panic!("{id}: undeclared_variables 失败: {e}"));
             ctx.insert("vars", names.into_iter().collect::<Vec<_>>().join(","));
         }
+
+        // ---------- P7b 真实 Word 手工模板（1:1 复刻 contexts/p7b_*.py）----------
+        "p7b_word2016" => {
+            // 纯空格/制表符：str 与 RichText 各一对（xml:space preserve 实测）。
+            ctx.insert("test_space", "          ");
+            ctx.insert("test_tabs", "\t".repeat(5));
+            ctx.insert("test_space_r", RichText::text("          "));
+            ctx.insert("test_tabs_r", RichText::text(&"\t".repeat(5)));
+        }
+        "p7b_cellbg" => {
+            // 4 行告警：第 1 行 RichText 红字加粗；bg 是单元格背景变量。
+            let alerts = RenderValue::array(vec![
+                RenderValue::object(vec![
+                    ("date".to_owned(), "2015-03-10".into()),
+                    (
+                        "desc".to_owned(),
+                        RichText::text_with(
+                            "Very critical alert",
+                            &props(|p| {
+                                p.color = Some("FF0000".to_owned());
+                                p.bold = true;
+                            }),
+                        )
+                        .into(),
+                    ),
+                    ("type".to_owned(), "CRITICAL".into()),
+                    ("bg".to_owned(), "FF0000".into()),
+                ]),
+                RenderValue::object(vec![
+                    ("date".to_owned(), "2015-03-11".into()),
+                    ("desc".to_owned(), RichText::text("Just a warning").into()),
+                    ("type".to_owned(), "WARNING".into()),
+                    ("bg".to_owned(), "FFDD00".into()),
+                ]),
+                RenderValue::object(vec![
+                    ("date".to_owned(), "2015-03-12".into()),
+                    ("desc".to_owned(), RichText::text("Information").into()),
+                    ("type".to_owned(), "INFO".into()),
+                    ("bg".to_owned(), "8888FF".into()),
+                ]),
+                RenderValue::object(vec![
+                    ("date".to_owned(), "2015-03-13".into()),
+                    ("desc".to_owned(), RichText::text("Debug trace").into()),
+                    ("type".to_owned(), "DEBUG".into()),
+                    ("bg".to_owned(), "FF00FF".into()),
+                ]),
+            ]);
+            ctx.insert("alerts", alerts);
+        }
+        "p7b_richtext_if" => {
+            ctx.insert(
+                "foobar",
+                RichText::text_with("Foobar!", &props(|p| p.color = Some("ff0000".to_owned()))),
+            );
+        }
+        "p7b_eastasia" => {
+            // eastAsia: 前缀 → rFonts w:eastAsia（三种字体名写法）。
+            ctx.insert(
+                "example",
+                RichText::text_with(
+                    "测试TEST",
+                    &props(|p| p.font = Some("eastAsia:Microsoft YaHei".to_owned())),
+                ),
+            );
+            ctx.insert(
+                "Chinese",
+                RichText::text_with(
+                    "测试TEST",
+                    &props(|p| p.font = Some("eastAsia:微软雅黑".to_owned())),
+                ),
+            );
+            ctx.insert(
+                "simsun",
+                RichText::text_with(
+                    "测试TEST",
+                    &props(|p| p.font = Some("eastAsia:SimSun".to_owned())),
+                ),
+            );
+        }
         other => panic!("未实现的 python 上下文 fixture: {other}"),
     }
     ctx
@@ -453,10 +532,11 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
-    // P0–P3 49 + P4 17 + P5 7 + P6 5 + P7 7 = 85 个 render fixture。
-    assert!(
-        render_ids.len() >= 85,
-        "render fixture 不足 85 个（实际 {}）",
+    // P0–P3 49 + P4 17 + P5 7 + P6 5 + P7 7 + P7b 16 = 101 个 render fixture。
+    assert_eq!(
+        render_ids.len(),
+        101,
+        "render fixture 计数应为 101（实际 {}）",
         render_ids.len()
     );
 

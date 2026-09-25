@@ -1,0 +1,61 @@
+{
+  "dishes": [
+    {
+      "name": "Pizza",
+      "ingredients": [
+        "bread",
+        "tomato",
+        "ham",
+        "cheese"
+      ]
+    },
+    {
+      "name": "Hamburger",
+      "ingredients": [
+        "bread",
+        "chopped steak",
+        "cheese",
+        "sauce"
+      ]
+    },
+    {
+      "name": "Apple pie",
+      "ingredients": [
+        "flour",
+        "apples",
+        "suggar",
+        "quince jelly"
+      ]
+    }
+  ],
+  "authors": [
+    {
+      "name": "Saint-Exupery",
+      "books": [
+        {
+          "title": "Le petit prince"
+        },
+        {
+          "title": "L'aviateur"
+        },
+        {
+          "title": "Vol de nuit"
+        }
+      ]
+    },
+    {
+      "name": "Barjavel",
+      "books": [
+        {
+          "title": "Ravage"
+        },
+        {
+          "title": "La nuit des temps"
+        },
+        {
+          "title": "Le grand secret"
+        }
+      ]
+    }
+  ]
+}
