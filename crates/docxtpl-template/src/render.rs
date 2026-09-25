@@ -356,6 +356,10 @@ fn value_to_minijinja<'a>(value: &'a RenderValue, pending: &mut Vec<&'a InlineIm
             pending.push(image);
             Value::from(format!("{IMAGE_TOKEN_PREFIX}{index}{IMAGE_TOKEN_SUFFIX}"))
         }
+        // Subdoc 片段按安全字符串注入（P6，ADR-007）：上游 `Subdoc.__html__`
+        // 存在，autoescape 开启时 jinja2 走 Markup 不转义；关闭时与
+        // `__str__` 等价原样输出。
+        RenderValue::Subdoc(fragment) => Value::from_safe_string(fragment.clone()),
         RenderValue::Array(items) => Value::from_iter(
             items
                 .iter()

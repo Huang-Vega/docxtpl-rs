@@ -68,6 +68,7 @@ use docxtpl_template::{
 pub use docxtpl_template::RenderContext;
 
 mod images;
+mod subdoc;
 
 use images::ImageInjections;
 
@@ -202,6 +203,24 @@ impl RenderSession {
     #[must_use]
     pub fn build_url_id(&mut self, url: &str) -> String {
         self.injections.build_url_id(url)
+    }
+
+    /// 上游 `DocxTemplate.new_subdoc(docpath)`（P6，ADR-007）：打开外部
+    /// docx 并把其部件合并进当前主包，返回可直接插入上下文的 Subdoc 值
+    /// （模板位写法 `{{p sd }}`）。
+    ///
+    /// 合并内容：引用部件复制（rels/Content Types）、样式三分支合并、
+    /// 编号复制、图片 media 去重并入、主文档 bookmark/docPr/cNvPr 重编号。
+    /// 树部件变更即时落包（未改 part 保留原字节）；图片与主 rels 变更在
+    /// [`RenderSession::finish`] 时与渲染结果一起落定。
+    ///
+    /// 必须在 [`RenderSession::finish`] 之前调用，且每次渲染会话内可调用
+    /// 多次（对齐上游构造期合并的幂等性）。
+    pub fn new_subdoc(
+        &mut self,
+        docpath: impl AsRef<std::path::Path>,
+    ) -> Result<RenderValue, Error> {
+        subdoc::new_subdoc(&mut self.pkg, &mut self.injections, docpath.as_ref())
     }
 
     /// 渲染全部 part（正文 → 页眉 → 页脚 → 核心属性 → 脚注，P5），

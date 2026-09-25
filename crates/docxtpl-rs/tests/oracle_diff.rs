@@ -343,6 +343,16 @@ fn build_python_context(id: &str, root: &Path, session: &mut RenderSession) -> R
                 ),
             );
         }
+        "p6_subdoc_basic" | "p6_subdoc_style" | "p6_subdoc_image" | "p6_subdoc_verbatim"
+        | "p6_subdoc_untagged" => {
+            // 1:1 复刻 contexts/p6_*.py：sd = tpl.new_subdoc(<id>_sub.docx)
+            // （上游在 build_context 构造期执行部件合并，此处同样先于 finish）。
+            let sub_path = root.join("templates").join(format!("{id}_sub.docx"));
+            let sd = session
+                .new_subdoc(&sub_path)
+                .unwrap_or_else(|e| panic!("{id}: new_subdoc 合并失败: {e}"));
+            ctx.insert("sd", sd);
+        }
         other => panic!("未实现的 python 上下文 fixture: {other}"),
     }
     ctx
@@ -376,10 +386,10 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
-    // P0–P3 49 个 + P4 17 个 + P5 7 个 = 73 个 render fixture。
+    // P0–P3 49 个 + P4 17 个 + P5 7 个 + P6 5 个 = 78 个 render fixture。
     assert!(
-        render_ids.len() >= 73,
-        "render fixture 不足 73 个（实际 {}）",
+        render_ids.len() >= 78,
+        "render fixture 不足 78 个（实际 {}）",
         render_ids.len()
     );
 

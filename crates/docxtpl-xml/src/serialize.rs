@@ -37,6 +37,22 @@ pub(crate) fn serialize_with(doc: &XmlDocument, options: SerializeOptions) -> St
     out
 }
 
+/// 序列化以 `id` 为根的子树（无 XML 声明）。
+///
+/// 供 Subdoc 片段输出使用：上游 `etree.tostring(body, encoding="unicode")`
+/// 后用正则剥掉 body 开/闭标签，等价于逐个序列化 body 的直接子节点——
+/// 片段不携带任何命名空间声明（body 开标签上被提升的声明随标签一起剥掉），
+/// 前缀绑定由主文档提供。
+pub(crate) fn serialize_subtree(
+    doc: &XmlDocument,
+    id: NodeId,
+    options: SerializeOptions,
+) -> String {
+    let mut out = String::new();
+    serialize_node(doc, id, options, &mut out);
+    out
+}
+
 fn serialize_node(doc: &XmlDocument, id: NodeId, options: SerializeOptions, out: &mut String) {
     let node = &doc.nodes[id.0 as usize];
     match node.kind {

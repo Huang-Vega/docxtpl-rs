@@ -97,6 +97,21 @@ impl XmlDocument {
         )
     }
 
+    /// 序列化以 `id` 为根的子树（无 XML 声明）。
+    ///
+    /// 供 Subdoc 片段输出使用（ADR-007）：上游对 sub body 做
+    /// `tostring` 后剥标签，片段不含任何命名空间声明。
+    #[must_use]
+    pub fn serialize_subtree(&self, id: NodeId) -> String {
+        serialize::serialize_subtree(
+            self,
+            id,
+            serialize::SerializeOptions {
+                retain_redundant_ns: false,
+            },
+        )
+    }
+
     /// 删除仅由 XML 空白字符组成、且不在 `xml:space="preserve"` 作用域内
     /// 的文本节点。
     ///

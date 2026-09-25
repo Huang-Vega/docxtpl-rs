@@ -78,3 +78,30 @@ docs/compatibility.md §7）。
     新建 rels 先挂载再写回；sha1/media 编号包级共享；`build_url_id`
     外链恒归主文档）；每次渲染后归一 `[Content_Types].xml`
     （Default/Override ASCII 排序，字节未变不写回）。
+- **P6：Subdoc 子文档合并（ADR-007）**。对齐 docxtpl 0.20.2
+  `tpl.new_subdoc(docpath)` + docxcompose 2.2.0 `Composer.attach_parts`；
+  新增 5 个 `p6_*` oracle fixture（各带 `*_sub.docx` 子文档），差分
+  5 个全部逐字节 MATCH，详见 docs/compatibility.md §4/§7。
+  - docxtpl-template：新增 `RenderValue::Subdoc(String)`，经
+    `Value::from_safe_string` 注入（对齐 `Subdoc.__html__`，
+    autoescape 开/关均原样；片段 jinja 单遍求值、字面标签不二次求值）；
+    不提供 From/JSON 入口。
+  - docxtpl-xml：新增 `serialize_subtree`（无声明子树序列化）、
+    `insert_child_at`（对齐 lxml `element.insert`）、
+    `deepcopy_element`（跨文档深拷贝）；主树序列化路径零改动。
+  - docxtpl-opc：新增 `ContentTypes::add_override`（Override 保序
+    尾插，排序仅在 to_xml）。
+  - docxtpl-rs：新增 `crates/docxtpl-rs/src/subdoc.rs`（约 1700 行）
+    1:1 复刻 attach_parts 编排——引用部件递归复制（partname/rId
+    空洞回填、external rel 迁移）、样式三分支合并（name 映射复用/
+    deepcopy append + 编号与 linked 链 fall-through 改写）、编号复制
+    （num 尾插前位、anum 首位、映射残留语义）、图片合并（扩展名取
+    源 part 后缀、CT 取源包声明、字节 sha1 去重）、页眉页脚引用
+    剥离、bookmark/docPr/cNvPr 重编号、分节守卫；树 part dirty 门控
+    保留未改字节，图片/主 rels 经 `ImageInjections` 随 finish 落定。
+  - 新门面 API `RenderSession::new_subdoc(path) ->
+    Result<RenderValue, Error>`（会话内可多次调用，须先于 finish）；
+    DEV-0008～DEV-0012：无 docpath 借用模式、custom.xml、编号
+    非确定路径（nsid/主缺 numbering/restart 实触发）、
+    SmartArt/VML/脚注引用、两侧多节均为不支持并返回带 part 名错误。
+  - oracle 侧锁定 docxcompose==2.2.0（tests/oracle/requirements.txt）。

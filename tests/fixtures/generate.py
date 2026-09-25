@@ -37,6 +37,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.section import WD_SECTION
+from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -67,12 +68,13 @@ FIXTURES = []
 
 
 def fixture(fid, feature, phase, mode, context=None, post=None,
-            context_kind="json", context_src=None):
+            context_kind="json", context_src=None, sub_build=None):
     def deco(build):
         FIXTURES.append({
             "id": fid, "feature": feature, "phase": phase, "mode": mode,
             "context": context, "post": post, "build": build,
             "context_kind": context_kind, "context_src": context_src,
+            "sub_build": sub_build,
         })
         return build
     return deco
@@ -967,7 +969,7 @@ _CTX_HEADER = '''\
 """P4 fixture context（由 tests/fixtures/generate.py 生成，勿手改）。
 
 提供 build_context(tpl)：返回渲染上下文，可包含 RichText/RichTextParagraph/
-Listing/InlineImage 等类型化值（对齐上游 docxtpl 0.20.2 用法）。
+Listing/InlineImage/Subdoc 等类型化值（对齐上游 docxtpl 0.20.2 用法）。
 """
 import os
 
@@ -979,6 +981,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 def _img(name):
     return os.path.join(_HERE, os.pardir, "media", name)
+
+
+def _sub(name):
+    return os.path.join(_HERE, os.pardir, "templates", name)
 
 '''
 
@@ -1336,6 +1342,117 @@ def p5_hf_untagged(doc):
 
 
 # ===========================================================================
+# P6 -- subdoc (external docx merged via tpl.new_subdoc, ADR-007)
+#
+# 主模板统一：普通文本段落 + `{{p sd }}` 独占段落（表达式形式，非 {%p %}）。
+# 主模板全域规避 bookmark/图片/页眉页脚/多分节（保证 renumber 三兄弟与
+# fix_section_types 在主文档 no-op）；sub docx 规避 w:numId/脚注引用/
+# SmartArt/VML/自定义属性/多分节（上游语义含非确定性或主包不支持）。
+# ===========================================================================
+
+def _sub_doc_basic(doc):
+    doc.add_paragraph("Sub first paragraph")
+    doc.add_paragraph("Sub second paragraph")
+    doc.add_paragraph("Sub third paragraph")
+
+
+# 94
+@fixture("p6_subdoc_basic", "render: subdoc with plain paragraphs (minimal attach)",
+         "P6", "render", context_kind="python", sub_build=_sub_doc_basic,
+         context_src='''
+def build_context(tpl):
+    sd = tpl.new_subdoc(_sub("p6_subdoc_basic_sub.docx"))
+    return {"sd": sd}
+''')
+def p6_subdoc_basic(doc):
+    doc.add_paragraph("Main text before subdoc")
+    doc.add_paragraph("{{p sd }}")
+
+
+def _sub_doc_style(doc):
+    doc.add_paragraph("Plain default paragraph")
+    doc.add_paragraph("Sub Heading", style="Heading 1")
+    custom = doc.styles.add_style("MyCustom", WD_STYLE_TYPE.PARAGRAPH)
+    doc.add_paragraph("Custom style paragraph", style=custom)
+
+
+# 95
+@fixture("p6_subdoc_style", "render: subdoc styles (mapped Heading 1 + appended custom)",
+         "P6", "render", context_kind="python", sub_build=_sub_doc_style,
+         context_src='''
+def build_context(tpl):
+    sd = tpl.new_subdoc(_sub("p6_subdoc_style_sub.docx"))
+    return {"sd": sd}
+''')
+def p6_subdoc_style(doc):
+    doc.add_paragraph("Main text before subdoc")
+    doc.add_paragraph("{{p sd }}")
+
+
+def _sub_doc_image(doc):
+    doc.add_picture(io.BytesIO(minimal_png()), width=Inches(1))
+    p = doc.add_paragraph()
+    r_id = doc.part.relate_to("https://example.com/sub-link", RT.HYPERLINK,
+                              is_external=True)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+    run = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = "Sub external link"
+    run.append(t)
+    hyperlink.append(run)
+    p._p.append(hyperlink)
+
+
+# 96
+@fixture("p6_subdoc_image",
+         "render: subdoc image (sha1 dedup, media part, r:embed rewrite) + external link",
+         "P6", "render", context_kind="python", sub_build=_sub_doc_image,
+         context_src='''
+def build_context(tpl):
+    sd = tpl.new_subdoc(_sub("p6_subdoc_image_sub.docx"))
+    return {"sd": sd}
+''')
+def p6_subdoc_image(doc):
+    doc.add_paragraph("Main text before subdoc")
+    doc.add_paragraph("{{p sd }}")
+
+
+def _sub_doc_verbatim(doc):
+    doc.add_paragraph("literal {% x %} stays")
+    doc.add_paragraph("literal {{ y }} stays too")
+
+
+# 97
+@fixture("p6_subdoc_verbatim", "render: subdoc with verbatim jinja tag text (single pass)",
+         "P6", "render", context_kind="python", sub_build=_sub_doc_verbatim,
+         context_src='''
+def build_context(tpl):
+    sd = tpl.new_subdoc(_sub("p6_subdoc_verbatim_sub.docx"))
+    return {"sd": sd}
+''')
+def p6_subdoc_verbatim(doc):
+    doc.add_paragraph("Main text before subdoc")
+    doc.add_paragraph("{{p sd }}")
+
+
+def _sub_doc_untagged(doc):
+    pass  # 空 body（仅 sectPr）：片段为空字符串
+
+
+# 98
+@fixture("p6_subdoc_untagged", "render: subdoc without any tags (attach tree transform only)",
+         "P6", "render", context_kind="python", sub_build=_sub_doc_untagged,
+         context_src='''
+def build_context(tpl):
+    sd = tpl.new_subdoc(_sub("p6_subdoc_untagged_sub.docx"))
+    return {"sd": sd}
+''')
+def p6_subdoc_untagged(doc):
+    doc.add_paragraph("{{p sd }}")
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
@@ -1356,6 +1473,11 @@ def main():
         doc.save(template_path)
         if fx["post"] is not None:
             fx["post"](template_path)
+        if fx["sub_build"] is not None:
+            # P6 sub docx：外部待合并文档（python-docx 生成，输入而非输出）。
+            sub_doc = Document()
+            fx["sub_build"](sub_doc)
+            sub_doc.save(TEMPLATES_DIR / (fx["id"] + "_sub.docx"))
 
         context_field = None
         if fx["mode"] == "render":

@@ -1305,6 +1305,76 @@
       "known_deviations": [],
       "owner": "vegah",
       "issue": ""
+    },
+    {
+      "id": "p6_subdoc_basic",
+      "feature": "render: subdoc with plain paragraphs (minimal attach)",
+      "phase": "P6",
+      "mode": "render",
+      "template": "templates/p6_subdoc_basic.docx",
+      "context": "contexts/p6_subdoc_basic.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": ""
+    },
+    {
+      "id": "p6_subdoc_style",
+      "feature": "render: subdoc styles (mapped Heading 1 + appended custom)",
+      "phase": "P6",
+      "mode": "render",
+      "template": "templates/p6_subdoc_style.docx",
+      "context": "contexts/p6_subdoc_style.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": ""
+    },
+    {
+      "id": "p6_subdoc_image",
+      "feature": "render: subdoc image (sha1 dedup, media part, r:embed rewrite) + external link",
+      "phase": "P6",
+      "mode": "render",
+      "template": "templates/p6_subdoc_image.docx",
+      "context": "contexts/p6_subdoc_image.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": ""
+    },
+    {
+      "id": "p6_subdoc_verbatim",
+      "feature": "render: subdoc with verbatim jinja tag text (single pass)",
+      "phase": "P6",
+      "mode": "render",
+      "template": "templates/p6_subdoc_verbatim.docx",
+      "context": "contexts/p6_subdoc_verbatim.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": ""
+    },
+    {
+      "id": "p6_subdoc_untagged",
+      "feature": "render: subdoc without any tags (attach tree transform only)",
+      "phase": "P6",
+      "mode": "render",
+      "template": "templates/p6_subdoc_untagged.docx",
+      "context": "contexts/p6_subdoc_untagged.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": ""
     }
   ]
 }

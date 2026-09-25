@@ -145,6 +145,20 @@ impl ContentTypes {
         self.defaults.push((extension, content_type.to_string()));
     }
 
+    /// 新增或替换一条 Override 声明（`part_name` 允许带或不带前导 `/`）。
+    ///
+    /// 供 Subdoc 部件合并使用：搬入的外部 docx 部件（styles/numbering/
+    /// header/footer 等）按部件名声明内容类型。
+    pub fn add_override(&mut self, part_name: &str, content_type: &str) {
+        let name = part_name.strip_prefix('/').unwrap_or(part_name);
+        if let Some(slot) = self.overrides.iter_mut().find(|(p, _)| p == name) {
+            slot.1 = content_type.to_string();
+            return;
+        }
+        self.overrides
+            .push((name.to_string(), content_type.to_string()));
+    }
+
     /// 序列化为 python-docx 保存时的 `[Content_Types].xml` 字节。
     ///
     /// 格式钉死 lxml 输出：单引号 XML 声明 + `\n`；根元素 `Types`（包内容

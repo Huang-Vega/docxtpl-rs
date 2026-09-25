@@ -4,7 +4,8 @@
 //!
 //! - 纯 JSON（[`serde_json::Value`]）：与 P2/P3 的 JSON 路径完全同构；
 //! - 富内容：[`RichText`] / [`RichTextParagraph`] / [`Listing`] /
-//!   [`InlineImage`]（docxtpl-rich）；
+//!   [`InlineImage`]（docxtpl-rich）；Subdoc 片段（P6，ADR-007，构造入口
+//!   在 docxtpl-rs）；
 //! - 嵌套数组 / 对象（支撑 `{% for row in rows %}` 中含富值的场景）。
 //!
 //! 富文本/列表在渲染期直接以其 `to_xml()` 字符串参与 MiniJinja 渲染
@@ -81,6 +82,13 @@ pub enum RenderValue {
     Listing(Listing),
     /// 内联图片。
     Image(InlineImage),
+    /// Subdoc 片段（P6，ADR-007）：外部 docx 的部件合并进主包后，其
+    /// body 子级拼成的 XML 片段字符串（对齐上游 `Subdoc.__str__`）。
+    ///
+    /// 片段不含任何命名空间声明（上游剥 body 标签时声明一并丢失），
+    /// 前缀绑定由主文档根元素声明兜底。构造入口在 docxtpl-rs 的
+    /// `RenderSession::new_subdoc`。
+    Subdoc(String),
     /// 有序数组。
     Array(Vec<RenderValue>),
     /// 有序对象（键值对保序）。
@@ -88,6 +96,12 @@ pub enum RenderValue {
 }
 
 impl RenderValue {
+    /// 构造 Subdoc 片段值（P6，ADR-007）。
+    #[must_use]
+    pub fn subdoc(fragment: impl Into<String>) -> Self {
+        Self::Subdoc(fragment.into())
+    }
+
     /// 构造有序对象值。
     #[must_use]
     pub fn object(entries: Vec<(String, RenderValue)>) -> Self {

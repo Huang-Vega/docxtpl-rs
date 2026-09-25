@@ -151,6 +151,82 @@ impl ImageInjections {
             .get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External)
     }
 
+    /// 在主文档关系作用域登记（或复用）一个关系，返回其 rId
+    /// （P6，ADR-007：Subdoc 部件合并）。
+    ///
+    /// 对齐上游 compose 期 `docx._part.relate_to` / `rels.get_or_add_ext_rel`：
+    /// 新增关系永远落在主文档 part 的 rels 上，按
+    /// （reltype, target, mode）去重复用。图片关系由
+    /// [`ImageInjections::add_subdoc_image`] 代调。
+    pub(crate) fn main_get_or_add(
+        &mut self,
+        rel_type: &str,
+        target: &str,
+        mode: TargetMode,
+    ) -> String {
+        self.current = self.main_index;
+        self.current_owner_mut().get_or_add(rel_type, target, mode)
+    }
+
+    /// Subdoc 图片合并（P6，ADR-007）：按 sha1 复用主包既有图片 part，
+    /// 未命中按 `word/media/imageN.ext` 新建（暂存，finish 落包），并在
+    /// 主文档 rels 登记 IMAGE 关系，返回其 rId。
+    ///
+    /// 对齐上游 `add_images`：`pkg.image_parts._get_by_sha1` 命中直接复用
+    /// partname（rId 仍经主 rels 的去重语义，同图既有 rel 时返回原 rId）；
+    /// 未命中按 `ImageWrapper`（扩展名取源 part 文件名后缀、content type
+    /// 取源包声明）+ `_add_image_part` 新建。编号/CT 暂存与渲染期图片
+    /// 共用同一状态，防止跨阶段撞号或重复 push Default。
+    pub(crate) fn add_subdoc_image(
+        &mut self,
+        bytes: &[u8],
+        ext: &str,
+        content_type: &str,
+    ) -> String {
+        let digest = hex_sha1(bytes);
+        let target_abs = match self.by_sha1.get(&digest) {
+            Some(existing) => existing.clone(),
+            None => {
+                let number = self.next_image_number();
+                let name = format!("word/media/image{number}.{ext}");
+                self.used_numbers.insert(number);
+                self.by_sha1.insert(digest, name.clone());
+                self.pending_parts.push((name.clone(), bytes.to_vec()));
+                if !self.known_defaults.contains(ext)
+                    && !self.pending_defaults.iter().any(|(known, _)| known == ext)
+                {
+                    self.pending_defaults
+                        .push((ext.to_string(), content_type.to_string()));
+                }
+                name
+            }
+        };
+        let owner_name = self.owners[self.main_index].name.clone();
+        let rel_target = relative_to_owner(&owner_name, &target_abs);
+        self.main_get_or_add(IMAGE_REL_TYPE, &rel_target, TargetMode::Internal)
+    }
+
+    /// 主文档 rels 中 HEADER/FOOTER 关系的内部目标 part 名（插入序，
+    /// 不去重，对齐上游 `renumber_docpr_ids` / `renumber_nvpicpr_ids`
+    /// 的 parts 收集方式）。
+    ///
+    /// 供 Subdoc 的 docPr/cNvPr 续编号使用（P6，ADR-007）。
+    pub(crate) fn main_header_footer_parts(&self) -> Vec<String> {
+        let main = &self.owners[self.main_index];
+        let base = PartUri::new(&main.name).ok().and_then(|uri| uri.parent());
+        let mut out = Vec::new();
+        for rel in main.rels.iter() {
+            if rel.target_mode == TargetMode::Internal
+                && (rel.rel_type.ends_with("/header") || rel.rel_type.ends_with("/footer"))
+            {
+                if let Some(target) = resolve_part_target(base.as_ref(), &rel.target) {
+                    out.push(target.as_str().to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// 分配下一个图片编号：1 起回填空洞，否则最大值 +1
     /// （等价上游 `range(1, len+1)` 回填空洞的结果）。
     fn next_image_number(&self) -> u64 {
@@ -341,7 +417,7 @@ fn parent_dir(name: &str) -> Option<String> {
 /// 计算目标绝对 part 相对 owner part 所在目录的引用路径
 /// （posix relpath：`word/document.xml` + `word/media/i.png` →
 /// `media/i.png`；需要上溯时产出 `..`）。
-fn relative_to_owner(owner_part: &str, target_abs: &str) -> String {
+pub(crate) fn relative_to_owner(owner_part: &str, target_abs: &str) -> String {
     fn segments(name: &str) -> Vec<&str> {
         name.split('/')
             .filter(|segment| !segment.is_empty())

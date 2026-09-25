@@ -550,12 +550,160 @@ impl XmlDocument {
         self.attach(parent, child);
     }
 
+    /// 把 `child` 插入 `parent` 的第 `index` 个子节点位（对齐 lxml
+    /// `element.insert(index, child)`）；`child` 已挂载时先从原位置脱离，
+    /// `index` 超出子节点数时退化为追加。
+    ///
+    /// 供 Subdoc 编号合并使用（ADR-007）：上游 `_insert_num`（前于最后一个
+    /// `w:num`）与 `_insert_abstract_num`（前于第一个 `w:num` / 根首）按
+    /// 下标插入。
+    pub fn insert_child_at(&mut self, parent: NodeId, index: usize, child: NodeId) {
+        if let Some(old) = self.nodes[child.0 as usize].parent.take() {
+            self.nodes[old.0 as usize].children.retain(|&c| c != child);
+        }
+        let slot = &mut self.nodes[parent.0 as usize];
+        let index = index.min(slot.children.len());
+        slot.children.insert(index, child);
+        self.nodes[child.0 as usize].parent = Some(parent);
+    }
+
     /// 从父节点移除该节点（节点本身保留在 arena 中，可重新挂载）。
     pub fn detach(&mut self, id: NodeId) {
         if let Some(parent) = self.nodes[id.0 as usize].parent.take() {
             self.nodes[parent.0 as usize].children.retain(|&c| c != id);
         }
     }
+
+    /// 深拷贝 `src` 文档中以 `src_id` 为根的元素子树到本文档
+    /// （对齐 lxml `deepcopy` + `append` 的命名空间自适配语义）。
+    ///
+    /// 返回游离的拷贝根（未挂载），由调用方负责挂载。
+    ///
+    /// 命名空间处理分三步：
+    /// 1. 整树拷贝（保留词法前缀、属性与开标签自带声明）；
+    /// 2. 找出拷贝子树内无法解析的前缀使用（元素名或属性名），
+    ///    其 URI 直接取节点上已解析的限定名——它正是源树祖先链
+    ///    提供的绑定；同前缀对应多个不同 URI 时报错（本实现保留
+    ///    词法前缀，无法像 lxml 那样自动改名规避冲突）；
+    /// 3. 将提升绑定按目标文档现状落地：目标未声明则补到拷贝根
+    ///    与文档级总表，同 URI 则跳过，异 URI 则报错。
+    pub fn deepcopy_element(
+        &mut self,
+        src: &XmlDocument,
+        src_id: NodeId,
+    ) -> Result<NodeId, XmlError> {
+        if src.nodes.get(src_id.0 as usize).map(|n| n.kind) != Some(NodeKind::Element) {
+            return Err(XmlError::Parse {
+                line: 0,
+                col: 0,
+                offset: 0,
+                message: "deepcopy_element 仅支持元素节点".to_string(),
+            });
+        }
+        // 1. 整树拷贝。
+        let copy_root = copy_subtree(self, src, src_id, None);
+
+        // 2. 收集需要提升的 (前缀, URI) 候选。
+        let mut needed: Vec<(String, String)> = Vec::new();
+        for cur in self.descendants(copy_root) {
+            let node = &self.nodes[cur.0 as usize];
+            if node.kind != NodeKind::Element {
+                continue;
+            }
+            // 元素名前缀：空前缀仅在元素确实落在默认命名空间时才需要声明。
+            let elem_ns = node
+                .qname
+                .as_ref()
+                .map(|q| q.ns.as_str())
+                .unwrap_or_default();
+            if !elem_ns.is_empty() && self.resolve_prefix(Some(cur), &[], &node.prefix).is_none() {
+                push_needed(&mut needed, &node.prefix, elem_ns)?;
+            }
+            // 属性名前缀：无前缀属性永不落在默认命名空间，无需处理。
+            for (i, aprefix) in node.attr_prefix.iter().enumerate() {
+                if aprefix.is_empty() || aprefix == "xml" {
+                    continue;
+                }
+                let ans = node.attrs[i].0.ns.as_str();
+                if !ans.is_empty() && self.resolve_prefix(Some(cur), &[], aprefix).is_none() {
+                    push_needed(&mut needed, aprefix, ans)?;
+                }
+            }
+        }
+
+        // 3. 落地提升绑定。
+        for (prefix, uri) in &needed {
+            match self.prefix_uri(prefix) {
+                Some(u) if u == uri => {}
+                Some(u) => {
+                    return Err(XmlError::Parse {
+                        line: 0,
+                        col: 0,
+                        offset: 0,
+                        message: format!(
+                            "目标文档中前缀 {prefix:?} 已绑定到 {u:?}，与源绑定 {uri:?} 冲突，无法跨文档拷贝"
+                        ),
+                    });
+                }
+                None => {
+                    let root_node = &mut self.nodes[copy_root.0 as usize];
+                    root_node.nsdecls.push((prefix.clone(), uri.clone()));
+                    self.prefix_uris.push((prefix.clone(), uri.clone()));
+                }
+            }
+        }
+        Ok(copy_root)
+    }
+}
+
+/// 递归拷贝子树：复制节点全部词法信息并挂到 `parent`。
+fn copy_subtree(
+    dst: &mut XmlDocument,
+    src: &XmlDocument,
+    src_id: NodeId,
+    parent: Option<NodeId>,
+) -> NodeId {
+    let sn = &src.nodes[src_id.0 as usize];
+    let id = dst.alloc(sn.kind);
+    let node = &mut dst.nodes[id.0 as usize];
+    node.qname = sn.qname.clone();
+    node.prefix = sn.prefix.clone();
+    node.attrs = sn.attrs.clone();
+    node.attr_prefix = sn.attr_prefix.clone();
+    node.nsdecls = sn.nsdecls.clone();
+    node.value = sn.value.clone();
+    node.pi_target = sn.pi_target.clone();
+    node.parent = parent;
+    if let Some(p) = parent {
+        dst.nodes[p.0 as usize].children.push(id);
+    }
+    for &child in &sn.children {
+        copy_subtree(dst, src, child, Some(id));
+    }
+    id
+}
+
+/// 登记一个待提升的 (前缀, URI) 候选；同前缀异 URI 视为不可适配。
+fn push_needed(
+    needed: &mut Vec<(String, String)>,
+    prefix: &str,
+    uri: &str,
+) -> Result<(), XmlError> {
+    if let Some((_, existing)) = needed.iter().find(|(p, _)| p == prefix) {
+        if existing != uri {
+            return Err(XmlError::Parse {
+                line: 0,
+                col: 0,
+                offset: 0,
+                message: format!(
+                    "源子树中前缀 {prefix:?} 绑定到多个命名空间（{existing:?} 与 {uri:?}），无法跨文档拷贝"
+                ),
+            });
+        }
+        return Ok(());
+    }
+    needed.push((prefix.to_string(), uri.to_string()));
+    Ok(())
 }
 
 /// 拆分词法限定名 `prefix:local`；冒号多于一个时按首个切分（宽松容错）。
