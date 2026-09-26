@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "date": "2026-09-26",
+  "baseline_commit": "fcfceec3df5e053bbad3f04d780562d56447f5d4",
+  "tested_working_tree": "strict.rs UTF-8 panic fix plus regression tests",
+  "host": {
+    "system": "macOS",
+    "version": "26.6.2",
+    "build": "25G83",
+    "architecture": "arm64",
+    "rust": "1.98.1",
+    "msrv": "1.85.0",
+    "python": "3.14.4"
+  },
+  "workspace_passed": 293,
+  "workspace_failed": 0,
+  "oracle": {
+    "render_fixtures": 102,
+    "byte_matches": 98,
+    "expected_error_matches": 4,
+    "failures": 0
+  },
+  "libreoffice": {
+    "version": "26.8.0.0.alpha0",
+    "open_resave_passed": 8
+  },
+  "logs": {
+    "fmt": {
+      "path": "target/macos-verification/fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "clippy": {
+      "path": "target/macos-verification/clippy.log",
+      "sha256": "e48a49d8068b268152091afd2c6fc3e72cef8d29d3256068608c224260d44f65"
+    },
+    "workspace": {
+      "path": "target/macos-verification/workspace.log",
+      "sha256": "ebb9565262b78d7a204e0aea08d633d93755ae78fe7806851b71f22c6d1584e7"
+    },
+    "oracle": {
+      "path": "target/macos-verification/oracle.log",
+      "sha256": "efbec89ef85b2218358b0581238b7402e3b765c65c9e2b81b79e7cbd93195edb"
+    },
+    "differential": {
+      "path": "target/macos-verification/differential.log",
+      "sha256": "e828c4e6b7e4d04504c88db2983a632d2e2992007a2e6bfc59cc713a4bbcff8c"
+    },
+    "differential-detail": {
+      "path": "target/macos-verification/differential-detail.log",
+      "sha256": "b77d2f349e33840d7822dfad6dc10cc3311d82b5ea7d34b46cc938bed94ded94"
+    },
+    "msrv": {
+      "path": "target/macos-verification/msrv.log",
+      "sha256": "d8d63ba63918291d4c83947e1b252ca3aa2a415e0957271a731361576176c7c8"
+    },
+    "release": {
+      "path": "target/macos-verification/release.log",
+      "sha256": "b57da5c6f201fc0f561bb3b60c8b501efd3aa169895e336ed6db1de123d6c3ef"
+    },
+    "office": {
+      "path": "target/macos-verification/office.log",
+      "sha256": "c7fb260b8a716a2dd4e0b43520c37cc92d02969ae60f16c95feaf90d7dcbb175"
+    }
+  },
+  "remaining_release_evidence": [
+    "long-running fuzz corpus and sanitizer trend"
+  ]
+}

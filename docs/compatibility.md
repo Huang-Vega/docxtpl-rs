@@ -145,7 +145,7 @@ rels Override、customXml/footnotes/comments 部件）下的逐字节等价。
 | 随机/截断 ZIP、任意 XML、marker-heavy patch 输入无 panic | compatible 加固 | 6 个 proptest 性质；每项 256/512 cases |
 | 默认资源限额对冻结 corpus 留有余量 | compatible 加固 | 127 个模板；最大 23 条目、833 014 B 总解压、32.156 压缩比 |
 | release 分阶段性能回归基线 | 0.8.x 候选门禁 | 3 个分层样例，各 15 次；拆分 open/render/write 并记录峰值 RSS；同机 `--compare` render 回退 >20% 阻断；尚未接入稳定同机 CI runner |
-| Windows/Linux/macOS 基础回归 | 候选门禁 | Windows 与 Ubuntu 24.04 x86_64 实测 fmt/clippy/test/oracle；Linux LibreOffice 24.2.7.2 打开并另存 8/8；macOS 待 CI |
+| Windows/Linux/macOS 基础回归 | 候选门禁 | Windows 与 Ubuntu 24.04 x86_64 实测 fmt/clippy/test/oracle；Linux LibreOffice 24.2.7.2 打开并另存 8/8；macOS 26.6.2 arm64 实测 fmt/clippy/test/oracle/MSRV、性能与 LibreOffice 8/8 通过（见 p7d-macos-verification.md） |
 | Microsoft Word 人工外观抽查 | 候选门禁 | Windows 11 Pro x64 / Word 16.0.17932.20700 x64；代表性 Rust 输出打开、另存、重开 10/10，Word 导出页面人工检查 11/11；详见 `p7d-word-smoke.json` |
 
 ### unsupported（明确拒绝）

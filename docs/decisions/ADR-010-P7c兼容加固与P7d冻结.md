@@ -26,7 +26,7 @@ P7a/P7b 及后续补漏已把公开功能和真实 Word corpus 收敛到 102 个
    为准。102 个 render fixture 中 98 个逐字节 MATCH、4 个错误类别一致，
    即声明范围 100%，阻断用例 100%，高于 95% 门槛。
 5. workspace 版本候选为 0.8.0；Office 代表性实机抽查已由 LibreOffice 与
-   Microsoft Word 覆盖，发布前仍需 macOS 实跑与长期 fuzz 证据。峰值 RSS
+   Microsoft Word 覆盖，macOS 实跑已补齐，发布前仍需长期 fuzz 证据。峰值 RSS
    采集支持 Windows/Linux/macOS。发布到 registry、创建 Git tag 属外部发布
    动作，不在本 ADR 内。
 
@@ -47,6 +47,11 @@ P7a/P7b 及后续补漏已把公开功能和真实 Word corpus 收敛到 102 个
   `docs/p7d-word-smoke.json`。
 - 新增 6 个 property tests 全部通过；完整门禁与 oracle 结果记录在
   `docs/p7-compatibility-report.md`。
+
+- macOS 26.6.2 arm64 / rustc 1.98.1 / Python 3.14.4 全部门禁通过，
+  LibreOfficeDev 26.8.0.0.alpha0 打开并另存 8/8；修复属性测试发现的
+  strict `<!` 分支 Unicode 切片 panic。详见 `docs/p7d-macos-verification.md`
+  与 `docs/p7c-performance-macos.json`。
 
 ## 影响
 

@@ -5,6 +5,14 @@ use proptest::prelude::*;
 
 const LIMITS: XmlLimits = XmlLimits { max_depth: 64 };
 
+#[test]
+fn malformed_bang_with_multibyte_characters_returns_error() {
+    for src in ["<!aAῖપ", "<root><!aAῖપ</root>"] {
+        assert!(XmlDocument::parse_strict(src, &LIMITS).is_err());
+        let _ = XmlDocument::parse_lenient(src, &LIMITS);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 

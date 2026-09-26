@@ -11,7 +11,8 @@ P7c 在 Windows 与 Ubuntu 24.04 x86_64 VM 均未发现 panic、资源限额缺�
 已知高危包校验缺陷；Linux 上 LibreOffice 24.2.7.2 的 8 个代表性打开/另存
 检查通过，Windows 上 Microsoft Word 16.0.17932.20700 x64 对 10 个 Rust
 实际输出的打开、另存、重开与 11 页人工外观检查全部通过。版本候选为 0.8.0；
-macOS 实跑与长期 fuzz corpus 仍待补齐，因此不发布 registry 包、不创建 Git 标签。
+macOS 26.6.2 arm64 实跑已完成，并修复属性测试发现的畸形 Unicode XML panic；
+长期 fuzz corpus 仍待补齐，因此不发布 registry 包、不创建 Git 标签。
 
 ## 验收证据
 
@@ -22,13 +23,13 @@ macOS 实跑与长期 fuzz corpus 仍待补齐，因此不发布 registry 包、
 | 属性测试 | 6/6 性质通过（每项 256/512 cases） |
 | 资源审计 | 127 模板全部在默认限额内 |
 | 性能基线 | 3 个 release 内部基准已拆分 open/render/write，并记录峰值 RSS；20% 阈值仅适合同机复测 |
-| 跨平台 | Windows 与 Ubuntu 24.04 x86_64 实测通过；macOS 结果待 CI |
+| 跨平台 | Windows、Ubuntu 24.04 x86_64 与 macOS 26.6.2 arm64 实测通过 |
 | LibreOffice | 24.2.7.2 headless 打开并另存 8/8，通过表/行/单元格结构断言 |
 | Microsoft Word | ProPlus2024Volume 16.0.17932.20700 x64：代表性 Rust 输出打开/另存/重开 10/10，Word 导出页面人工检查 11/11，重存 DOCX ZIP/XML 结构检查 10/10 |
 | Rust 质量门禁 | workspace test、clippy `-D warnings`、fmt |
 
 性能和资源明细见 Windows `p7c-performance-baseline.json`、Linux
-`p7c-performance-linux.json` 与 `security-limits.md`。
+`p7c-performance-linux.json`、macOS `p7c-performance-macos.json` 与 `security-limits.md`。
 Microsoft Word 的 fixture、哈希、文档计数与逐项观察见 `p7d-word-smoke.json`。
 完整功能分层与 DEV-0001～DEV-0014 公开边界见 `compatibility.md`。
 
@@ -47,4 +48,4 @@ Microsoft Word 的 fixture、哈希、文档计数与逐项观察见 `p7d-word-s
 - DEV-0007 的重复/外部/孤立 story 与 endnotes、DEV-0008 借用模式 API 边界、
   DEV-0009、DEV-0010 的 `w:nsid`/主包缺 numbering/编号重启分支，以及
   DEV-0011、DEV-0012 均已有动态 DOCX 或 compile-fail 回归。
-- macOS 实跑结果仍待 CI。
+- macOS 实跑结果见 `p7d-macos-verification.md`；修复后的本机门禁全部通过。

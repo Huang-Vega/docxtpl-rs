@@ -2,6 +2,11 @@
 
 所有用户可见变化均记录于此（代码规范 §10）。语义对齐基线：Python docxtpl 0.20.2。
 
+## [Unreleased]
+
+- 修复严格 XML 解析器对畸形 `<!` 声明中多字节 Unicode 字符进行前缀切片时的 panic；新增定向回归与持久化属性测试 seed。
+- 补齐 macOS 26.6.2 arm64 的质量门禁、oracle、MSRV、Office 与性能实测证据。
+
 ## [0.1.0-alpha]
 
 首个 MVP：P0–P3 范围全部完成，与 Python docxtpl 0.20.2 oracle 差分全绿

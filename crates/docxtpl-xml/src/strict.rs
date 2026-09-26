@@ -129,7 +129,11 @@ impl<'a> Parser<'a> {
         let mut rest: &str = &self.input[self.pos..];
         rest = rest.strip_prefix('<').unwrap_or(rest);
         rest = rest.strip_prefix('!').unwrap_or(rest);
-        if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case("DOCTYPE") {
+        if rest
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"DOCTYPE"))
+        {
             let follows = rest[7..].chars().next();
             if follows.is_none_or(|c| names::is_ws(c) || c == '>') {
                 return Err(XmlError::EntityForbidden("检测到 DOCTYPE 声明".to_string()));
