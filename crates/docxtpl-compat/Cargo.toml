@@ -1,0 +1,21 @@
+[package]
+name = "docxtpl-compat"
+description = "Compatibility layer for upstream docxtpl 0.20.2: line-by-line port of the patch_xml regexes and replacement units"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+fancy-regex = "0.13"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+zip.workspace = true

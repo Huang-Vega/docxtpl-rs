@@ -1,0 +1,23 @@
+[package]
+name = "docxtpl-template"
+description = "Template rendering pipeline: patch_xml → MiniJinja rendering → resolve_listing → fix_tables/fix_docpr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+docxtpl-compat = { version = "=1.0.0-rc.1", path = "../docxtpl-compat" }
+docxtpl-rich = { version = "=1.0.0-rc.1", path = "../docxtpl-rich" }
+docxtpl-xml = { version = "=1.0.0-rc.1", path = "../docxtpl-xml" }
+html-escape = "0.2"
+minijinja = { version = "2", features = ["fuel", "json", "preserve_order", "unicode", "urlencode"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat", "rand", "wordcount"] }
+regex = "1"
+serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "preserve_order"] }
+thiserror = "2"

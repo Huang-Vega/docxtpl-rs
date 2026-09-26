@@ -1,0 +1,16 @@
+[package]
+name = "docxtpl-rich"
+description = "Rich content value types: RichText/RichTextParagraph/Listing/InlineImage and image header parsing, byte-for-byte aligned with docxtpl 0.20.2 and python-docx 1.2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+sha1 = "0.10"
+thiserror = "2"

@@ -1,0 +1,12 @@
+{
+  "htitle": "Header title",
+  "hshow": true,
+  "hitems": [
+    "A",
+    "B",
+    "C"
+  ],
+  "ftitle": "Footer title",
+  "pageno": 7,
+  "btitle": "Body title"
+}

@@ -1,0 +1,11 @@
+/target
+/.tmp/
+/.cache/
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
+/third_party
+tests/oracle/actual/
+__pycache__/
+*.pyc
+.DS_Store

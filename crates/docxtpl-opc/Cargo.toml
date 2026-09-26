@@ -1,0 +1,21 @@
+[package]
+name = "docxtpl-opc"
+description = "OOXML/OPC package reader/writer: ZIP, parts, Content Types, relationships, and resource limits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zip.workspace = true
+quick-xml = "0.41"
+thiserror = "2"
+tempfile = "3"
+
+[dev-dependencies]
+proptest = "1"

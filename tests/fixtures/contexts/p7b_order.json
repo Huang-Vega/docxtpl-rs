@@ -1,0 +1,24 @@
+{
+  "customer_name": "Eric",
+  "items": [
+    {
+      "desc": "Python interpreters",
+      "qty": 2,
+      "price": "FREE"
+    },
+    {
+      "desc": "Django projects",
+      "qty": 5403,
+      "price": "FREE"
+    },
+    {
+      "desc": "Guido",
+      "qty": 1,
+      "price": "100,000,000.00"
+    }
+  ],
+  "in_europe": true,
+  "is_paid": false,
+  "company_name": "The World Wide company",
+  "total_price": "100,000,000.00"
+}
