@@ -60,7 +60,9 @@ use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
-use docxtpl_opc::{resolve_part_target, OpcError, Package, PackageLimits, PartUri, TargetMode};
+use docxtpl_opc::{
+    resolve_part_target, OpcError, Package, PackageLimits, PartUri, Relationship, TargetMode,
+};
 use docxtpl_template::{
     find_undeclared_variables, normalize_part_xml, render_core_properties_ctx,
     render_document_xml_ctx, render_footnotes_xml_ctx, render_story_xml_ctx, RenderError,
@@ -73,7 +75,7 @@ mod replacements;
 mod subdoc;
 
 use images::ImageInjections;
-use replacements::Replacements;
+use replacements::{picture_map, Replacements};
 
 const MAX_INPUT_DOCX_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -198,6 +200,17 @@ impl DocxTemplate {
         find_undeclared_variables(&doc_xml, &story_xmls).map_err(Error::Render)
     }
 
+    /// 上游 `DocxTemplate.get_pic_map()` 的只读等价物。
+    ///
+    /// 返回模板正文及页眉页脚中图片的 `cNvPr@name` 到图片 relationship
+    /// 相对 target（例如 `image.png -> media/image1.png`）的有序映射。
+    /// 病态图片结构、外部图片和悬空关系与上游扫描一样跳过。
+    pub fn picture_map(&self) -> Result<std::collections::BTreeMap<String, String>, Error> {
+        let pkg = self.open_package()?;
+        let main_name = pkg.main_document_uri()?.as_str().to_string();
+        picture_map(&pkg, &main_name)
+    }
+
     /// 每次渲染独立开包并校验。
     fn open_package(&self) -> Result<Package, Error> {
         let pkg = Package::from_reader(Cursor::new(&self.data), &PackageLimits::default())?;
@@ -254,6 +267,15 @@ impl RenderSession {
     ///
     /// 必须在 [`RenderSession::finish`] 之前调用，且每次渲染会话内可调用
     /// 多次（对齐上游构造期合并的幂等性）。
+    ///
+    /// 无参数的 Subdoc 借用模式不属于公开 API（DEV-0008）；调用方必须
+    /// 提供一个外部 DOCX 路径：
+    ///
+    /// ```compile_fail,E0061
+    /// fn borrowing_mode_is_not_available(session: &mut docxtpl_rs::RenderSession) {
+    ///     let _ = session.new_subdoc();
+    /// }
+    /// ```
     pub fn new_subdoc(
         &mut self,
         docpath: impl AsRef<std::path::Path>,
@@ -377,13 +399,12 @@ fn render_all_parts(
     }
 
     // 4. 核心属性：上游 render() 无条件执行 render_properties。目标经根
-    // rels 的 core-properties 关系解析（标准 docx 即 docProps/core.xml）。
-    if let Some(core_name) = core_properties_part(pkg) {
-        let core_src = read_part_utf8(pkg, &core_name)?;
-        let rendered =
-            render_core_properties_ctx(&core_src, context, options.autoescape(), injections)?;
-        pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
-    }
+    // rels 的 core-properties 关系解析；缺失时 python-docx 会创建默认 part。
+    let core_name = ensure_core_properties_part(pkg)?;
+    let core_src = read_part_utf8(pkg, &core_name)?;
+    let rendered =
+        render_core_properties_ctx(&core_src, context, options.autoescape(), injections)?;
+    pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
 
     // 5. 脚注：通用二进制 part，渲染字符串原样写回（保留 XML 声明）。
     for name in footnotes_parts(pkg) {
@@ -515,14 +536,95 @@ fn read_part_utf8(pkg: &Package, name: &str) -> Result<String, Error> {
         })
 }
 
-/// 经根 rels 的 core-properties 关系定位核心属性 part（仅内部目标）。
-fn core_properties_part(pkg: &Package) -> Option<String> {
-    pkg.root_relationships()
+/// 经根 rels 定位核心属性 part；关系缺失时对齐 python-docx，创建默认
+/// `/docProps/core.xml`、content type 与根关系。
+fn ensure_core_properties_part(pkg: &mut Package) -> Result<String, Error> {
+    const CORE_NAME: &str = "docProps/core.xml";
+    const CORE_CONTENT_TYPE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
+    const CORE_REL_TYPE: &str =
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
+
+    if let Some(name) = pkg
+        .root_relationships()
         .iter()
-        .find(|r| r.rel_type.ends_with("/metadata/core-properties"))
-        .filter(|r| r.target_mode == TargetMode::Internal)
-        .map(|r| r.target.clone())
+        .find(|rel| {
+            rel.rel_type.ends_with("/metadata/core-properties")
+                && rel.target_mode == TargetMode::Internal
+        })
+        .and_then(|rel| resolve_part_target(None, &rel.target))
+        .map(|uri| uri.as_str().to_string())
         .filter(|name| pkg.contains(name))
+    {
+        return Ok(name);
+    }
+
+    let default_xml = default_core_properties_xml().into_bytes();
+    if pkg.contains(CORE_NAME) {
+        // 未被关系引用的同名 part 在 python-docx 中不可见；创建默认 part
+        // 的效果等价于替换该孤立条目。
+        pkg.set_part_bytes(CORE_NAME, default_xml)?;
+    } else {
+        pkg.add_part(CORE_NAME, default_xml)?;
+    }
+
+    let mut content_types = pkg.content_types().clone();
+    content_types.add_override(CORE_NAME, CORE_CONTENT_TYPE);
+    pkg.set_part_bytes("[Content_Types].xml", content_types.to_xml().into_bytes())?;
+
+    let mut relationships = pkg.root_relationships().clone();
+    relationships.push(Relationship {
+        id: relationships.next_r_id(),
+        rel_type: CORE_REL_TYPE.to_string(),
+        target: CORE_NAME.to_string(),
+        target_mode: TargetMode::Internal,
+    });
+    pkg.set_part_bytes("_rels/.rels", relationships.to_xml().into_bytes())?;
+    Ok(CORE_NAME.to_string())
+}
+
+/// python-docx `CorePropertiesPart.default()` 的默认 XML。时间精度与上游
+/// 一致为 UTC 秒（W3CDTF）。
+fn default_core_properties_xml() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = unix_seconds_to_w3cdtf(seconds);
+    format!(
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n\
+         <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+         xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\
+         <dc:title>Word Document</dc:title>\
+         <cp:lastModifiedBy xmlns:cp=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\">python-docx</cp:lastModifiedBy>\
+         <cp:revision xmlns:cp=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\">1</cp:revision>\
+         <dcterms:modified xsi:type=\"dcterms:W3CDTF\">{timestamp}</dcterms:modified>\
+         </cp:coreProperties>"
+    )
+}
+
+fn unix_seconds_to_w3cdtf(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+
+    // Howard Hinnant 的 civil_from_days；Unix epoch 对应 1970-01-01。
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// 一次渲染的结果文档。

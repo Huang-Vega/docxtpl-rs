@@ -1,0 +1,167 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-26T10:20:07.7274939+08:00",
+  "git": {
+    "commit": "f1d51c3f7c95e0c40e375eea3c21bf0410f6ccc7",
+    "working_tree_dirty": true
+  },
+  "host": {
+    "system": "Microsoft Windows 11 Pro",
+    "version": "10.0.26200",
+    "build": "26200.9457",
+    "architecture": "x64"
+  },
+  "word": {
+    "product_release_id": "ProPlus2024Volume",
+    "version": "16.0",
+    "build": "16.0.17932.20700",
+    "architecture": "x64"
+  },
+  "procedure": {
+    "source": "Rust outputs retained from the oracle differential test run",
+    "oracle_command": "cargo test -p docxtpl-rs --features oracle --test oracle_diff oracle_differential_render_fixtures -- --exact --nocapture",
+    "oracle_result": {
+      "byte_matches": 98,
+      "expected_error_matches": 4,
+      "failures": 0
+    },
+    "word_sequence": [
+      "open Rust output read-only",
+      "repaginate and collect document metrics",
+      "save as a new DOCX",
+      "close and reopen the saved DOCX read-only",
+      "repaginate and compare document metrics",
+      "export the reopened document to PDF",
+      "render and manually inspect every exported page",
+      "parse every XML and relationships part in the saved DOCX"
+    ]
+  },
+  "summary": {
+    "fixtures": 10,
+    "open_save_reopen_passed": 10,
+    "source_sha256_unchanged": 10,
+    "word_metrics_preserved": 10,
+    "visual_pages_reviewed": 11,
+    "visual_pages_passed": 11,
+    "docx_zip_xml_passed": 10,
+    "cleanup_errors": 0
+  },
+  "cases": [
+    {
+      "id": "r2_var_multiple",
+      "source_sha256": "D600C343E0DE659915BB95FA6E6A8E72A01B460061413FC99EBB2215975AA525",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 0,
+      "hyperlinks": 0,
+      "visual_check": "Rendered text is complete and no template marker remains.",
+      "result": "passed"
+    },
+    {
+      "id": "p7b_order",
+      "source_sha256": "93A7F4A48ECE4973D7C4D3BF5B5045C96061AD3101283FE6C2AE3D2A832CC149",
+      "pages": 1,
+      "sections": 1,
+      "tables": 1,
+      "inline_shapes": 0,
+      "hyperlinks": 0,
+      "visual_check": "Invoice rows, quantity and price columns, total, borders and widths are intact.",
+      "result": "passed"
+    },
+    {
+      "id": "p7b_vm_nested",
+      "source_sha256": "99FD1228118926BFD460BF00FFD70DC52AFF456AD025DC91E57B4FCC43D2A9BD",
+      "pages": 1,
+      "sections": 1,
+      "tables": 2,
+      "inline_shapes": 0,
+      "hyperlinks": 0,
+      "visual_check": "Nested vertical merges, compound headers and footer totals are coherent without overflow.",
+      "result": "passed"
+    },
+    {
+      "id": "p4_combo_rich",
+      "source_sha256": "856ECCB4B34A69795C3204A4AEB1F69902E509A8A44FB1C2601D876B8A764149",
+      "pages": 1,
+      "sections": 1,
+      "tables": 1,
+      "inline_shapes": 2,
+      "hyperlinks": 0,
+      "visual_check": "Blue bold title, bold and italic rows, two images, newline and tab rendering are present.",
+      "result": "passed"
+    },
+    {
+      "id": "p4_img_formats",
+      "source_sha256": "06D6B5AEB5D7A9382AA5DAD310580BB42AECEC98794E3CAD5CACC7A6DD8F8680",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 4,
+      "hyperlinks": 0,
+      "visual_check": "The image-format test media render without broken-image placeholders.",
+      "result": "passed"
+    },
+    {
+      "id": "p5_hf_multi",
+      "source_sha256": "397B14B5ABB1A16AB5C3570DBD503C57A5E1CA18006513FC2ACDA51BAFB22477",
+      "pages": 2,
+      "sections": 2,
+      "tables": 0,
+      "inline_shapes": 0,
+      "hyperlinks": 0,
+      "visual_check": "Both sections retain their independent body, header and footer content on separate pages.",
+      "result": "passed"
+    },
+    {
+      "id": "p5_hf_image",
+      "source_sha256": "028D46C5EA9B8E2CDFFD13E2DE3A2EE3F378C9B763B60FAAE62AC02908BB8324",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 4,
+      "hyperlinks": 1,
+      "external_target": "https://example.com/anchor",
+      "visual_check": "Header, body and footer images are visible; the header hyperlink relationship is preserved.",
+      "result": "passed"
+    },
+    {
+      "id": "p6_subdoc_style",
+      "source_sha256": "B6CA88695FC087C8F1F63DE65F66F8BFBFA3E9C583FD9D5F04DAC2DCADF9F808",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 0,
+      "hyperlinks": 0,
+      "visual_check": "Plain paragraph, Sub Heading and custom-style paragraph render with distinct styling and spacing.",
+      "result": "passed"
+    },
+    {
+      "id": "p6_subdoc_image",
+      "source_sha256": "4C802DD6C94E23D72D92C135E2F5DA2929311D78AE149374D72D11905E2ED627",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 1,
+      "hyperlinks": 1,
+      "external_target": "https://example.com/sub-link",
+      "visual_check": "Subdocument image, insertion order and external hyperlink relationship are preserved.",
+      "result": "passed"
+    },
+    {
+      "id": "p7_media_body",
+      "source_sha256": "30ADDBE6C7C220A763F7C75AB5A8D4742157436E7305B3079105FC977FD7B543",
+      "pages": 1,
+      "sections": 1,
+      "tables": 0,
+      "inline_shapes": 1,
+      "hyperlinks": 0,
+      "visual_check": "The replacement image is visible in blue and the surrounding body text is intact.",
+      "result": "passed"
+    }
+  ],
+  "remaining_release_evidence": [
+    "macOS real runner result",
+    "long-running fuzz corpus and sanitizer trend"
+  ]
+}

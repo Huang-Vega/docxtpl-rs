@@ -273,10 +273,9 @@ fn parse_jpeg(blob: &[u8]) -> Result<(u32, u32, u32, u32), ImageError> {
     let mut sof = None;
     let mut start = 0usize;
     while let Some((code, seg_off)) = next_marker(blob, start) {
-        let next_start;
-        if is_standalone(code) {
+        let next_start = if is_standalone(code) {
             // standalone 标记段长为 0
-            next_start = seg_off;
+            seg_off
         } else {
             // 段长 = BE u16@段首（含 2 字节长度本身，不含 2 字节标记码）
             let seg_len = be_u16(blob, seg_off).ok_or(ImageError::Unrecognized)? as usize;
@@ -293,8 +292,8 @@ fn parse_jpeg(blob: &[u8]) -> Result<(u32, u32, u32, u32), ImageError> {
                 let px_w = be_u16(blob, seg_off + 5).ok_or(ImageError::Unrecognized)?;
                 sof = Some((u32::from(px_w), u32::from(px_h)));
             }
-            next_start = seg_off + seg_len;
-        }
+            seg_off + seg_len
+        };
         // EOI：扫描终点；SOS：上游 marker 收集到此为止
         if code == 0xD9 || code == 0xDA {
             break;

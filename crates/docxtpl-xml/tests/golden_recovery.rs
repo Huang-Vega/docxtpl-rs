@@ -60,8 +60,8 @@ fn golden_recovery_all_pairs() {
     }
 
     assert_eq!(
-        checked, 99,
-        "golden fixture 对数应为 99（101 个 render fixture 中 r2_syntax_error/p4_img_bad 仅导出 patched；p5_hf_syntax_error 与 P7 save 阶段错误的 body pre/recover 仍存在）"
+        checked, 100,
+        "golden fixture 对数应为 100（102 个 render fixture 中 r2_syntax_error/p4_img_bad 仅导出 patched；p5_hf_syntax_error 与 P7 save 阶段错误的 body pre/recover 仍存在）"
     );
     assert!(
         failures.is_empty(),

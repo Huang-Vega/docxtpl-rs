@@ -1,0 +1,23 @@
+name: bounded fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Exercise fuzz targets
+        run: |
+          for target in opc_reader xml_parsers patch_xml full_render; do
+            cargo fuzz run "$target" -- -max_total_time=240 -timeout=10
+          done

@@ -67,7 +67,7 @@ def run_fixture(fx):
             # build_context 仍执行（P7：replace_* 在其中注册）。
             context = load_context(fx, tpl)
             if not fx.get("skip_render"):
-                tpl.render(context)
+                tpl.render(context, autoescape=fx.get("autoescape", False))
             # P7 skip_render：对齐上游不 render 直接 save（注册的
             # pre/post 替换照常执行；docPr 等保持模板原字节）。
             tpl.save(str(out_path))

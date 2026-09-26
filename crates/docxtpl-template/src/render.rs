@@ -416,9 +416,13 @@ pub(crate) fn context_to_minijinja(context: &RenderContext) -> (Value, Vec<&Inli
 fn value_to_minijinja<'a>(value: &'a RenderValue, pending: &mut Vec<&'a InlineImage>) -> Value {
     match value {
         RenderValue::Json(json) => Value::from_serialize(json),
-        RenderValue::RichText(rich) => Value::from(rich.to_xml()),
-        RenderValue::RichTextParagraph(paragraph) => Value::from(paragraph.to_xml()),
-        RenderValue::Listing(listing) => Value::from(listing.to_xml()),
+        // 上游四类富值都实现 `__html__`，autoescape 开启时仍作为 Markup
+        // 原样注入；MiniJinja 对应使用 safe string。
+        RenderValue::RichText(rich) => Value::from_safe_string(rich.to_xml().to_owned()),
+        RenderValue::RichTextParagraph(paragraph) => {
+            Value::from_safe_string(paragraph.to_xml().to_owned())
+        }
+        RenderValue::Listing(listing) => Value::from_safe_string(listing.to_xml().to_owned()),
         RenderValue::Image(image) => {
             let index = pending.len();
             pending.push(image);
@@ -427,7 +431,7 @@ fn value_to_minijinja<'a>(value: &'a RenderValue, pending: &mut Vec<&'a InlineIm
         // Subdoc 片段按安全字符串注入（P6，ADR-007）：上游 `Subdoc.__html__`
         // 存在，autoescape 开启时 jinja2 走 Markup 不转义；关闭时与
         // `__str__` 等价原样输出。
-        RenderValue::Subdoc(fragment) => Value::from_safe_string(fragment.clone()),
+        RenderValue::Subdoc(fragment) => Value::from_safe_string(fragment.as_str().to_owned()),
         RenderValue::Array(items) => Value::from_iter(
             items
                 .iter()

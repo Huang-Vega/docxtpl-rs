@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-25T23:54:56+08:00",
+  "generated_at": "2026-09-26T09:05:09+08:00",
   "versions": {
     "docxtpl": "0.20.2",
     "jinja2": "3.1.6",
@@ -610,6 +610,13 @@
       "error_message": null
     },
     {
+      "id": "p4_autoescape_rich",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
       "id": "p5_hf_basic",
       "mode": "render",
       "status": "ok",
@@ -737,6 +744,118 @@
     },
     {
       "id": "p7_undeclared_vars",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_order",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_dynamic_table",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_merge_paragraph",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_word2016",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_hf_entities",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_comments",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_nested_for",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_preserve_spaces",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_vm",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_vm_nested",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_hm",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_cellbg",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_richtext_if",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_eastasia",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_less_cells",
+      "mode": "render",
+      "status": "ok",
+      "error_type": null,
+      "error_message": null
+    },
+    {
+      "id": "p7b_footnotes_real",
       "mode": "render",
       "status": "ok",
       "error_type": null,

@@ -185,6 +185,11 @@ fn build_python_context(
             ctx.insert("rt", RichText::text("前"));
             ctx.insert("lst", Listing::new("X\nY"));
         }
+        "p4_autoescape_rich" => {
+            ctx.insert("rt", RichText::text_with("R<&", &props(|p| p.bold = true)));
+            ctx.insert("lst", Listing::new("L<&\nN"));
+            ctx.insert("img", media_image(root, "p4_dot2x1.png", None, None, None));
+        }
         "p4_img_png" => {
             ctx.insert("img", media_image(root, "p4_dot2x1.png", None, None, None));
         }
@@ -532,11 +537,11 @@ fn oracle_differential_render_fixtures() {
         .filter(|fx| fx["mode"] == "render")
         .map(|fx| fx["id"].as_str().unwrap())
         .collect();
-    // P0–P3 49 + P4 17 + P5 7 + P6 5 + P7 7 + P7b 16 = 101 个 render fixture。
+    // P0–P3 49 + P4 18 + P5 7 + P6 5 + P7 7 + P7b 16 = 102 个 render fixture。
     assert_eq!(
         render_ids.len(),
-        101,
-        "render fixture 计数应为 101（实际 {}）",
+        102,
+        "render fixture 计数应为 102（实际 {}）",
         render_ids.len()
     );
 
@@ -578,12 +583,17 @@ fn oracle_differential_render_fixtures() {
             .get("skip_render")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let autoescape = fx
+            .get("autoescape")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let options = RenderOptions::compat().with_autoescape(autoescape);
 
         // python 上下文走富内容渲染会话（build_url_id 在会话内预登记）；
         // 其余走纯 JSON 路径。
         let rendered = if is_python_context {
             let mut session = tpl
-                .render_session(&RenderOptions::compat())
+                .render_session(&options)
                 .unwrap_or_else(|e| panic!("{id}: 开启渲染会话失败: {e}"));
             let ctx = build_python_context(id, &root, &tpl, &mut session);
             if skip_render {
@@ -596,7 +606,7 @@ fn oracle_differential_render_fixtures() {
                 Some(rel) => load_json(&root.join(rel)),
                 None => Value::Object(serde_json::Map::new()),
             };
-            tpl.render(&ctx, &RenderOptions::compat())
+            tpl.render(&ctx, &options)
         };
 
         if let Some(expected_type) = expected_error_type {

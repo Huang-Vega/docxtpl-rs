@@ -1,0 +1,46 @@
+[package]
+name = "docxtpl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+docxtpl-opc = { path = "../crates/docxtpl-opc" }
+docxtpl-xml = { path = "../crates/docxtpl-xml" }
+docxtpl-compat = { path = "../crates/docxtpl-compat" }
+docxtpl-rs = { path = "../crates/docxtpl-rs" }
+serde_json = "1"
+
+[[bin]]
+name = "opc_reader"
+path = "fuzz_targets/opc_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_parsers"
+path = "fuzz_targets/xml_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch_xml"
+path = "fuzz_targets/patch_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "full_render"
+path = "fuzz_targets/full_render.rs"
+test = false
+doc = false
+bench = false

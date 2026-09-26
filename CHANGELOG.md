@@ -33,6 +33,39 @@ docs/compatibility.md §7）。
 
 ## [Unreleased]
 
+- **P7c/P7d：兼容加固、审计与 0.8.0 冻结（ADR-010）**。
+  - 新增 OPC 随机/截断字节、XML strict/recover 任意输入和 marker-heavy
+    `patch_xml` 共 6 个 proptest 性质（每项 256/512 cases），错误路径无 panic。
+  - 对 127 个模板复核资源峰值；默认限额继续覆盖最大 23 条目、833 014 B
+    总解压和 32.156 压缩比，未发现高危包校验缺陷。
+  - 新增 `tests/p7c_audit.py` 与 Windows release 三样例分阶段性能基线，拆分
+    open/render/write、排除 CLI 启动并记录峰值 RSS；同平台 render 回退超过
+    20% 可阻断；CI 保持 Windows/Linux/macOS 回归，
+    clippy 扩至 `--all-features`。
+  - 冻结 P7 兼容报告与公开 DEV 边界，workspace 版本提升为 0.8.0；
+    不包含 crates.io 发布或 Git 标签。
+  - 后续审计补齐 `DocxTemplate::picture_map()`（上游 `get_pic_map`）及
+    reset/zipname 优先级回归，并将三平台、Office、持续 fuzz、峰值内存
+    明确保留为发布前证据，不再把 CI 配置等同于实测结果。
+  - 新增 `p4_autoescape_rich` oracle，修复 autoescape 下富值被转义的
+    DEV-0005；基线升至 102 render（98 MATCH + 4 错误类别），golden
+    102/100。增加重复/外部 story、SmartArt/VML/脚注拒绝和 P7 descr/
+    未命中/注册顺序测试；Subdoc 原始字符串改为严格校验的 opaque 片段。
+  - 增加四个 `cargo-fuzz` target（OPC、strict/recover XML、patch_xml、完整
+    from_bytes/render）及每周有界 fuzz 工作流；补充页眉图片与核心属性语法
+    错误的 part 定位集成回归，并清理 224 个仅 ZIP 时间戳变化的 DOCX。
+  - 峰值 RSS 采集扩展到 Windows/Linux/macOS，性能比较显式拒绝跨 OS/架构
+    基线，避免把机器差异误报为性能回退。
+  - 补齐 DEV-0008 路径模式/借用模式 API 边界和 DEV-0010 缺 numbering/
+    编号重启拒绝分支；核心属性 part 缺失时按 python-docx 重建，非 UTF-8
+    核心属性返回带 part 名错误。
+  - 在 Ubuntu 24.04 x86_64 VM（rustc 1.98.1）完成 workspace、clippy、fmt、
+    oracle 与 15 次 Linux 性能/RSS 基线；LibreOffice 24.2.7.2 代表性 DOCX
+    打开并另存 8/8。修复新版 Clippy 报告的 JPEG marker 无需延迟初始化。
+  - 在 Windows 11 Pro x64 的 Microsoft Word 16.0.17932.20700 x64 完成 10 个
+    代表性 Rust 输出的打开、另存与重开（10/10），人工检查 Word 导出页面
+    11/11，并验证重存 DOCX ZIP/XML 结构 10/10。
+
 - **P4：RichText / RichTextParagraph / Listing / InlineImage（ADR-005）**。
   新增 17 个 `p4_*` oracle fixture，差分 16 个逐字节 MATCH + 1 个错误类别
   一致（UnrecognizedImageError），详见 docs/compatibility.md §4/§7。
@@ -160,5 +193,5 @@ docs/compatibility.md §7）。
   - tests：`generate.py` 新增 `source`/`source_upstream` 机制
     （从 `tests/fixtures/sources/` 复制真实模板不程序化 build，
     manifest 记录上游出处）；oracle_diff 新增 4 个 P7b Rust
-    python-context arms；本机无 Office/LibreOffice 实机抽查，
-    逐 part 字节/c14n 差分替代。
+    python-context arms；逐 part 字节/c14n 差分为主，P7d 后续补齐
+    Microsoft Word 与 LibreOffice 代表性实机抽查。

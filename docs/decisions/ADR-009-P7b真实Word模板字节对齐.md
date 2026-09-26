@@ -154,5 +154,6 @@ Word 模板（Word 2016 保存形态：双引号声明 + CRLF、元素间缩进�
 - 本阶段不新增 DEV：通用 Part blob 透传、ns 重绑等均为对齐上游
   行为；既存排除项（DEV-0005 autoescape+富值、DEV-0008 Subdoc 仅
   docpath、自定义 jinja_env 拒绝清单）继续适用。
-- 本机无 Office/LibreOffice 实机抽查（语料源自上游仓库，字节差分
-  已逐 part 钉死）。
+- P7b 实施时本机无 Office/LibreOffice 实机抽查（语料源自上游仓库，字节
+  差分已逐 part 钉死）；P7d 后续已补齐 LibreOffice 8/8 与 Microsoft Word
+  10/10 代表性实机抽查，详见 `docs/p7-compatibility-report.md`。

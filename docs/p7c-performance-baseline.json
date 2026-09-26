@@ -1,0 +1,60 @@
+{
+  "schema": 2,
+  "platform": {
+    "system": "Windows",
+    "machine": "AMD64",
+    "python": "3.13.13"
+  },
+  "corpus": {
+    "template_count": 127,
+    "maxima": {
+      "compressed_bytes": {
+        "value": 38750,
+        "fixture": "p5_hf_multi.docx"
+      },
+      "entries": {
+        "value": 23,
+        "fixture": "p7b_footnotes_real.docx"
+      },
+      "entry_uncompressed_bytes": {
+        "value": 438131,
+        "fixture": "p4_autoescape_rich.docx"
+      },
+      "total_uncompressed_bytes": {
+        "value": 833014,
+        "fixture": "p5_hf_multi.docx"
+      },
+      "compression_ratio": {
+        "value": 32.156,
+        "fixture": "p4_autoescape_rich.docx"
+      }
+    }
+  },
+  "benchmarks": {
+    "r2_var_basic": {
+      "iterations": 15,
+      "open_ms": 1.293,
+      "render_ms": 15.699,
+      "write_ms": 5.366,
+      "output_bytes": 35132,
+      "peak_rss_bytes": 21303296
+    },
+    "r3_combo_invoice": {
+      "iterations": 15,
+      "open_ms": 1.296,
+      "render_ms": 17.799,
+      "write_ms": 5.27,
+      "output_bytes": 35334,
+      "peak_rss_bytes": 20705280
+    },
+    "p7b_dynamic_table": {
+      "iterations": 15,
+      "open_ms": 0.413,
+      "render_ms": 27.61,
+      "write_ms": 1.411,
+      "output_bytes": 5326,
+      "peak_rss_bytes": 11067392
+    }
+  },
+  "regression_threshold_percent": 20
+}

@@ -1209,6 +1209,21 @@
       "issue": ""
     },
     {
+      "id": "p4_autoescape_rich",
+      "feature": "render: autoescape=True with RichText, Listing and InlineImage",
+      "phase": "P4",
+      "mode": "render",
+      "template": "templates/p4_autoescape_rich.docx",
+      "context": "contexts/p4_autoescape_rich.py",
+      "context_kind": "python",
+      "expected": "ok",
+      "allowed_normalizations": [],
+      "known_deviations": [],
+      "owner": "vegah",
+      "issue": "",
+      "autoescape": true
+    },
+    {
       "id": "p5_hf_basic",
       "feature": "render: header vars/if/for + footer var + body",
       "phase": "P5",

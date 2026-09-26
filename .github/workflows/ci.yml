@@ -18,8 +18,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # oracle feature 由下方固定 Python 依赖的专门 job 执行。
       - run: cargo test --workspace
+      - name: Cross-platform phase benchmark and peak RSS smoke test
+        run: python tests/p7c_audit.py --iterations 3
 
   oracle:
     name: python oracle differential

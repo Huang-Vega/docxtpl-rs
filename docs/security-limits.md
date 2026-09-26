@@ -1,6 +1,6 @@
 # 安全限额（security-limits）
 
-> 状态：P1 corpus 校准于 2026-09-25 完成；数值适用于默认配置。
+> 状态：P7c corpus 复核于 2026-09-26 完成；数值适用于默认配置。
 > 修改本文件必须随 PR 更新测试（代码规范 §1.3 / §6）。
 
 ## 输入限额（docxtpl-opc::PackageLimits，默认值）
@@ -35,19 +35,22 @@ MiniJinja 每次模板求值为 10 000 000 fuel。超限返回错误。
 - 非法路径（`../evil.txt`、绝对路径）、重复条目名、截断 ZIP。
 - 深层嵌套 XML、非法实体、超大文本节点。
 
-## P1 实测依据与复核
+## P7c 实测依据与复核
 
-对 `tests/fixtures/templates` 的 69 个 DOCX 逐个读取 ZIP 中央目录和 XML：
+对 `tests/fixtures/templates` 的 127 个 DOCX 逐个读取 ZIP 中央目录：
 
 | 指标 | corpus 最大值 | 对应样本 |
 |---|---:|---|
-| 压缩文件 | 37 650 B | rt_header_footer |
-| 条目数 | 19 | rt_header_footer |
-| 单条目解压量 | 438 131 B | rt_rsid 等 |
-| 总解压量 | 830 652 B | rt_long |
-| 单条目压缩比 | 32.16 | rt_rsid 等 |
-| XML 深度 | 12 | r3_docpr |
+| 压缩文件 | 38 750 B | p5_hf_multi.docx |
+| 条目数 | 23 | p7b_footnotes_real.docx |
+| 单条目解压量 | 438 131 B | p4_combo_rich.docx |
+| 总解压量 | 833 014 B | p5_hf_multi.docx |
+| 单条目压缩比 | 32.156 | p4_combo_rich.docx |
 
-新默认值为 corpus 留出较大余量，同时比 ADR-004 初值收紧了条目数和
+默认值仍为 corpus 留出较大余量，同时比 ADR-004 初值收紧了条目数和
 内存相关上限。此 corpus 均为小型生成模板，无法代表真实大型文档；接收大型
 真实模板前，应增加样本并复核这些值。`PackageLimits` 的字段可由底层包 API 调整。
+
+P7c 另以 proptest 覆盖随机/截断 ZIP、任意 UTF-8 与 XML-like 输入的严格/
+recover 解析、marker-heavy `patch_xml`；每条性质 256 或 512 cases，确保错误
+路径返回受控错误而不 panic。复核和性能命令为 `python tests/p7c_audit.py`。

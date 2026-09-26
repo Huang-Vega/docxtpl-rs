@@ -19,7 +19,7 @@
 //! 注册只暂存字节，不做 I/O；同一 [`crate::RenderSession`] 内可多次
 //! 注册，[`Replacements::reset`] 对齐上游 `reset_replacements`。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use docxtpl_opc::{resolve_part_target, Package, PartUri, TargetMode};
 use docxtpl_template::{RenderError, TemplateErrorKind};
@@ -40,6 +40,72 @@ const RT_FOOTER: &str =
 const MEDIA_PREFIX: &str = "word/media/";
 /// zip 条目 embeddings 前缀。
 const EMBEDDINGS_PREFIX: &str = "word/embeddings/";
+
+/// 上游 `get_pic_map()` 的只读等价物：扫描正文及主文档关系可达的
+/// header/footer，把 cNvPr name 映射到 owner relationship 的相对 target。
+pub(crate) fn picture_map(
+    pkg: &Package,
+    main_name: &str,
+) -> Result<BTreeMap<String, String>, Error> {
+    let mut result = BTreeMap::new();
+    let mut owners = vec![main_name.to_string()];
+    owners.extend(header_footer_targets(pkg, main_name));
+    for owner in owners {
+        picture_map_in_part(pkg, &owner, &mut result)?;
+    }
+    Ok(result)
+}
+
+fn picture_map_in_part(
+    pkg: &Package,
+    owner: &str,
+    result: &mut BTreeMap<String, String>,
+) -> Result<(), Error> {
+    let Some(part) = pkg.part(owner) else {
+        return Ok(());
+    };
+    let xml = std::str::from_utf8(part.bytes()).map_err(|source| Error::NotUtf8 {
+        part: owner.to_string(),
+        source,
+    })?;
+    let doc = XmlDocument::parse_strict(xml, &XmlLimits::default()).map_err(|source| {
+        Error::Render(RenderError::Xml {
+            part: owner.to_string(),
+            source,
+        })
+    })?;
+    let Some(rels) = pkg.relationships_of(owner) else {
+        return Ok(());
+    };
+    for graphic in tag_descendants(&doc, doc.root(), ns_uri::A, "graphic") {
+        let Some(gd) = direct_child(&doc, graphic, ns_uri::A, "graphicData") else {
+            continue;
+        };
+        let Some((name, rid)) = picture_name_and_rid(&doc, gd) else {
+            continue;
+        };
+        let Some(rel) = rels.iter().find(|rel| {
+            rel.id == rid && rel.target_mode == TargetMode::Internal && rel.rel_type == RT_IMAGE
+        }) else {
+            continue;
+        };
+        result.insert(name.to_string(), rel.target.clone());
+    }
+    Ok(())
+}
+
+fn picture_name_and_rid(doc: &XmlDocument, gd: NodeId) -> Option<(&str, &str)> {
+    if doc.attr(gd, "", "uri") != Some(ns_uri::PIC) {
+        return None;
+    }
+    let pic = direct_child(doc, gd, ns_uri::PIC, "pic")?;
+    let blip_fill = direct_child(doc, pic, ns_uri::PIC, "blipFill")?;
+    let blip = direct_child(doc, blip_fill, ns_uri::A, "blip")?;
+    let rid = doc.attr(blip, ns_uri::R, "embed")?;
+    let nvpicpr = direct_child(doc, pic, ns_uri::PIC, "nvPicPr")?;
+    let cnvpr = direct_child(doc, nvpicpr, ns_uri::PIC, "cNvPr")?;
+    Some((doc.attr(cnvpr, "", "name")?, rid))
+}
 
 /// 单个 replace_pic 注册项：新字节 + 是否已在扫描中命中。
 struct PicReplacement {

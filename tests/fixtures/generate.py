@@ -80,7 +80,7 @@ FIXTURES = []
 
 def fixture(fid, feature, phase, mode, context=None, post=None,
             context_kind="json", context_src=None, sub_build=None,
-            skip_render=False, source=None, source_upstream=None):
+            skip_render=False, autoescape=False, source=None, source_upstream=None):
     """登记一个 fixture。
 
     source 非 None 时为 P7b 静态模板：不执行 build，直接把
@@ -93,6 +93,7 @@ def fixture(fid, feature, phase, mode, context=None, post=None,
             "context": context, "post": post, "build": build,
             "context_kind": context_kind, "context_src": context_src,
             "sub_build": sub_build, "skip_render": skip_render,
+            "autoescape": autoescape,
             "source": source, "source_upstream": source_upstream,
         })
         return build
@@ -1266,6 +1267,19 @@ def p4_combo_rich(doc):
     doc.add_paragraph("N: {{notes}}")
 
 
+@fixture("p4_autoescape_rich",
+         "render: autoescape=True with RichText, Listing and InlineImage",
+         "P4", "render", context_kind="python", autoescape=True,
+         context_src='''
+def build_context(tpl):
+    return {"rt": RichText("R<&", bold=True),
+            "lst": Listing("L<&\\nN"),
+            "img": InlineImage(tpl, _img("p4_dot2x1.png"))}
+''')
+def p4_autoescape_rich(doc):
+    doc.add_paragraph("A{{rt}}B{{lst}}C{{img}}D")
+
+
 # ===========================================================================
 # P5 -- headers / footers / footnotes multi-part rendering (ADR-006)
 # ===========================================================================
@@ -1945,6 +1959,8 @@ def main():
         # P7：仅 True 时落字段（runner/oracle 双侧按缺省 false 处理）。
         if fx["skip_render"]:
             record["skip_render"] = True
+        if fx["autoescape"]:
+            record["autoescape"] = True
         # P7b：静态外部模板的许可证/来源归属。
         if fx["source"] is not None:
             record["source"] = "docxtpl-0.20.2:%s" % fx["source_upstream"]

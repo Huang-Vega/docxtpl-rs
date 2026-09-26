@@ -37,7 +37,7 @@ use docxtpl_opc::{
     relationships_path_of, resolve_part_target, ContentTypes, OpcError, Package, PackageLimits,
     PartUri, Relationship, Relationships, TargetMode,
 };
-use docxtpl_template::RenderValue;
+use docxtpl_template::{RenderError, RenderValue, SubdocFragment};
 use docxtpl_xml::{ns_uri, NodeId, XmlDocument, XmlLimits};
 
 use crate::images::{relative_to_owner, ImageInjections};
@@ -262,7 +262,13 @@ impl<'a> SubdocComposer<'a> {
         self.flush_main_parts()?;
         self.flush_content_types()?;
 
-        Ok(RenderValue::Subdoc(self.build_fragment()))
+        let fragment = SubdocFragment::parse(self.build_fragment()).map_err(|source| {
+            Error::Render(RenderError::Xml {
+                part: self.main_name.clone(),
+                source,
+            })
+        })?;
+        Ok(RenderValue::Subdoc(fragment))
     }
 
     // ---------------------------------------------------------------
@@ -646,7 +652,7 @@ impl<'a> SubdocComposer<'a> {
         // 修改块：视为主包不支持（上游依赖随机 nsid 之外的完整重启语义，
         // oracle 语料不覆盖，保守拒绝以免字节漂移）。
         Err(malformed(format!(
-            "子文档样式 {style_id:?} 触发列表编号重启（restart_first_numbering），主包不支持"
+            "子文档样式 {style_id:?} 触发列表编号重启（restart_first_numbering），主包不支持（part word/numbering.xml）"
         )))
     }
 

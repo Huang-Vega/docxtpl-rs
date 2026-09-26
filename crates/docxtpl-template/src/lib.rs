@@ -25,6 +25,7 @@ mod render;
 
 pub use context::{
     ImageRegistry, ImageRels, ImageResolveError, NullRegistry, RenderContext, RenderValue,
+    SubdocFragment,
 };
 pub use core_props::{render_core_properties, render_core_properties_ctx};
 pub use error::{RenderError, TemplateErrorKind};

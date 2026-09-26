@@ -21,6 +21,37 @@
 use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph};
 use serde_json::Value as JsonValue;
 
+/// 已校验的 Subdoc XML 片段。
+///
+/// 构造时把片段置于带常用 WordprocessingML 命名空间的临时根中做严格
+/// XML 解析，拒绝 DTD、声明、多根不良构及未绑定前缀。它仍是低级入口；
+/// 常规调用应使用 `docxtpl_rs::RenderSession::new_subdoc()` 完成部件合并。
+#[derive(Debug, Clone)]
+pub struct SubdocFragment(String);
+
+impl SubdocFragment {
+    /// 校验并构造片段。
+    pub fn parse(fragment: impl Into<String>) -> Result<Self, docxtpl_xml::XmlError> {
+        let fragment = fragment.into();
+        let wrapped = format!(
+            "<w:body xmlns:w=\"{}\" xmlns:r=\"{}\" xmlns:a=\"{}\" xmlns:pic=\"{}\" xmlns:wp=\"{}\">{fragment}</w:body>",
+            docxtpl_xml::ns_uri::W,
+            docxtpl_xml::ns_uri::R,
+            docxtpl_xml::ns_uri::A,
+            docxtpl_xml::ns_uri::PIC,
+            docxtpl_xml::ns_uri::WP,
+        );
+        docxtpl_xml::XmlDocument::parse_strict(&wrapped, &docxtpl_xml::XmlLimits::default())?;
+        Ok(Self(fragment))
+    }
+
+    /// 已校验的原始 XML。
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 一张图片解析得到的关系 ID（由 [`ImageRegistry`] 分配）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRels {
@@ -88,7 +119,7 @@ pub enum RenderValue {
     /// 片段不含任何命名空间声明（上游剥 body 标签时声明一并丢失），
     /// 前缀绑定由主文档根元素声明兜底。构造入口在 docxtpl-rs 的
     /// `RenderSession::new_subdoc`。
-    Subdoc(String),
+    Subdoc(SubdocFragment),
     /// 有序数组。
     Array(Vec<RenderValue>),
     /// 有序对象（键值对保序）。
@@ -96,12 +127,6 @@ pub enum RenderValue {
 }
 
 impl RenderValue {
-    /// 构造 Subdoc 片段值（P6，ADR-007）。
-    #[must_use]
-    pub fn subdoc(fragment: impl Into<String>) -> Self {
-        Self::Subdoc(fragment.into())
-    }
-
     /// 构造有序对象值。
     #[must_use]
     pub fn object(entries: Vec<(String, RenderValue)>) -> Self {
@@ -252,5 +277,24 @@ fn json_to_value(value: &JsonValue) -> RenderValue {
                 .collect(),
         ),
         other => RenderValue::Json(other.clone()),
+    }
+}
+
+#[cfg(test)]
+mod subdoc_fragment_tests {
+    use super::SubdocFragment;
+
+    #[test]
+    fn accepts_well_formed_word_fragment() {
+        let fragment =
+            SubdocFragment::parse("<w:p><w:r><w:t>ok</w:t></w:r></w:p>").expect("良构 Word 片段");
+        assert_eq!(fragment.as_str(), "<w:p><w:r><w:t>ok</w:t></w:r></w:p>");
+    }
+
+    #[test]
+    fn rejects_malformed_or_dtd_fragment() {
+        assert!(SubdocFragment::parse("<w:p>").is_err());
+        assert!(SubdocFragment::parse("<!DOCTYPE x><w:p/>").is_err());
+        assert!(SubdocFragment::parse("<unknown:p/>").is_err());
     }
 }
