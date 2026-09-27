@@ -18,6 +18,11 @@ skipping the gates.
    installs the CLI, renders a DOCX, and inspects the output package.
 4. No unresolved failures across the three platforms, LibreOffice, the
    representative Microsoft Word samples, and the periodic fuzz runs.
+   On a Windows host with desktop Word installed, run
+   `powershell -NoProfile -File tests/word_check.ps1 -ExportPdf`. The script
+   opens the representative corpus read-only with `OpenAndRepair` disabled,
+   repaginates it, records document structure in
+   `target/word-check/report.json`, and optionally exports comparison PDFs.
 5. The RC tag must correspond to the workspace version, for example
    `v1.0.0-rc.3`.
 
