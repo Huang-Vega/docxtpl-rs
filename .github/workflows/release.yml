@@ -48,6 +48,8 @@ jobs:
           .venv/bin/python -m pip install -r tests/oracle/requirements.txt
       - run: .venv/bin/python tests/oracle/runner.py
       - run: cargo test -p docxtpl-rs --features oracle --locked
+        env:
+          DOCXTPL_PYTHON_ORACLE: .venv/bin/python
       - name: Live Jinja differential
         env:
           DOCXTPL_PYTHON_ORACLE: .venv/bin/python

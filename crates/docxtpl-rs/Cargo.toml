@@ -17,11 +17,11 @@ oracle = []
 
 [dependencies]
 crc32fast = "1.5"
-docxtpl-compat = { version = "=1.0.0-rc.1", path = "../docxtpl-compat" }
-docxtpl-opc = { version = "=1.0.0-rc.1", path = "../docxtpl-opc" }
-docxtpl-rich = { version = "=1.0.0-rc.1", path = "../docxtpl-rich" }
-docxtpl-template = { version = "=1.0.0-rc.1", path = "../docxtpl-template" }
-docxtpl-xml = { version = "=1.0.0-rc.1", path = "../docxtpl-xml" }
+docxtpl-compat = { version = "=1.0.0-rc.2", path = "../docxtpl-compat" }
+docxtpl-opc = { version = "=1.0.0-rc.2", path = "../docxtpl-opc" }
+docxtpl-rich = { version = "=1.0.0-rc.2", path = "../docxtpl-rich" }
+docxtpl-template = { version = "=1.0.0-rc.2", path = "../docxtpl-template" }
+docxtpl-xml = { version = "=1.0.0-rc.2", path = "../docxtpl-xml" }
 serde_json = "1"
 sha1 = "0.10"
 thiserror = "2"

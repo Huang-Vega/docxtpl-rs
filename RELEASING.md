@@ -19,7 +19,7 @@ skipping the gates.
 4. No unresolved failures across the three platforms, LibreOffice, the
    representative Microsoft Word samples, and the periodic fuzz runs.
 5. The RC tag must correspond to the workspace version, for example
-   `v1.0.0-rc.1`.
+   `v1.0.0-rc.2`.
 
 ## Registry publish order
 

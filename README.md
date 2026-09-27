@@ -2,7 +2,7 @@
 
 A Rust library and command-line tool for rendering Jinja templates in the DOCX
 body, headers/footers, core properties, and footnotes.
-The current version is `1.0.0-rc.1`, aligned with the P0–P7 frozen feature set
+The current version is `1.0.0-rc.2`, aligned with the P0–P7 frozen feature set
 of Python docxtpl 0.20.2, and is now in P8 release-candidate validation.
 This candidate is the first public compatibility baseline; earlier development
 snapshots are not supported release or migration targets. See the
@@ -22,8 +22,8 @@ Once the candidate packages are published to the registry, you can use the exact
 pre-release versions:
 
 ```sh
-cargo add docxtpl-rs@1.0.0-rc.1
-cargo install docxtpl-cli --version 1.0.0-rc.1 --locked
+cargo add docxtpl-rs@1.0.0-rc.2
+cargo install docxtpl-cli --version 1.0.0-rc.2 --locked
 ```
 
 Until the candidates are actually published, the registry commands above will

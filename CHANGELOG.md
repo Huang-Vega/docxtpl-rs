@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Prepared `1.0.0-rc.2` after the immutable `v1.0.0-rc.1` candidate exposed
+  two fuzz-found XML recovery panics; invalid UTF-8 byte offsets and overflowing
+  numeric character references now return normal parse errors with regression
+  coverage.
+- Parallelized the four bounded fuzz targets and fixed the release workflow to
+  run Rust oracle tests with the pinned Python virtual environment.
 - Added the default Jinja `random` filter and `lipsum`/`randrange` globals.
 - `striptags` now decodes the complete HTML5 named-entity set while preserving
   Jinja's whitespace-before-unescape behavior.
