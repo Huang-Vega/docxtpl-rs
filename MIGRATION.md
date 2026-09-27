@@ -1,9 +1,10 @@
 # 1.0 release line
 
-`1.0.0-rc.1` is the first public compatibility baseline of this repository.
+`1.0.0` is the first stable public compatibility baseline of this repository;
+`1.0.0-rc.1` began the release-candidate line.
 Earlier development snapshots were never published or tagged as supported
 releases, so there is no supported pre-RC migration path. The API and behavior
-described here apply to the `1.0` release line beginning with this candidate.
+described here apply to the stable `1.0` release line.
 
 ## Minimum Rust version
 
@@ -42,10 +43,10 @@ in CI and verify application dependency resolution using the committed
 
 ## Adoption checklist
 
-1. Pin `1.0.0-rc.1` and compile against the public API described above.
+1. Pin `1.0.0` and compile against the public API described above.
 2. Run your project's representative DOCX corpus and review the resource
    budgets.
 3. Use wildcard arms when matching error enums, so that future new error
    categories do not cause source-level incompatibility.
-4. Move to the final `1.0.0` only after RC validation passes, and keep
-   dependencies locked.
+4. Keep dependencies locked and run representative document tests before
+   adopting later 1.x updates.

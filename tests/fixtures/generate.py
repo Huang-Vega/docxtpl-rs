@@ -51,11 +51,17 @@ CONTEXTS_DIR = SCRIPT_DIR / "contexts"
 MEDIA_DIR = SCRIPT_DIR / "media"
 # P7b: external static templates (maintained by hand / real Word, not built
 # programmatically), copied into the repository verbatim.
-# Source: docxtpl 0.20.2 tests/templates (LGPL-2.1, same license as this project).
+# Source: docxtpl 0.20.2 tests/templates (LGPL-2.1-only, same license as this project).
 SOURCES_DIR = SCRIPT_DIR / "sources"
 MANIFEST_PATH = SCRIPT_DIR / "manifest.json"
 
-UPSTREAM = {"docxtpl": "0.20.2", "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd"}
+UPSTREAM = {
+    "docxtpl": "0.20.2",
+    "repository": "https://github.com/elapouya/python-docx-template",
+    "tag": "v0.20.2",
+    "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd",
+    "license": "LGPL-2.1-only",
+}
 
 # Fixture ids whose measured upstream outcome is "error" (all others are "ok").
 EXPECTED_OVERRIDES = {
@@ -1671,7 +1677,7 @@ def p7_undeclared_vars(doc):
 
 # ===========================================================================
 # P7b -- real-Word hand-built template corpus (static external templates;
-# source = docxtpl 0.20.2 tests/templates, LGPL-2.1; not built
+# source = docxtpl 0.20.2 tests/templates, LGPL-2.1-only; not built
 # programmatically -- only the context and source attribution are registered)
 # ===========================================================================
 

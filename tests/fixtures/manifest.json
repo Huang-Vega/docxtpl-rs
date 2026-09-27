@@ -1,7 +1,10 @@
 {
   "upstream": {
     "docxtpl": "0.20.2",
-    "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd"
+    "repository": "https://github.com/elapouya/python-docx-template",
+    "tag": "v0.20.2",
+    "sha": "cf5437bdf5d30f9362149ddea508d6d9f008b6cd",
+    "license": "LGPL-2.1-only"
   },
   "fixtures": [
     {

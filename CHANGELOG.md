@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## [1.0.0] - 2026-09-27
+
+- Completed every 1.0 release gate for the immutable `v1.0.0-rc.3`
+  candidate: Linux/Windows/macOS CI, Rust 1.85 MSRV, packaged-crate smoke,
+  LibreOffice, Microsoft Word visual inspection, and all four bounded fuzz
+  targets.
+- Completed the final license disposition review. The workspace now declares
+  `LGPL-2.1-only`, matching the pinned upstream baseline and conservatively
+  treating this semantic port as a derivative work; the upstream Word-template
+  provenance and license are explicit in the fixture manifest.
+- Clarified the product boundary: docxtpl-rs is an independent, non-official
+  Rust implementation. Python docxtpl remains only the pinned development-time
+  compatibility oracle and is excluded from all published crate contents and
+  runtime dependency graphs.
 
 - Prepared `1.0.0-rc.3` after `v1.0.0-rc.2` showed that the release job used
   the wrong Python selector for the live Jinja tests; all oracle subprocesses
@@ -21,8 +34,6 @@
 
 All user-visible changes are recorded here (code spec §10). Semantic alignment
 baseline: Python docxtpl 0.20.2.
-
-## [Unreleased]
 
 - English-ification of docs and code: removed archived stage acceptance/report
   artifacts (P0–P3 acceptance, the P7 compatibility report, P7c/P7d performance
@@ -50,8 +61,8 @@ baseline: Python docxtpl 0.20.2.
   also carry exact registry versions; release metadata
   (repository/homepage/readme/keywords/categories) was completed.
 - Added the full LGPL-2.1 text, the 1.0 release-line guide, and the release
-  manual; `LGPL-2.1-or-later` remains in use and still requires maintainer
-  review before the final release. This candidate is the first public
+  manual; the release candidate initially used `LGPL-2.1-or-later`, which the
+  final 1.0 license review narrowed to `LGPL-2.1-only`. This candidate is the first public
   compatibility baseline; earlier development snapshots are not migration
   targets.
 - Added a dependency-license gate and `.crate`-based clean-install smoke tests:

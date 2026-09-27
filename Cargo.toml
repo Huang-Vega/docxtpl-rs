@@ -11,10 +11,10 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.3"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
-license = "LGPL-2.1-or-later"
+license = "LGPL-2.1-only"
 repository = "https://github.com/Huang-Vega/docxtpl-rs"
 homepage = "https://github.com/Huang-Vega/docxtpl-rs"
 readme = "README.md"

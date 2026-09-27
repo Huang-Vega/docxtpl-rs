@@ -1,6 +1,6 @@
 [package]
 name = "docxtpl-cli"
-description = "docxtpl-rs command line: render"
+description = "Command-line interface for the independent docxtpl-rs renderer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ name = "docxtpl"
 path = "src/main.rs"
 
 [dependencies]
-docxtpl-rs = { version = "=1.0.0-rc.3", path = "../docxtpl-rs" }
+docxtpl-rs = { version = "=1.0.0", path = "../docxtpl-rs" }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 

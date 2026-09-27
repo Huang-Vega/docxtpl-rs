@@ -2,9 +2,13 @@
 
 A Rust library and command-line tool for rendering Jinja templates in the DOCX
 body, headers/footers, core properties, and footnotes.
-The current version is `1.0.0-rc.3`, aligned with the P0–P7 frozen feature set
-of Python docxtpl 0.20.2, and is now in P8 release-candidate validation.
-This candidate is the first public compatibility baseline; earlier development
+This is an independent Rust implementation. It is not an official port and is
+not affiliated with or endorsed by the Python docxtpl project. Python docxtpl
+is used only as the pinned development-time compatibility oracle; it is not a
+runtime dependency of any published Rust crate.
+The current version is `1.0.0`, aligned with the P0–P7 frozen feature set
+of Python docxtpl 0.20.2. The 1.0 line is the first public compatibility
+baseline; earlier development
 snapshots are not supported release or migration targets. See the
 [1.0 release-line guide](https://github.com/Huang-Vega/docxtpl-rs/blob/master/MIGRATION.md)
 for the public API baseline and adoption checklist.
@@ -18,17 +22,14 @@ cargo build -p docxtpl-cli
 cargo run -p docxtpl-cli -- render template.docx context.json output.docx
 ```
 
-Once the candidate packages are published to the registry, you can use the exact
-pre-release versions:
+Use the exact stable version:
 
 ```sh
-cargo add docxtpl-rs@1.0.0-rc.3
-cargo install docxtpl-cli --version 1.0.0-rc.3 --locked
+cargo add docxtpl-rs@1.0.0
+cargo install docxtpl-cli --version 1.0.0 --locked
 ```
 
-Until the candidates are actually published, the registry commands above will
-not succeed; please build from this repository. The release procedure for the
-stable version and the crate order are described in
+The release procedure and crate order are described in
 [RELEASING.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/RELEASING.md).
 Release evidence is tracked in
 [docs/release-readiness.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/docs/release-readiness.md).

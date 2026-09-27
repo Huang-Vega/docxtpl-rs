@@ -13,7 +13,7 @@
 | PyPI | `docxtpl==0.20.2`, released 2025-11-13 |
 | Git | tag `v0.20.2`, SHA `cf5437bdf5d30f9362149ddea508d6d9f008b6cd` |
 | Subdoc merge dependency | docxcompose **2.2.0** (oracle side; docxtpl `Subdoc` merges parts via its `Composer.attach_parts`, P6) |
-| License | LGPL-2.1-only (the workspace declares LGPL-2.1-or-later, see ADR-001) |
+| License | LGPL-2.1-only (workspace and pinned upstream baseline; see ADR-001) |
 | Dependency locks | `tests/oracle/requirements.txt` + `Cargo.lock` |
 
 ## 2. Upstream rendering pipeline (audit conclusions)

@@ -16,10 +16,14 @@ skipping the gates.
    `python tests/release_smoke.py`. This script uses only the generated
    `.crate` files: in an isolated directory it builds the library example,
    installs the CLI, renders a DOCX, and inspects the output package.
+   Inspect `cargo package --list -p <name> --locked` for all seven crates. No
+   package may contain Python source, oracle code, upstream fixture templates,
+   a virtual environment, or repository-only test assets; Python docxtpl is a
+   development-time compatibility oracle, not a runtime or packaged component.
 4. No unresolved failures across the three platforms, LibreOffice, the
    representative Microsoft Word samples, and the periodic fuzz runs.
 5. The RC tag must correspond to the workspace version, for example
-   `v1.0.0-rc.3`.
+   `v1.0.0`.
 
 ## Registry publish order
 
