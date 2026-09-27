@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Prepared `1.0.0-rc.3` after `v1.0.0-rc.2` showed that the release job used
+  the wrong Python selector for the live Jinja tests; all oracle subprocesses
+  now use the absolute path of the pinned virtual-environment interpreter.
 - Prepared `1.0.0-rc.2` after the immutable `v1.0.0-rc.1` candidate exposed
   two fuzz-found XML recovery panics; invalid UTF-8 byte offsets and overflowing
   numeric character references now return normal parse errors with regression

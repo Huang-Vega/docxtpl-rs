@@ -49,10 +49,12 @@ jobs:
       - run: .venv/bin/python tests/oracle/runner.py
       - run: cargo test -p docxtpl-rs --features oracle --locked
         env:
-          DOCXTPL_PYTHON_ORACLE: .venv/bin/python
+          DOCXTPL_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          DOCXTPL_PYTHON_ORACLE: ${{ github.workspace }}/.venv/bin/python
       - name: Live Jinja differential
         env:
-          DOCXTPL_PYTHON_ORACLE: .venv/bin/python
+          DOCXTPL_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          DOCXTPL_PYTHON_ORACLE: ${{ github.workspace }}/.venv/bin/python
         run: cargo test -p docxtpl-template live_python_oracle_for_new_compat_surface --locked
       - run: cargo doc --workspace --no-deps --locked
         env:
