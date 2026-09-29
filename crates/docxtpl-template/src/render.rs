@@ -9,12 +9,12 @@ use minijinja::{
 use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::context::{ImageRegistry, ImageResolveError, NullRegistry, RenderContext, RenderValue};
@@ -29,6 +29,8 @@ pub(crate) const MAX_RENDERED_XML_BYTES: usize = 600 * 1024 * 1024;
 /// string, so reserve a conservative 128-byte bookkeeping budget per item.
 const MAX_TEMPLATE_INTERMEDIATE_ITEMS: usize = MAX_RENDERED_XML_BYTES / 128;
 const MAX_TEMPLATE_FUEL: u64 = 10_000_000;
+const MAX_IMAGE_PARALLELISM: usize = 32;
+const DEFAULT_MAX_PARALLEL_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 fn rendered_xml_limit(part: &str) -> RenderError {
     rendered_xml_limit_with_max(part, MAX_RENDERED_XML_BYTES)
@@ -87,6 +89,10 @@ pub struct RenderOptions {
     max_rendered_xml_bytes: usize,
     /// Budget for a single MiniJinja template evaluation.
     template_fuel: u64,
+    /// Maximum number of scoped workers used for independent image probes.
+    image_parallelism: usize,
+    /// Maximum aggregate source bytes assigned to active image probes.
+    max_parallel_image_bytes: usize,
 }
 
 impl RenderOptions {
@@ -99,6 +105,8 @@ impl RenderOptions {
             environment_configurator: None,
             max_rendered_xml_bytes: MAX_RENDERED_XML_BYTES,
             template_fuel: MAX_TEMPLATE_FUEL,
+            image_parallelism: 1,
+            max_parallel_image_bytes: DEFAULT_MAX_PARALLEL_IMAGE_BYTES,
         }
     }
 
@@ -141,6 +149,38 @@ impl RenderOptions {
         self.template_fuel
     }
 
+    /// Sets the maximum number of workers used to probe independent images.
+    ///
+    /// Values are clamped to `1..=32`; the default is 1. Relationship and
+    /// part allocation remain serial and deterministic.
+    #[must_use]
+    pub fn with_image_parallelism(mut self, workers: usize) -> Self {
+        self.image_parallelism = workers.clamp(1, MAX_IMAGE_PARALLELISM);
+        self
+    }
+
+    /// Current maximum image-probe worker count.
+    #[must_use]
+    pub fn image_parallelism(&self) -> usize {
+        self.image_parallelism
+    }
+
+    /// Sets the aggregate source-byte budget for active parallel image probes.
+    ///
+    /// A single image larger than the budget is allowed to run alone. Zero is
+    /// normalized to one byte so the scheduler cannot deadlock.
+    #[must_use]
+    pub fn with_max_parallel_image_bytes(mut self, max: usize) -> Self {
+        self.max_parallel_image_bytes = max.max(1);
+        self
+    }
+
+    /// Current aggregate source-byte budget for parallel image probes.
+    #[must_use]
+    pub fn max_parallel_image_bytes(&self) -> usize {
+        self.max_parallel_image_bytes
+    }
+
     /// Adds a Rust-native MiniJinja environment configurator.
     ///
     /// Multiple calls compose in registration order rather than overriding
@@ -176,6 +216,8 @@ impl fmt::Debug for RenderOptions {
             .field("autoescape", &self.autoescape)
             .field("max_rendered_xml_bytes", &self.max_rendered_xml_bytes)
             .field("template_fuel", &self.template_fuel)
+            .field("image_parallelism", &self.image_parallelism)
+            .field("max_parallel_image_bytes", &self.max_parallel_image_bytes)
             .field(
                 "has_environment_configurator",
                 &self.environment_configurator.is_some(),
@@ -189,6 +231,8 @@ impl PartialEq for RenderOptions {
         self.autoescape == other.autoescape
             && self.max_rendered_xml_bytes == other.max_rendered_xml_bytes
             && self.template_fuel == other.template_fuel
+            && self.image_parallelism == other.image_parallelism
+            && self.max_parallel_image_bytes == other.max_parallel_image_bytes
             && match (
                 self.environment_configurator.as_ref(),
                 other.environment_configurator.as_ref(),
@@ -216,6 +260,17 @@ pub struct RenderOutcome {
     pub xml: String,
     /// All healing actions recorded during lenient (recover) parsing.
     pub recoveries: Vec<Recovery>,
+}
+
+/// Context-independent preprocessing result for one XML template part.
+///
+/// The value can be reused across renders as long as the source part bytes are
+/// unchanged. It contains no render context, relationship, or image state.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct PreparedXmlTemplate {
+    prepared: String,
+    shape_id: i64,
 }
 
 /// Inserts a newline before `<w:p>` (the opening move of upstream
@@ -262,8 +317,40 @@ pub fn render_document_xml_ctx(
     options: &RenderOptions,
     registry: &mut dyn ImageRegistry,
 ) -> Result<RenderOutcome, RenderError> {
-    render_part_xml(
-        src_xml,
+    let prepared = prepare_render_context(context, MAIN_PART)?;
+    render_document_xml_prepared(src_xml, &prepared, options, registry)
+}
+
+/// Renders the main document with a context prepared once for a multi-part render.
+pub fn render_document_xml_prepared(
+    src_xml: &str,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+) -> Result<RenderOutcome, RenderError> {
+    let template = prepare_document_xml_template(src_xml, options)?;
+    render_document_xml_from_template(&template, context, options, registry)
+}
+
+/// Preprocesses the main document independently of a render context.
+#[doc(hidden)]
+pub fn prepare_document_xml_template(
+    src_xml: &str,
+    options: &RenderOptions,
+) -> Result<PreparedXmlTemplate, RenderError> {
+    prepare_xml_template(src_xml, options, MAIN_PART, true, shape_id_of(src_xml))
+}
+
+/// Renders a previously preprocessed main document template.
+#[doc(hidden)]
+pub fn render_document_xml_from_template(
+    template: &PreparedXmlTemplate,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+) -> Result<RenderOutcome, RenderError> {
+    render_part_xml_from_template(
+        template,
         context,
         options,
         registry,
@@ -288,8 +375,43 @@ pub fn render_story_xml_ctx(
     registry: &mut dyn ImageRegistry,
     part_name: &str,
 ) -> Result<RenderOutcome, RenderError> {
-    render_part_xml(
-        src_xml,
+    let prepared = prepare_render_context(context, part_name)?;
+    render_story_xml_prepared(src_xml, &prepared, options, registry, part_name)
+}
+
+/// Renders a story part with a context prepared once for a multi-part render.
+pub fn render_story_xml_prepared(
+    src_xml: &str,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+) -> Result<RenderOutcome, RenderError> {
+    let template = prepare_story_xml_template(src_xml, options, part_name)?;
+    render_story_xml_from_template(&template, context, options, registry, part_name)
+}
+
+/// Preprocesses a header or footer independently of a render context.
+#[doc(hidden)]
+pub fn prepare_story_xml_template(
+    src_xml: &str,
+    options: &RenderOptions,
+    part_name: &str,
+) -> Result<PreparedXmlTemplate, RenderError> {
+    prepare_xml_template(src_xml, options, part_name, true, shape_id_of(src_xml))
+}
+
+/// Renders a previously preprocessed header or footer template.
+#[doc(hidden)]
+pub fn render_story_xml_from_template(
+    template: &PreparedXmlTemplate,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+) -> Result<RenderOutcome, RenderError> {
+    render_part_xml_from_template(
+        template,
         context,
         options,
         registry,
@@ -314,19 +436,41 @@ pub fn render_footnotes_xml_ctx(
     options: &RenderOptions,
     part_name: &str,
 ) -> Result<String, RenderError> {
+    let prepared = prepare_render_context(context, part_name)?;
+    render_footnotes_xml_prepared(src_xml, &prepared, options, part_name)
+}
+
+/// Renders a generic notes part with a prebuilt context.
+pub fn render_footnotes_xml_prepared(
+    src_xml: &str,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    part_name: &str,
+) -> Result<String, RenderError> {
+    let template = prepare_footnotes_xml_template(src_xml, options, part_name)?;
+    render_footnotes_xml_from_template(&template, context, options, part_name)
+}
+
+/// Preprocesses a generic notes part independently of a render context.
+#[doc(hidden)]
+pub fn prepare_footnotes_xml_template(
+    src_xml: &str,
+    options: &RenderOptions,
+    part_name: &str,
+) -> Result<PreparedXmlTemplate, RenderError> {
+    prepare_xml_template(src_xml, options, part_name, false, 0)
+}
+
+/// Renders a previously preprocessed generic notes template.
+#[doc(hidden)]
+pub fn render_footnotes_xml_from_template(
+    template: &PreparedXmlTemplate,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    part_name: &str,
+) -> Result<String, RenderError> {
     let mut null_registry = NullRegistry;
-    // Images are not allowed in footnotes; shape_id is never consumed, so 0
-    // suffices; normalize_input=false (generic Part, raw bytes pass through,
-    // preserving the template declaration form).
-    render_part_string(
-        src_xml,
-        context,
-        options,
-        &mut null_registry,
-        part_name,
-        0,
-        false,
-    )
+    render_part_string_from_template(template, context, options, &mut null_registry, part_name)
 }
 
 /// Kinds of parts handled by the pipeline: determines shape_id scope and
@@ -341,23 +485,16 @@ enum PartKind {
 
 /// Runs the full pipeline according to the part kind and returns the
 /// serialized XML.
-fn render_part_xml(
-    src_xml: &str,
-    context: &RenderContext,
+fn render_part_xml_from_template(
+    template: &PreparedXmlTemplate,
+    context: &PreparedRenderContext<'_>,
     options: &RenderOptions,
     registry: &mut dyn ImageRegistry,
     part_name: &str,
     kind: PartKind,
 ) -> Result<RenderOutcome, RenderError> {
     let max = options.max_rendered_xml_bytes();
-    // shape_id is scoped to a single part (upstream StoryPart.next_id takes
-    // max(xpath("//@id")) + 1 over the original tree; the body is likewise
-    // computed from the original document before rendering).
-    let shape_id = shape_id_of(src_xml);
-
-    let dst = render_part_string(
-        src_xml, context, options, registry, part_name, shape_id, true,
-    )?;
+    let dst = render_part_string_from_template(template, context, options, registry, part_name)?;
 
     // Lenient (recover) parsing/healing (safety limits remain enforced).
     let outcome =
@@ -405,16 +542,13 @@ fn render_part_xml(
 /// on-disk bytes (Word's double-quoted declaration passes through jinja
 /// verbatim, evidenced in P7b B5); patch consumes the raw bytes directly and
 /// the rendered string is written back unchanged.
-#[allow(clippy::too_many_arguments)]
-fn render_part_string(
+fn prepare_xml_template(
     src_xml: &str,
-    context: &RenderContext,
     options: &RenderOptions,
-    registry: &mut dyn ImageRegistry,
     part_name: &str,
-    shape_id: i64,
     normalize_input: bool,
-) -> Result<String, RenderError> {
+    shape_id: i64,
+) -> Result<PreparedXmlTemplate, RenderError> {
     let max = options.max_rendered_xml_bytes();
     // 0. Body/header-footer: tree round-trip normalization (P7b B2) — the
     //    upstream patch_xml input is not the raw on-disk bytes: the body is
@@ -444,15 +578,32 @@ fn render_part_string(
         .replace_all(&patched, "\n<w:p${1}")
         .into_owned();
 
+    Ok(PreparedXmlTemplate { prepared, shape_id })
+}
+
+fn render_part_string_from_template(
+    template: &PreparedXmlTemplate,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+    part_name: &str,
+) -> Result<String, RenderError> {
+    let max = options.max_rendered_xml_bytes();
+
     // 3. MiniJinja rendering (defaults aligned with jinja2: lenient
     //    undefined, autoescape=false).
     //    Images first participate in rendering as placeholders (aligned with
     //    the lazy upstream InlineImage.__str__: only images actually
     //    referenced by this part's template are resolved, ADR-006); after
     //    rendering they are placed in order of appearance.
-    let env = build_jinja_env_with_options(options);
-    let (root, pending_images) = context_to_minijinja(context, part_name)?;
-    let rendered = render_inline_value_with_limit(&env, &prepared, root, part_name, max)?;
+    let environment = build_jinja_env_with_options(options);
+    let rendered = render_inline_value_with_limit(
+        &environment,
+        &template.prepared,
+        context.root.clone(),
+        part_name,
+        max,
+    )?;
 
     // 4. Undo the newlines + restore {_{ }_} literal escapes.
     let dst = newline_before_p_remove()
@@ -481,8 +632,15 @@ fn render_part_string(
     //     back), so multiple images get the same id/name; the body then
     //     reorders ids from 1001 via fix_docpr_ids (the name stays "Picture
     //     N"), while header/footer keeps them verbatim.
-    let dst =
-        substitute_images_with_limit(&dst, registry, &pending_images, shape_id, part_name, max)?;
+    let dst = substitute_images_with_limit(
+        &dst,
+        registry,
+        &context.pending_images,
+        template.shape_id,
+        part_name,
+        max,
+        ImageProbeOptions::from_render_options(options),
+    )?;
     if dst.len() > max {
         return Err(rendered_xml_limit_with_max(part_name, max));
     }
@@ -588,6 +746,12 @@ pub(crate) struct PendingImages<'a> {
     images: Vec<&'a InlineImage>,
 }
 
+/// MiniJinja state derived once from a rich render context and reused across parts.
+pub struct PreparedRenderContext<'a> {
+    pub(crate) root: Value,
+    pub(crate) pending_images: PendingImages<'a>,
+}
+
 impl<'a> PendingImages<'a> {
     fn new() -> Self {
         let nonce = image_token_nonce();
@@ -640,6 +804,18 @@ pub(crate) fn context_to_minijinja<'a>(
         ));
     }
     Ok((Value::from_iter(pairs), pending))
+}
+
+/// Prepares the template environment and rich context for a multi-part render.
+pub fn prepare_render_context<'a>(
+    context: &'a RenderContext,
+    part: &str,
+) -> Result<PreparedRenderContext<'a>, RenderError> {
+    let (root, pending_images) = context_to_minijinja(context, part)?;
+    Ok(PreparedRenderContext {
+        root,
+        pending_images,
+    })
 }
 
 fn invalid_context_value(part: &str, message: String) -> RenderError {
@@ -760,6 +936,12 @@ fn value_to_minijinja<'a>(
             pending.images.push(image);
             Ok(Value::from_object(RichMarkup(token)))
         }
+        RenderValue::SharedImage(image) => {
+            let index = pending.images.len();
+            let token = pending.token(index);
+            pending.images.push(image.as_ref());
+            Ok(Value::from_object(RichMarkup(token)))
+        }
         // Subdoc fragments are injected as safe strings (P6, ADR-007):
         // upstream `Subdoc.__html__` exists, so with autoescape on jinja2
         // takes the Markup path without escaping; with it off, output is
@@ -812,6 +994,7 @@ pub(crate) fn substitute_images(
         shape_id,
         part,
         MAX_RENDERED_XML_BYTES,
+        ImageProbeOptions::default(),
     )
 }
 
@@ -839,9 +1022,22 @@ pub(crate) fn substitute_images_with_limit(
     shape_id: i64,
     part: &str,
     max: usize,
+    probe_options: ImageProbeOptions,
 ) -> Result<String, RenderError> {
     let mut output = String::with_capacity(rendered.len().min(max));
     let mut cursor = 0usize;
+    let mut resolved_images = HashMap::<usize, crate::ResolvedImage>::new();
+    let preprobed = if probe_options.parallelism > 1 {
+        probe_referenced_images(
+            rendered,
+            pending,
+            probe_options.parallelism,
+            probe_options.max_bytes,
+        )
+        .map_err(|error| image_error(&error, part))?
+    } else {
+        HashMap::new()
+    };
     for captures in pending.token_re.captures_iter(rendered) {
         let matched = captures.get(0).expect("image token regex has a full match");
         push_image_output(&mut output, &rendered[cursor..matched.start()], part, max)?;
@@ -851,14 +1047,36 @@ pub(crate) fn substitute_images_with_limit(
             .ok()
             .and_then(|index| pending.images.get(index).copied());
         if let Some(image) = replacement {
-            let rels = registry
-                .resolve_image(image)
-                .map_err(|err| image_error(&err, part))?;
-            let xml = docxtpl_rich::render_inline_image(
+            let key = std::ptr::from_ref(image) as usize;
+            let resolved = match resolved_images.get(&key) {
+                Some(resolved) => resolved.clone(),
+                None => {
+                    let resolved = match preprobed.get(&key) {
+                        Some(Ok((info, digest))) => registry
+                            .resolve_preprobed_image(image, info, *digest)
+                            .map_err(|error| image_error(&error, part))?,
+                        Some(Err(message)) => {
+                            return Err(image_error(
+                                &ImageResolveError {
+                                    message: message.clone(),
+                                },
+                                part,
+                            ));
+                        }
+                        None => registry
+                            .resolve_image_with_info(image)
+                            .map_err(|error| image_error(&error, part))?,
+                    };
+                    resolved_images.insert(key, resolved.clone());
+                    resolved
+                }
+            };
+            let xml = docxtpl_rich::render_inline_image_with_info(
                 image,
+                &resolved.info,
                 shape_id,
-                &rels.blip_rid,
-                rels.hyperlink_rid.as_deref(),
+                &resolved.rels.blip_rid,
+                resolved.rels.hyperlink_rid.as_deref(),
             )
             .map_err(|err| match err {
                 docxtpl_rich::ImageError::MetadataTooLarge { .. } => rendered_xml_limit(part),
@@ -886,6 +1104,145 @@ pub(crate) fn substitute_images_with_limit(
     }
     push_image_output(&mut output, &rendered[cursor..], part, max)?;
     Ok(output)
+}
+
+type ProbeResult = Result<(docxtpl_rich::ImageInfo, docxtpl_rich::ImageDigest), String>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImageProbeOptions {
+    parallelism: usize,
+    max_bytes: usize,
+}
+
+impl ImageProbeOptions {
+    pub(crate) fn from_render_options(options: &RenderOptions) -> Self {
+        Self {
+            parallelism: options.image_parallelism(),
+            max_bytes: options.max_parallel_image_bytes(),
+        }
+    }
+}
+
+impl Default for ImageProbeOptions {
+    fn default() -> Self {
+        Self {
+            parallelism: 1,
+            max_bytes: DEFAULT_MAX_PARALLEL_IMAGE_BYTES,
+        }
+    }
+}
+
+fn probe_referenced_images(
+    rendered: &str,
+    pending: &PendingImages<'_>,
+    requested_workers: usize,
+    max_parallel_image_bytes: usize,
+) -> Result<HashMap<usize, ProbeResult>, ImageResolveError> {
+    let mut seen = HashSet::<usize>::new();
+    let mut images = Vec::<&InlineImage>::new();
+    for captures in pending.token_re.captures_iter(rendered) {
+        let image = captures[1]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| pending.images.get(index).copied());
+        if let Some(image) = image {
+            let key = std::ptr::from_ref(image) as usize;
+            if seen.insert(key) {
+                images.push(image);
+            }
+        }
+    }
+    if images.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let workers = requested_workers
+        .clamp(1, MAX_IMAGE_PARALLELISM)
+        .min(images.len());
+    let chunk_size = images.len().div_ceil(workers);
+    let budget = ProbeBudget::new(max_parallel_image_bytes);
+    let chunks = std::thread::scope(|scope| {
+        let budget = &budget;
+        let handles = images
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|image| {
+                            let key = std::ptr::from_ref(*image) as usize;
+                            let _permit = budget.acquire(image.source_len());
+                            let result =
+                                image.probe_with_digest().map_err(|error| error.to_string());
+                            (key, result)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| ImageResolveError {
+                    message: "image probe worker panicked".to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+struct ProbeBudget {
+    max: usize,
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+impl ProbeBudget {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, requested: u64) -> ProbePermit<'_> {
+        let requested = usize::try_from(requested).unwrap_or(usize::MAX);
+        let weight = requested.max(1).min(self.max);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *active > self.max - weight {
+            active = self
+                .available
+                .wait(active)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *active += weight;
+        ProbePermit {
+            budget: self,
+            weight,
+        }
+    }
+}
+
+struct ProbePermit<'a> {
+    budget: &'a ProbeBudget,
+    weight: usize,
+}
+
+impl Drop for ProbePermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .budget
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active -= self.weight;
+        self.budget.available.notify_all();
+    }
 }
 
 /// Merges image resolution/rendering failures into
@@ -4417,8 +4774,11 @@ for template, context in cases:
 #[cfg(test)]
 mod context_render_tests {
     use super::*;
-    use crate::context::{ImageRegistry, ImageRels, ImageResolveError};
-    use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph, RichTextProps};
+    use crate::context::{ImageRegistry, ImageRels, ImageResolveError, ResolvedImage};
+    use docxtpl_rich::{
+        ImageDigest, ImageInfo, InlineImage, Listing, RichText, RichTextParagraph, RichTextProps,
+    };
+    use std::sync::Arc;
 
     /// Fake registry that always returns rId9 (records the call count to
     /// verify idempotence).
@@ -4440,6 +4800,128 @@ mod context_render_tests {
                 hyperlink_rid: None,
             })
         }
+    }
+
+    struct PreprobedRegistry {
+        direct_calls: usize,
+        preprobed_calls: usize,
+    }
+
+    impl ImageRegistry for PreprobedRegistry {
+        fn resolve_image(&mut self, _image: &InlineImage) -> Result<ImageRels, ImageResolveError> {
+            self.direct_calls += 1;
+            Err(ImageResolveError {
+                message: "parallel rendering unexpectedly probed an image twice".to_string(),
+            })
+        }
+
+        fn resolve_preprobed_image(
+            &mut self,
+            _image: &InlineImage,
+            info: &ImageInfo,
+            digest: ImageDigest,
+        ) -> Result<ResolvedImage, ImageResolveError> {
+            assert!(info.px_w > 0);
+            assert_ne!(digest, [0; 20]);
+            self.preprobed_calls += 1;
+            Ok(ResolvedImage {
+                rels: ImageRels {
+                    blip_rid: format!("rId{}", self.preprobed_calls),
+                    hyperlink_rid: None,
+                },
+                info: info.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn image_parallelism_is_explicit_and_bounded() {
+        assert_eq!(RenderOptions::compat().image_parallelism(), 1);
+        assert_eq!(
+            RenderOptions::compat().max_parallel_image_bytes(),
+            DEFAULT_MAX_PARALLEL_IMAGE_BYTES
+        );
+        assert_eq!(
+            RenderOptions::compat()
+                .with_image_parallelism(0)
+                .image_parallelism(),
+            1
+        );
+        assert_eq!(
+            RenderOptions::compat()
+                .with_image_parallelism(usize::MAX)
+                .image_parallelism(),
+            MAX_IMAGE_PARALLELISM
+        );
+        assert_eq!(
+            RenderOptions::compat()
+                .with_max_parallel_image_bytes(0)
+                .max_parallel_image_bytes(),
+            1
+        );
+    }
+
+    #[test]
+    fn image_probe_budget_blocks_until_capacity_is_released() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let budget = ProbeBudget::new(10);
+        let full = budget.acquire(10);
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let budget = &budget;
+            scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                let _permit = budget.acquire(1);
+                acquired_tx.send(()).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(acquired_rx.try_recv().is_err());
+            drop(full);
+            acquired_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("probe should continue after capacity is released");
+        });
+    }
+
+    #[test]
+    fn parallel_image_probes_are_committed_serially_without_reprobing() {
+        let png_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_dot2x1.png"
+        );
+        let mut context = RenderContext::new();
+        context.insert(
+            "first",
+            InlineImage::from_path(png_path, None, None, None).unwrap(),
+        );
+        context.insert(
+            "second",
+            InlineImage::from_path(png_path, None, None, None).unwrap(),
+        );
+        let source = concat!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+            "<w:body><w:p><w:r><w:t>{{ first }}</w:t></w:r>",
+            "<w:r><w:t>{{ second }}</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let mut registry = PreprobedRegistry {
+            direct_calls: 0,
+            preprobed_calls: 0,
+        };
+        let outcome = render_document_xml_ctx(
+            source,
+            &context,
+            &RenderOptions::compat().with_image_parallelism(4),
+            &mut registry,
+        )
+        .expect("parallel image probes should render");
+
+        assert_eq!(registry.direct_calls, 0);
+        assert_eq!(registry.preprobed_calls, 2);
+        assert!(outcome.xml.contains("r:embed=\"rId1\""));
+        assert!(outcome.xml.contains("r:embed=\"rId2\""));
     }
 
     #[test]
@@ -4581,9 +5063,16 @@ mod context_render_tests {
             fail: false,
             calls: 0,
         };
-        let error =
-            substitute_images_with_limit(&rendered, &mut registry, &pending, 1, MAIN_PART, 64)
-                .expect_err("expanded image XML must honor the output budget");
+        let error = substitute_images_with_limit(
+            &rendered,
+            &mut registry,
+            &pending,
+            1,
+            MAIN_PART,
+            64,
+            ImageProbeOptions::default(),
+        )
+        .expect_err("expanded image XML must honor the output budget");
         assert!(matches!(
             error,
             RenderError::Limit {
@@ -4620,6 +5109,54 @@ mod context_render_tests {
             outcome.xml
         );
         assert_eq!(registry.calls, 1);
+    }
+
+    #[test]
+    fn repeated_image_object_is_resolved_once_per_part() {
+        let png_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_dot2x1.png"
+        );
+        let image = InlineImage::from_path(png_path, None, None, None).unwrap();
+        let mut context = RenderContext::new();
+        context.insert("img", image);
+        let src = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{ img }}{{ img }}</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut registry = StubRegistry {
+            fail: false,
+            calls: 0,
+        };
+
+        let outcome =
+            render_document_xml_ctx(src, &context, &RenderOptions::compat(), &mut registry)
+                .expect("repeated image should render");
+
+        assert_eq!(registry.calls, 1);
+        assert_eq!(outcome.xml.matches(r#"r:embed="rId9""#).count(), 2);
+    }
+
+    #[test]
+    fn shared_image_values_reuse_bytes_and_resolution() {
+        let png_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_dot2x1.png"
+        );
+        let image = Arc::new(InlineImage::from_path(png_path, None, None, None).unwrap());
+        let mut context = RenderContext::new();
+        context.insert("first", Arc::clone(&image));
+        context.insert("second", Arc::clone(&image));
+        let src = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{ first }}{{ second }}</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut registry = StubRegistry {
+            fail: false,
+            calls: 0,
+        };
+
+        let outcome =
+            render_document_xml_ctx(src, &context, &RenderOptions::compat(), &mut registry)
+                .expect("shared images should render");
+
+        assert_eq!(registry.calls, 1);
+        assert_eq!(outcome.xml.matches(r#"r:embed="rId9""#).count(), 2);
+        assert_eq!(Arc::strong_count(&image), 3);
     }
 
     #[test]

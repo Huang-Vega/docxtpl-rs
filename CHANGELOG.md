@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0] - 2026-09-29
+
+- Added bounded parallel image probing and hashing with deterministic package
+  mutation order and an explicit in-flight byte budget.
+- Added lazy path-backed images and streaming media output to reduce peak memory
+  for documents containing hundreds or thousands of images.
+- Added configurable media compression, including an automatic policy that
+  stores formats that are already compressed.
+- Added fast paths for marker-free XML and an instance-scoped preprocessing
+  cache that is invalidated when a path-backed template changes.
+- Reduced repeated relationship and media allocation scans while preserving
+  Python docxtpl-compatible output in compatible mode.
+- Added large-image performance harnesses, package write regressions, Word COM
+  acceptance automation, and Windows/Linux office-suite acceptance evidence.
+
 ## [1.0.0] - 2026-09-27
 
 - Completed every 1.0 release gate for the immutable `v1.0.0-rc.3`

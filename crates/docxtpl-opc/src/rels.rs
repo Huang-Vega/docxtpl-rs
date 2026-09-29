@@ -16,7 +16,7 @@ use crate::xmlutil::{attr_value, required_attr};
 ///
 /// assert_ne!(TargetMode::Internal, TargetMode::External);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetMode {
     /// Target inside the package (the default value of `TargetMode`).
     Internal,

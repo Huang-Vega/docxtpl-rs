@@ -262,6 +262,39 @@ fn one_template_can_render_multiple_independent_outputs() {
 }
 
 #[test]
+fn reusable_path_template_invalidates_preprocessing_when_source_changes() {
+    let workspace_target = root().join("target");
+    let dir = tempfile::Builder::new()
+        .prefix("render-cache-invalidation-")
+        .tempdir_in(workspace_target)
+        .expect("create a tempdir in the project target");
+    let source = root().join("tests/fixtures/templates/r2_var_basic.docx");
+    let variant = dir.path().join("template.docx");
+    rewrite_document(&source, &variant, "{{name}}", "{{name}}");
+    let template = DocxTemplate::open(&variant).expect("open the path template");
+
+    let first = template
+        .render(&json!({"name": "First"}), &RenderOptions::compat())
+        .expect("render the original source")
+        .to_bytes()
+        .expect("serialize the original output");
+    assert!(String::from_utf8(zip_part(&first, "word/document.xml"))
+        .expect("original document XML is UTF-8")
+        .contains("First"));
+
+    rewrite_document(&source, &variant, "{{name}}", "{{other}}");
+    let changed = template
+        .render(&json!({"other": "Changed"}), &RenderOptions::compat())
+        .expect("render the changed source")
+        .to_bytes()
+        .expect("serialize the changed output");
+    let changed_xml = String::from_utf8(zip_part(&changed, "word/document.xml"))
+        .expect("changed document XML is UTF-8");
+    assert!(changed_xml.contains("Changed"));
+    assert!(!changed_xml.contains("{{other}}"));
+}
+
+#[test]
 fn zipname_has_priority_over_embedded_crc() {
     let tpl = template("p7_embedded_zipname");
     let zip_bytes = b"zipname-wins";

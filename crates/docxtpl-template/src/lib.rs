@@ -25,16 +25,21 @@ mod render;
 
 pub use context::{
     ImageRegistry, ImageRels, ImageResolveError, JsonContextError, NullRegistry, RenderContext,
-    RenderValue, SubdocFragment,
+    RenderValue, ResolvedImage, SubdocFragment,
 };
 pub use core_props::{
     render_core_properties, render_core_properties_ctx, render_core_properties_ctx_with_options,
+    render_core_properties_prepared,
 };
 pub use error::{RenderError, TemplateErrorKind};
 pub use render::{
-    find_undeclared_variables, normalize_part_xml, render_document_xml, render_document_xml_ctx,
-    render_footnotes_xml_ctx, render_story_xml_ctx, shape_id_of, EnvironmentConfigurator,
-    RenderOptions, RenderOutcome,
+    find_undeclared_variables, normalize_part_xml, prepare_document_xml_template,
+    prepare_footnotes_xml_template, prepare_render_context, prepare_story_xml_template,
+    render_document_xml, render_document_xml_ctx, render_document_xml_from_template,
+    render_document_xml_prepared, render_footnotes_xml_ctx, render_footnotes_xml_from_template,
+    render_footnotes_xml_prepared, render_story_xml_ctx, render_story_xml_from_template,
+    render_story_xml_prepared, shape_id_of, EnvironmentConfigurator, PreparedRenderContext,
+    PreparedXmlTemplate, RenderOptions, RenderOutcome,
 };
 
 /// MiniJinja is re-exported so callers configuring [`RenderOptions`] do not

@@ -16,6 +16,7 @@ zip.workspace = true
 quick-xml = "0.41"
 thiserror = "2"
 tempfile = "3"
+sha1 = "0.10"
 
 [dev-dependencies]
 proptest = "1"

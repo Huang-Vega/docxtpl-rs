@@ -2,9 +2,12 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
+use sha1::{Digest, Sha1};
 use zip::CompressionMethod;
 use zip::DateTime;
 
@@ -37,6 +40,13 @@ impl LazyArchive {
 
 enum PartData {
     Loaded(Vec<u8>),
+    FileBacked {
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+        digest: [u8; 20],
+        cache: OnceLock<Result<Vec<u8>, String>>,
+    },
     Lazy {
         source: Arc<LazyArchive>,
         entry_index: usize,
@@ -123,6 +133,31 @@ impl Part {
         }
     }
 
+    pub(crate) fn new_file_backed(
+        uri: PartUri,
+        path: PathBuf,
+        len: u64,
+        modified: Option<SystemTime>,
+        digest: [u8; 20],
+    ) -> Self {
+        Self {
+            uri,
+            data: PartData::FileBacked {
+                path,
+                len,
+                modified,
+                digest,
+                cache: OnceLock::new(),
+            },
+            source_index: None,
+            modified: false,
+            dir: false,
+            relationships: None,
+            compression: CompressionMethod::Deflated,
+            last_modified: None,
+        }
+    }
+
     pub(crate) fn set_relationships(&mut self, rels: Relationships) {
         self.relationships = Some(rels);
     }
@@ -192,6 +227,21 @@ impl Part {
     pub fn bytes(&self) -> Result<&[u8], OpcError> {
         match &self.data {
             PartData::Loaded(data) => Ok(data),
+            PartData::FileBacked {
+                path,
+                len,
+                modified,
+                digest,
+                cache,
+            } => match cache.get_or_init(|| {
+                read_verified_file(path, *len, *modified, *digest)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(data) => Ok(data),
+                Err(detail) => Err(OpcError::ZipRead {
+                    detail: format!("entry {:?}: {detail}", self.name()),
+                }),
+            },
             PartData::Lazy {
                 source,
                 entry_index,
@@ -233,6 +283,22 @@ impl Part {
         }
     }
 
+    pub(crate) fn write_content(&self, writer: &mut impl Write) -> Result<(), OpcError> {
+        match &self.data {
+            PartData::FileBacked {
+                path,
+                len,
+                modified,
+                digest,
+                ..
+            } => stream_verified_file(path, *len, *modified, *digest, writer),
+            _ => {
+                writer.write_all(self.bytes()?)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Whether the content is already resident in memory.
     ///
     /// Packages opened from a path lazily read regular parts; this returns
@@ -242,6 +308,7 @@ impl Part {
     pub fn is_loaded(&self) -> bool {
         match &self.data {
             PartData::Loaded(_) => true,
+            PartData::FileBacked { cache, .. } => cache.get().is_some(),
             PartData::Lazy { cache, .. } => cache.get().is_some(),
         }
     }
@@ -306,6 +373,10 @@ impl fmt::Debug for Part {
                 "loaded_len",
                 &match &self.data {
                     PartData::Loaded(data) => Some(data.len()),
+                    PartData::FileBacked { cache, .. } => cache
+                        .get()
+                        .and_then(|result| result.as_ref().ok())
+                        .map(Vec::len),
                     PartData::Lazy { cache, .. } => cache
                         .get()
                         .and_then(|result| result.as_ref().ok())
@@ -320,4 +391,79 @@ impl fmt::Debug for Part {
             )
             .finish()
     }
+}
+
+fn validate_file_metadata(
+    path: &std::path::Path,
+    len: u64,
+    modified: Option<SystemTime>,
+) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() != len || metadata.modified().ok() != modified {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file-backed part source changed: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn stream_verified_file(
+    path: &std::path::Path,
+    len: u64,
+    modified: Option<SystemTime>,
+    expected_digest: [u8; 20],
+    writer: &mut impl Write,
+) -> Result<(), OpcError> {
+    validate_file_metadata(path, len, modified)?;
+    let mut file = File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut written = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        written = written.saturating_add(read as u64);
+        if written > len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file-backed part source changed: {}", path.display()),
+            )
+            .into());
+        }
+        hasher.update(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+    }
+    validate_file_metadata(path, len, modified)?;
+    let actual: [u8; 20] = hasher.finalize().into();
+    if written != len || actual != expected_digest {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file-backed part source changed: {}", path.display()),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn read_verified_file(
+    path: &std::path::Path,
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: [u8; 20],
+) -> std::io::Result<Vec<u8>> {
+    let capacity = usize::try_from(len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file-backed part is too large for this platform",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    stream_verified_file(path, len, modified, digest, &mut bytes).map_err(|error| match error {
+        OpcError::Io(error) => error,
+        other => std::io::Error::other(other.to_string()),
+    })?;
+    Ok(bytes)
 }

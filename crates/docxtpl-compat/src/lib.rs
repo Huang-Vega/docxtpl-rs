@@ -108,6 +108,11 @@ fn concat(parts: &[&str]) -> String {
     out
 }
 
+/// Returns true when the source can contain a template expression or comment.
+fn contains_template_marker(src: &str) -> bool {
+    src.contains("{{") || src.contains("{%") || src.contains("{#")
+}
+
 /// Defines a regex accessor that compiles the pattern only once (a
 /// compilation failure is a program bug; `expect` is allowed only here).
 macro_rules! define_regex {
@@ -232,6 +237,9 @@ fn step_delimiter_heal(src: &str) -> String {
 /// For every tag match starting at `{%`/`{#`/`{{`, removes all
 /// `</w:t>…<w:t>` boundaries inside it (including attributed `<w:t ...>`).
 fn step_strip_tags_inside_markers(src: &str) -> String {
+    if !contains_template_marker(src) {
+        return src.to_owned();
+    }
     sub(re_tag_outer(), src, |caps| {
         let whole = cap(caps, 0);
         sub(re_run_boundary(), whole, |_| String::new())
@@ -245,6 +253,9 @@ fn step_strip_tags_inside_markers(src: &str) -> String {
 /// inject after every `<w:tcPr ...>`
 /// `<w:gridSpan w:val="{{expr}}"/>` (expr is the verbatim g2).
 fn step_colspan(src: &str) -> String {
+    if !src.contains("colspan") {
+        return src.to_owned();
+    }
     sub(re_colspan_outer(), src, |caps| {
         let cell = concat(&[cap(caps, 1), cap(caps, 3)]);
         let cell = sub(re_empty_run(), &cell, |_| String::new());
@@ -260,6 +271,9 @@ fn step_colspan(src: &str) -> String {
 /// and inject after `<w:tcPr ...>`
 /// `<w:shd w:val="clear" w:color="auto" w:fill="{{expr}}"/>`.
 fn step_cellbg(src: &str) -> String {
+    if !src.contains("cellbg") {
+        return src.to_owned();
+    }
     sub(re_cellbg_outer(), src, |caps| {
         let cell = concat(&[cap(caps, 1), cap(caps, 3)]);
         let cell = sub(re_empty_run(), &cell, |_| String::new());
@@ -280,6 +294,9 @@ fn step_cellbg(src: &str) -> String {
 /// `<w:t xml:space="preserve">` + g1 + g2; the text after the tag is
 /// preserved.
 fn step_ensure_space_preservation(src: &str) -> String {
+    if !src.contains("{{") && !src.contains("{%") {
+        return src.to_owned();
+    }
     sub(re_xml_space(), src, |caps| {
         concat(&["<w:t xml:space=\"preserve\">", cap(caps, 1), cap(caps, 2)])
     })
@@ -290,6 +307,9 @@ fn step_ensure_space_preservation(src: &str) -> String {
 /// Closes the current run before the tag, carries the tag in a new
 /// unformatted run, and finally opens another unformatted run.
 fn step_split_r_tag(src: &str) -> String {
+    if !src.contains("{{r ") && !src.contains("{%r ") {
+        return src.to_owned();
+    }
     sub(re_r_split(), src, |caps| {
         let tag = cap(caps, 1);
         concat(&[
@@ -305,6 +325,9 @@ fn step_split_r_tag(src: &str) -> String {
 /// The span from after `</w:t>` up to `{%-` (which must not cross another
 /// `</w:t>`) is replaced wholesale with `{%`.
 fn step_trim_left(src: &str) -> String {
+    if !src.contains("{%-") {
+        return src.to_owned();
+    }
     sub(re_trim_left(), src, |_| "{%".to_owned())
 }
 
@@ -313,6 +336,9 @@ fn step_trim_left(src: &str) -> String {
 /// Between `-%}` and the next `<w:t...>` there must be no
 /// `<w:t `/`<w:t>`/`{%`/`{{`; the whole span is replaced with `%}`.
 fn step_trim_right(src: &str) -> String {
+    if !src.contains("-%}") {
+        return src.to_owned();
+    }
     sub(re_trim_right(), src, |_| "%}".to_owned())
 }
 
@@ -324,7 +350,10 @@ fn step_trim_right(src: &str) -> String {
 /// including the closing delimiter).
 fn step_structured_tags(src: &str) -> String {
     let mut src = src.to_owned();
-    for index in 0..STRUCT_TAGS.len() {
+    for (index, tag) in STRUCT_TAGS.iter().enumerate() {
+        if !src.contains(&concat(&["{%", tag, " "])) && !src.contains(&concat(&["{{", tag, " "])) {
+            continue;
+        }
         src = sub(struct_regex(index), &src, |caps| {
             concat(&[cap(caps, 1), " ", cap(caps, 2)])
         });
@@ -338,7 +367,10 @@ fn step_structured_tags(src: &str) -> String {
 /// Same as step 9, but applies to `{#y …#}`.
 fn step_comment_structured_tags(src: &str) -> String {
     let mut src = src.to_owned();
-    for index in 0..COMMENT_STRUCT_TAGS.len() {
+    for (index, tag) in COMMENT_STRUCT_TAGS.iter().enumerate() {
+        if !src.contains(&concat(&["{#", tag, " "])) {
+            continue;
+        }
         src = sub(comment_struct_regex(index), &src, |caps| {
             concat(&[cap(caps, 1), " ", cap(caps, 2)])
         });
@@ -355,6 +387,9 @@ fn step_comment_structured_tags(src: &str) -> String {
 /// When the inner regex does not match, the whole cell is returned
 /// unchanged.
 fn step_v_merge(src: &str) -> String {
+    if !src.contains("vm") {
+        return src.to_owned();
+    }
     sub(re_vm_outer(), src, |caps| {
         let cell = cap(caps, 0);
         sub(re_vm_inner(), cell, |m| {
@@ -381,6 +416,9 @@ fn step_v_merge(src: &str) -> String {
 /// The return value of both branches is wrapped wholesale in
 /// `{% if loop.first %}…{% endif %}`.
 fn step_h_merge(src: &str) -> String {
+    if !src.contains("hm") {
+        return src.to_owned();
+    }
     sub(re_hm_outer(), src, |caps| {
         let cell = cap(caps, 0);
         let patched = if cell.contains("w:gridSpan") {
@@ -411,6 +449,9 @@ fn step_h_merge(src: &str) -> String {
 /// left/right double quotation marks (U+201C/U+201D) -> `"`, left/right
 /// single quotation marks (U+2018/U+2019) -> `'`.
 fn step_clean_tags(src: &str) -> String {
+    if !src.contains("{{") && !src.contains("{%") {
+        return src.to_owned();
+    }
     sub(re_clean_tags(), src, |caps| {
         cap(caps, 0)
             .replace("&#8216;", "'")

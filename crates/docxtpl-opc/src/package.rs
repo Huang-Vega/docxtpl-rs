@@ -24,6 +24,51 @@ use crate::uri::{
 const OFFICE_DOCUMENT_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
 
+/// Compression policy for media entries that must be written from bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaCompression {
+    /// Preserve the current behavior: Stored entries stay Stored and all other
+    /// rewritten media entries use Deflate at the ZIP crate's default level.
+    #[default]
+    Compatible,
+    /// Use Deflate level 1 for rewritten media entries.
+    FastDeflate,
+    /// Store rewritten media entries without compression.
+    Stored,
+    /// Store formats that are already compressed and use fast Deflate for
+    /// media formats that can still benefit from ZIP compression.
+    Auto,
+}
+
+/// Options controlling OPC ZIP serialization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    media_compression: MediaCompression,
+}
+
+impl WriteOptions {
+    /// Options matching the historical writer behavior.
+    #[must_use]
+    pub const fn compatible() -> Self {
+        Self {
+            media_compression: MediaCompression::Compatible,
+        }
+    }
+
+    /// Selects the compression policy for rewritten media entries.
+    #[must_use]
+    pub const fn with_media_compression(mut self, compression: MediaCompression) -> Self {
+        self.media_compression = compression;
+        self
+    }
+
+    /// Returns the selected media compression policy.
+    #[must_use]
+    pub const fn media_compression(&self) -> MediaCompression {
+        self.media_compression
+    }
+}
+
 /// An OPC package (the OOXML ZIP container + Content Types + relationships).
 ///
 /// See the crate-level documentation for the typical flow.
@@ -550,6 +595,36 @@ impl Package {
         Ok(())
     }
 
+    /// Appends a file-backed part whose content is streamed during ZIP writing.
+    ///
+    /// The source metadata and SHA-1 digest are verified during serialization;
+    /// changing the file before or during the write returns an error.
+    pub fn add_file_backed_part(
+        &mut self,
+        name: &str,
+        path: impl Into<PathBuf>,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        digest: [u8; 20],
+    ) -> Result<(), OpcError> {
+        let uri = PartUri::new(name)?;
+        if self.index.contains_key(name) {
+            return Err(OpcError::DuplicateEntry {
+                uri: name.to_string(),
+                scope: "exact",
+            });
+        }
+        self.index.insert(name.to_string(), self.parts.len());
+        self.parts.push(Part::new_file_backed(
+            uri,
+            path.into(),
+            len,
+            modified,
+            digest,
+        ));
+        Ok(())
+    }
+
     /// The parsed view of `[Content_Types].xml`.
     ///
     /// # Examples
@@ -721,6 +796,15 @@ impl Package {
     /// # Ok::<(), docxtpl_opc::OpcError>(())
     /// ```
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), OpcError> {
+        self.save_with_options(path, &WriteOptions::compatible())
+    }
+
+    /// Save to a file using explicit ZIP serialization options.
+    pub fn save_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+    ) -> Result<(), OpcError> {
         let path = path.as_ref();
         let overwrites_source = self
             .source_path
@@ -738,7 +822,7 @@ impl Package {
             if let Some(source) = &self.source {
                 source.close()?;
             }
-            return self.write_to(std::fs::File::create(path)?);
+            return self.write_to_with_options(std::fs::File::create(path)?, options);
         }
         if path.exists() && !overwrites_source {
             // On Windows the target may still be held open by the caller (a
@@ -746,7 +830,7 @@ impl Package {
             // a direct truncated write still keeps the streaming memory
             // profile. Brand-new file paths go through the same-directory
             // temporary file below so a failure never leaves a truncated file.
-            return self.write_to(std::fs::File::create(path)?);
+            return self.write_to_with_options(std::fs::File::create(path)?, options);
         }
         let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
         let mut temporary = match parent {
@@ -757,7 +841,7 @@ impl Package {
         // in-memory copy of `max_output_size` scale. The temporary file lives
         // in the same directory and is persisted only on success, so a write
         // failure never leaves a truncated target document.
-        self.write_to(temporary.as_file_mut())?;
+        self.write_to_with_options(temporary.as_file_mut(), options)?;
         temporary
             .persist(path)
             .map_err(|error| OpcError::Io(error.error))?;
@@ -793,9 +877,18 @@ impl Package {
     /// # Ok::<(), docxtpl_opc::OpcError>(())
     /// ```
     pub fn write_to(&self, mut writer: impl Write + Seek) -> Result<(), OpcError> {
+        self.write_to_with_options(&mut writer, &WriteOptions::compatible())
+    }
+
+    /// Write to any seekable writer using explicit ZIP serialization options.
+    pub fn write_to_with_options(
+        &self,
+        mut writer: impl Write + Seek,
+        options: &WriteOptions,
+    ) -> Result<(), OpcError> {
         let max = self.limits.max_output_size;
         let mut limited = CountingWriter::new(&mut writer, max);
-        let result = write_zip(&self.parts, self.source.as_deref(), &mut limited);
+        let result = write_zip(&self.parts, self.source.as_deref(), &mut limited, options);
         let exceeded = limited.exceeded();
         let attempted = limited.attempted();
         match result {
@@ -954,21 +1047,23 @@ fn write_zip<W: Write + Seek>(
     parts: &[Part],
     source: Option<&LazyArchive>,
     out: &mut CountingWriter<W>,
+    options: &WriteOptions,
 ) -> Result<(), OpcError> {
     if let Some(source) = source {
         let mut source_file = source.lock()?;
         if let Some(file) = source_file.as_mut() {
             let mut archive = ZipArchive::new(file).map_err(zip_read_err)?;
-            return write_zip_entries(parts, Some(&mut archive), out);
+            return write_zip_entries(parts, Some(&mut archive), out, options);
         }
     }
-    write_zip_entries::<W, std::io::Cursor<Vec<u8>>>(parts, None, out)
+    write_zip_entries::<W, std::io::Cursor<Vec<u8>>>(parts, None, out, options)
 }
 
 fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
     parts: &[Part],
     mut source: Option<&mut ZipArchive<R>>,
     out: &mut CountingWriter<W>,
+    write_options: &WriteOptions,
 ) -> Result<(), OpcError> {
     let mut zip = ZipWriter::new(out);
     for part in parts {
@@ -991,12 +1086,30 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
                 continue;
             }
         }
-        let method = if part.is_dir() || part.compression_method() == CompressionMethod::Stored {
-            CompressionMethod::Stored
+        let media = is_media_part(part.name());
+        let (method, level) = if part.is_dir() {
+            (CompressionMethod::Stored, None)
+        } else if media {
+            match write_options.media_compression {
+                MediaCompression::Compatible => {
+                    if part.compression_method() == CompressionMethod::Stored {
+                        (CompressionMethod::Stored, None)
+                    } else {
+                        (CompressionMethod::Deflated, None)
+                    }
+                }
+                MediaCompression::FastDeflate => (CompressionMethod::Deflated, Some(1)),
+                MediaCompression::Stored => (CompressionMethod::Stored, None),
+                MediaCompression::Auto => auto_media_compression(part.name()),
+            }
+        } else if part.compression_method() == CompressionMethod::Stored {
+            (CompressionMethod::Stored, None)
         } else {
-            CompressionMethod::Deflated
+            (CompressionMethod::Deflated, None)
         };
-        let mut options = SimpleFileOptions::default().compression_method(method);
+        let mut options = SimpleFileOptions::default()
+            .compression_method(method)
+            .compression_level(level);
         if let Some(time) = part.last_modified() {
             options = options.last_modified_time(time);
         }
@@ -1005,13 +1118,33 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
                 detail: error.to_string(),
             })?;
         if !part.is_dir() {
-            zip.write_all(part.bytes()?)?;
+            part.write_content(&mut zip)?;
         }
     }
     zip.finish().map_err(|error| OpcError::ZipWrite {
         detail: error.to_string(),
     })?;
     Ok(())
+}
+
+fn is_media_part(name: &str) -> bool {
+    name.strip_prefix('/')
+        .is_some_and(|name| name.starts_with("word/media/"))
+        || name.starts_with("word/media/")
+}
+
+fn auto_media_compression(name: &str) -> (CompressionMethod, Option<i64>) {
+    let extension = name.rsplit_once('.').map(|(_, extension)| extension);
+    if extension.is_some_and(|extension| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "tif" | "tiff"
+        )
+    }) {
+        (CompressionMethod::Stored, None)
+    } else {
+        (CompressionMethod::Deflated, Some(1))
+    }
 }
 
 /// Three-scope duplicate entry detector: exact (with empty-segment

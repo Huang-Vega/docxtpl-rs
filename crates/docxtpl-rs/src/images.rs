@@ -35,15 +35,14 @@
 //! (including the original rels/CT bytes when no image is rendered) are kept
 //! as-is.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use docxtpl_opc::{
     relationships_path_of, resolve_part_target, OpcError, Package, PartUri, Relationship,
     Relationships, TargetMode,
 };
-use docxtpl_rich::{probe, InlineImage};
-use docxtpl_template::{ImageRegistry, ImageRels, ImageResolveError};
-use sha1::{Digest, Sha1};
+use docxtpl_rich::{sha1_digest, ImageDigest, InlineImage, LazyImageFile};
+use docxtpl_template::{ImageRegistry, ImageRels, ImageResolveError, ResolvedImage};
 
 /// Image relationship type.
 const IMAGE_REL_TYPE: &str =
@@ -73,6 +72,13 @@ struct OwnerState {
     rels_existed: bool,
     /// Whether relationships were added (unchanged rels are not written back, preserving the original bytes).
     dirty: bool,
+    /// Existing relationship lookup grouped by mode, type, and target.
+    /// The first relationship in file order wins, matching `find_matching`.
+    matching: HashMap<TargetMode, HashMap<String, HashMap<String, String>>>,
+    /// Relationship IDs already occupied in this owner scope.
+    used_rids: HashSet<String>,
+    /// Smallest positive numeric relationship ID not currently occupied.
+    next_free_rid: u64,
 }
 
 /// Image/relationship/Content Types changes staged during rendering (multi-owner version).
@@ -84,16 +90,30 @@ pub(crate) struct ImageInjections {
     /// Scope index of the currently rendering part (used by resolve_image).
     current: usize,
     /// Set of occupied imageN numbers (including pre-existing template images, shared package-wide).
-    used_numbers: BTreeSet<u64>,
+    used_numbers: HashSet<u64>,
+    /// Smallest positive image number not currently occupied.
+    next_free_image_number: u64,
     /// sha1 -> absolute part name (pre-existing template parts plus newly added ones, shared package-wide).
-    by_sha1: HashMap<String, String>,
-    /// Parts to add: (absolute part name, bytes).
-    pending_parts: Vec<(String, Vec<u8>)>,
+    by_sha1: HashMap<ImageDigest, String>,
+    /// Media parts staged for byte-backed or lazy file-backed insertion.
+    pending_parts: Vec<PendingImagePart>,
     /// Content Types to register: (absolute part name, lowercase extension,
     /// content type). At apply time choose Default or Override from the
     /// then-current CT, so a Subdoc eagerly copying other parts cannot make
     /// the session's initial snapshot stale.
     pending_content_types: Vec<(String, String, String)>,
+}
+
+enum PendingImagePart {
+    Bytes {
+        name: String,
+        bytes: Vec<u8>,
+    },
+    File {
+        name: String,
+        source: LazyImageFile,
+        digest: ImageDigest,
+    },
 }
 
 impl ImageInjections {
@@ -111,11 +131,11 @@ impl ImageInjections {
         let main = load_owner(pkg, main_name)?;
 
         let existing_images = collect_image_parts(pkg);
-        let mut used_numbers = BTreeSet::new();
+        let mut used_numbers = HashSet::new();
         let mut by_sha1 = HashMap::new();
         for name in &existing_images {
             if let Some(part) = pkg.part(name) {
-                let digest = hex_sha1(part.bytes()?);
+                let digest = sha1_digest(part.bytes()?);
                 // If the same bytes are referenced by multiple part names, keep the first (dict insertion order).
                 by_sha1.entry(digest).or_insert_with(|| name.clone());
                 if let Some(number) = image_number(name) {
@@ -124,11 +144,14 @@ impl ImageInjections {
             }
         }
 
+        let next_free_image_number = first_free_number(&used_numbers);
+
         Ok(Self {
             main_index: 0,
             owners: vec![main],
             current: 0,
             used_numbers,
+            next_free_image_number,
             by_sha1,
             pending_parts: Vec::new(),
             pending_content_types: Vec::new(),
@@ -199,7 +222,7 @@ impl ImageInjections {
         ext: &str,
         content_type: &str,
     ) -> String {
-        let digest = hex_sha1(bytes);
+        let digest = sha1_digest(bytes);
         self.get_or_add_image_part(bytes, ext, content_type, digest)
     }
 
@@ -234,16 +257,52 @@ impl ImageInjections {
         bytes: &[u8],
         ext: &str,
         content_type: &str,
-        digest: String,
+        digest: ImageDigest,
     ) -> String {
         match self.by_sha1.get(&digest) {
             Some(existing) => existing.clone(),
             None => {
-                let number = self.next_image_number();
+                let number = self.allocate_image_number();
                 let name = format!("word/media/image{number}.{ext}");
-                self.used_numbers.insert(number);
                 self.by_sha1.insert(digest, name.clone());
-                self.pending_parts.push((name.clone(), bytes.to_vec()));
+                self.pending_parts.push(PendingImagePart::Bytes {
+                    name: name.clone(),
+                    bytes: bytes.to_vec(),
+                });
+                self.pending_content_types.push((
+                    name.clone(),
+                    ext.to_ascii_lowercase(),
+                    content_type.to_string(),
+                ));
+                name
+            }
+        }
+    }
+
+    fn get_or_add_inline_image_part(
+        &mut self,
+        image: &InlineImage,
+        ext: &str,
+        content_type: &str,
+        digest: ImageDigest,
+    ) -> String {
+        match self.by_sha1.get(&digest) {
+            Some(existing) => existing.clone(),
+            None => {
+                let number = self.allocate_image_number();
+                let name = format!("word/media/image{number}.{ext}");
+                self.by_sha1.insert(digest, name.clone());
+                match image.lazy_file() {
+                    Some(source) => self.pending_parts.push(PendingImagePart::File {
+                        name: name.clone(),
+                        source: source.clone(),
+                        digest,
+                    }),
+                    None => self.pending_parts.push(PendingImagePart::Bytes {
+                        name: name.clone(),
+                        bytes: image.blob.clone(),
+                    }),
+                }
                 self.pending_content_types.push((
                     name.clone(),
                     ext.to_ascii_lowercase(),
@@ -278,14 +337,14 @@ impl ImageInjections {
 
     /// Allocate the next image number: fill holes starting at 1, otherwise the
     /// maximum + 1 (equivalent to upstream `range(1, len+1)` hole filling).
-    fn next_image_number(&self) -> u64 {
-        let mut number = 1;
-        loop {
-            if !self.used_numbers.contains(&number) {
-                return number;
-            }
-            number += 1;
+    fn allocate_image_number(&mut self) -> u64 {
+        let number = self.next_free_image_number;
+        self.used_numbers.insert(number);
+        self.next_free_image_number = number.saturating_add(1);
+        while self.used_numbers.contains(&self.next_free_image_number) {
+            self.next_free_image_number = self.next_free_image_number.saturating_add(1);
         }
+        number
     }
 
     /// Scope of the currently rendering part (mutable).
@@ -298,8 +357,21 @@ impl ImageInjections {
     /// mount via add_part before set_part_bytes), and finally rebuild
     /// [Content_Types].xml (so validate can resolve the new part types).
     pub(crate) fn apply(&mut self, pkg: &mut Package) -> Result<(), OpcError> {
-        for (name, bytes) in self.pending_parts.drain(..) {
-            pkg.add_part(&name, bytes)?;
+        for pending in self.pending_parts.drain(..) {
+            match pending {
+                PendingImagePart::Bytes { name, bytes } => pkg.add_part(&name, bytes)?,
+                PendingImagePart::File {
+                    name,
+                    source,
+                    digest,
+                } => pkg.add_file_backed_part(
+                    &name,
+                    source.path().to_path_buf(),
+                    source.len(),
+                    source.modified(),
+                    digest,
+                )?,
+            }
         }
         for owner in &self.owners {
             if !owner.dirty {
@@ -337,16 +409,35 @@ impl ImageInjections {
 impl OwnerState {
     /// Upstream `_Relationships.get_or_add` / `get_or_add_ext_rel`.
     fn get_or_add(&mut self, rel_type: &str, target: &str, mode: TargetMode) -> String {
-        if let Some(rel) = self.rels.find_matching(rel_type, target, mode) {
-            return rel.id.clone();
+        if let Some(id) = self
+            .matching
+            .get(&mode)
+            .and_then(|types| types.get(rel_type))
+            .and_then(|targets| targets.get(target))
+        {
+            return id.clone();
         }
-        let id = self.rels.next_r_id();
+        let id = format!("rId{}", self.next_free_rid);
+        self.used_rids.insert(id.clone());
+        self.next_free_rid = self.next_free_rid.saturating_add(1);
+        while self
+            .used_rids
+            .contains(&format!("rId{}", self.next_free_rid))
+        {
+            self.next_free_rid = self.next_free_rid.saturating_add(1);
+        }
         self.rels.push(Relationship {
             id: id.clone(),
             rel_type: rel_type.to_string(),
             target: target.to_string(),
             target_mode: mode,
         });
+        self.matching
+            .entry(mode)
+            .or_default()
+            .entry(rel_type.to_string())
+            .or_default()
+            .insert(target.to_string(), id.clone());
         self.dirty = true;
         id
     }
@@ -361,24 +452,54 @@ impl OwnerState {
 fn load_owner(pkg: &Package, part_name: &str) -> Result<OwnerState, OpcError> {
     let uri = PartUri::new(part_name)?;
     let rels_name = relationships_path_of(&uri);
-    match pkg.relationships_of(part_name) {
-        Some(rels) => Ok(OwnerState {
-            name: part_name.to_string(),
-            rels_name,
-            rels: rels.clone(),
-            rels_existed: true,
-            dirty: false,
-        }),
-        None => Ok(OwnerState {
-            name: part_name.to_string(),
-            rels_name,
-            rels: Relationships::parse(
+    let (rels, rels_existed) = match pkg.relationships_of(part_name) {
+        Some(rels) => (rels.clone(), true),
+        None => (
+            Relationships::parse(
                 r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
             )?,
-            rels_existed: false,
-            dirty: false,
-        }),
+            false,
+        ),
+    };
+    let mut matching = HashMap::<TargetMode, HashMap<String, HashMap<String, String>>>::new();
+    let mut used_rids = HashSet::with_capacity(rels.len());
+    for rel in rels.iter() {
+        used_rids.insert(rel.id.clone());
+        matching
+            .entry(rel.target_mode)
+            .or_default()
+            .entry(rel.rel_type.clone())
+            .or_default()
+            .entry(rel.target.clone())
+            .or_insert_with(|| rel.id.clone());
     }
+    let next_free_rid = first_free_rid(&used_rids);
+    Ok(OwnerState {
+        name: part_name.to_string(),
+        rels_name,
+        rels,
+        rels_existed,
+        dirty: false,
+        matching,
+        used_rids,
+        next_free_rid,
+    })
+}
+
+fn first_free_rid(used: &HashSet<String>) -> u64 {
+    let mut number = 1u64;
+    while used.contains(&format!("rId{number}")) {
+        number = number.saturating_add(1);
+    }
+    number
+}
+
+fn first_free_number(used: &HashSet<u64>) -> u64 {
+    let mut number = 1u64;
+    while used.contains(&number) {
+        number = number.saturating_add(1);
+    }
+    number
 }
 
 impl ImageRegistry for ImageInjections {
@@ -386,15 +507,50 @@ impl ImageRegistry for ImageInjections {
         // 1. probe: image-header parsing inside upstream get_or_add_image; a
         //    bad image raises UnrecognizedImageError here (before any part/rId
         //    allocation).
-        let info = probe(&image.blob).map_err(|err| ImageResolveError {
+        let (info, digest) = image.probe_with_digest().map_err(|err| ImageResolveError {
             message: err.to_string(),
         })?;
 
-        // 2. Deduplicate by sha1 or allocate a new part name (numbers span extensions and fill holes).
-        let target_abs =
-            self.get_or_add_image_part(&image.blob, info.ext, info.content_type, info.sha1.clone());
+        Ok(self.resolve_probed_image(image, &info, digest))
+    }
 
-        // 3. Rels of the currently rendering part: the internal image
+    fn resolve_image_with_info(
+        &mut self,
+        image: &InlineImage,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        let (info, digest) = image.probe_with_digest().map_err(|err| ImageResolveError {
+            message: err.to_string(),
+        })?;
+        let rels = self.resolve_probed_image(image, &info, digest);
+        Ok(ResolvedImage { rels, info })
+    }
+
+    fn resolve_preprobed_image(
+        &mut self,
+        image: &InlineImage,
+        info: &docxtpl_rich::ImageInfo,
+        digest: ImageDigest,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        let rels = self.resolve_probed_image(image, info, digest);
+        Ok(ResolvedImage {
+            rels,
+            info: info.clone(),
+        })
+    }
+}
+
+impl ImageInjections {
+    fn resolve_probed_image(
+        &mut self,
+        image: &InlineImage,
+        info: &docxtpl_rich::ImageInfo,
+        digest: ImageDigest,
+    ) -> ImageRels {
+        // Deduplicate by sha1 or allocate a new part name (numbers span extensions and fill holes).
+        let target_abs =
+            self.get_or_add_inline_image_part(image, info.ext, info.content_type, digest);
+
+        // Rels of the currently rendering part: the internal image
         //    relationship (Target is relative to that part's directory; in P5
         //    headers/footers and the body each have their own rels, so rIds do
         //    not interfere).
@@ -404,7 +560,7 @@ impl ImageRegistry for ImageInjections {
             self.current_owner_mut()
                 .get_or_add(IMAGE_REL_TYPE, &rel_target, TargetMode::Internal);
 
-        // 4. Anchor external link: upstream allocates it after the image rId
+        // Anchor external link: upstream allocates it after the image rId
         // (same scope). docxtpl 0.20.2's `if self.anchor:` treats an empty
         // string as no anchor; do not allocate a hyperlink relationship with
         // an empty Target for `Some("")`.
@@ -417,10 +573,10 @@ impl ImageRegistry for ImageInjections {
                     .get_or_add(HYPERLINK_REL_TYPE, url, TargetMode::External)
             });
 
-        Ok(ImageRels {
+        ImageRels {
             blip_rid,
             hyperlink_rid,
-        })
+        }
     }
 }
 
@@ -431,6 +587,7 @@ impl ImageRegistry for ImageInjections {
 /// order).
 fn collect_image_parts(pkg: &Package) -> Vec<String> {
     let mut visited: HashSet<String> = HashSet::new();
+    let mut seen_images: HashSet<String> = HashSet::new();
     let mut images: Vec<String> = Vec::new();
     // Stack element: (directory of the owner part, rels). The base of the root rels is None.
     let mut stack: Vec<(Option<String>, Relationships)> =
@@ -446,7 +603,7 @@ fn collect_image_parts(pkg: &Package) -> Vec<String> {
                 continue;
             };
             let name = target.as_str().to_string();
-            if rel.rel_type == IMAGE_REL_TYPE && !images.contains(&name) {
+            if rel.rel_type == IMAGE_REL_TYPE && seen_images.insert(name.clone()) {
                 images.push(name.clone());
             }
             // Each part's rels is pushed only once (deduplicated via visited).
@@ -514,19 +671,6 @@ fn image_number(abs_name: &str) -> Option<u64> {
     stem[digit_at..digit_end].parse().ok()
 }
 
-/// SHA-1 as lowercase hexadecimal (mirrors `hashlib.sha1(blob).hexdigest()`).
-fn hex_sha1(bytes: &[u8]) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +727,52 @@ mod tests {
             parent_dir("word/media/i.png").as_deref(),
             Some("word/media")
         );
+    }
+
+    #[test]
+    fn allocation_cursors_fill_holes_without_rescanning_from_one() {
+        let used_rids = HashSet::from([
+            "rId1".to_string(),
+            "rId2".to_string(),
+            "rId4".to_string(),
+            "rId01".to_string(),
+        ]);
+        assert_eq!(first_free_rid(&used_rids), 3);
+
+        let used_numbers = HashSet::from([1, 2, 4]);
+        assert_eq!(first_free_number(&used_numbers), 3);
+    }
+
+    #[test]
+    fn owner_index_reuses_first_match_and_allocates_unique_ids() -> Result<(), OpcError> {
+        let pkg = Package::open(IMAGE_TEMPLATE_PATH, &docxtpl_opc::PackageLimits::default())?;
+        let mut owner = load_owner(&pkg, "word/document.xml")?;
+        let first = owner.get_or_add(
+            "https://example.test/performance",
+            "media/generated-0.png",
+            TargetMode::Internal,
+        );
+        assert_eq!(
+            owner.get_or_add(
+                "https://example.test/performance",
+                "media/generated-0.png",
+                TargetMode::Internal,
+            ),
+            first
+        );
+
+        let mut ids = HashSet::new();
+        ids.insert(first);
+        for index in 1..=1_000 {
+            let id = owner.get_or_add(
+                "https://example.test/performance",
+                &format!("media/generated-{index}.png"),
+                TargetMode::Internal,
+            );
+            assert!(ids.insert(id));
+        }
+        assert_eq!(ids.len(), 1_001);
+        Ok(())
     }
 
     #[test]

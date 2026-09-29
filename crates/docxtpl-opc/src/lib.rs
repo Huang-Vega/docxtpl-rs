@@ -65,7 +65,7 @@ mod xmlutil;
 pub use crate::content_types::ContentTypes;
 pub use crate::error::OpcError;
 pub use crate::limits::PackageLimits;
-pub use crate::package::Package;
+pub use crate::package::{MediaCompression, Package, WriteOptions};
 pub use crate::part::Part;
 pub use crate::rels::{Relationship, Relationships, TargetMode};
 pub use crate::uri::{relationships_path_of, resolve_part_target, PartUri};

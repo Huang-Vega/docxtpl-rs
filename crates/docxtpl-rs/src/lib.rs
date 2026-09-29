@@ -56,15 +56,19 @@
 //! [`DocxTemplate`] is read-only and reusable: the file entry reopens the source path on every render, and the bytes/reader
 //! entries reopen the package from the retained original bytes; transient render state never leaks across renders.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-pub use docxtpl_opc::PackageLimits;
 use docxtpl_opc::{resolve_part_target, OpcError, Package, PartUri, Relationship, TargetMode};
+pub use docxtpl_opc::{MediaCompression, PackageLimits, WriteOptions};
 use docxtpl_template::{
-    find_undeclared_variables, normalize_part_xml, render_core_properties_ctx_with_options,
-    render_document_xml_ctx, render_footnotes_xml_ctx, render_story_xml_ctx, RenderError,
+    find_undeclared_variables, normalize_part_xml, prepare_document_xml_template,
+    prepare_footnotes_xml_template, prepare_render_context, prepare_story_xml_template,
+    render_core_properties_prepared, render_document_xml_from_template,
+    render_footnotes_xml_from_template, render_story_xml_from_template, PreparedXmlTemplate,
+    RenderError,
 };
 // Serves both as internal types and public re-exports (the pub use list at the bottom does not repeat them).
 pub use docxtpl_template::{JsonContextError, RenderContext};
@@ -204,11 +208,64 @@ enum TemplateSource {
     Bytes(Vec<u8>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CachedPartKind {
+    Document,
+    Story,
+    Notes,
+}
+
+#[derive(Debug)]
+struct CachedPartTemplate {
+    source: String,
+    template: Arc<PreparedXmlTemplate>,
+}
+
+#[derive(Debug, Default)]
+struct TemplateRenderCache {
+    parts: Mutex<HashMap<(String, CachedPartKind), CachedPartTemplate>>,
+}
+
+impl TemplateRenderCache {
+    fn get_or_prepare(
+        &self,
+        part_name: &str,
+        kind: CachedPartKind,
+        source: &str,
+        prepare: impl FnOnce() -> Result<PreparedXmlTemplate, RenderError>,
+    ) -> Result<Arc<PreparedXmlTemplate>, Error> {
+        {
+            let parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = parts.get(&(part_name.to_string(), kind)) {
+                if cached.source == source {
+                    return Ok(Arc::clone(&cached.template));
+                }
+            }
+        }
+
+        let template = Arc::new(prepare()?);
+        let mut parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
+        parts.insert(
+            (part_name.to_string(), kind),
+            CachedPartTemplate {
+                source: source.to_string(),
+                template: Arc::clone(&template),
+            },
+        );
+        Ok(template)
+    }
+}
+
 /// A reusable docx template.
+///
+/// Context-independent XML preprocessing is cached per part after the first
+/// render. Path-backed templates compare the complete current part source on
+/// every render, so changed template content invalidates the affected entry.
 #[derive(Debug)]
 pub struct DocxTemplate {
     source: TemplateSource,
     limits: ResourceLimits,
+    render_cache: Arc<TemplateRenderCache>,
 }
 
 impl DocxTemplate {
@@ -232,6 +289,7 @@ impl DocxTemplate {
         Ok(Self {
             source: TemplateSource::Path(path),
             limits,
+            render_cache: Arc::new(TemplateRenderCache::default()),
         })
     }
 
@@ -268,6 +326,7 @@ impl DocxTemplate {
         Ok(Self {
             source: TemplateSource::Bytes(data),
             limits,
+            render_cache: Arc::new(TemplateRenderCache::default()),
         })
     }
 
@@ -295,7 +354,13 @@ impl DocxTemplate {
             })?;
         let mut injections = ImageInjections::new(&pkg, &main_name)?;
 
-        render_all_parts(&mut pkg, &context, &options, &mut injections)?;
+        render_all_parts(
+            &mut pkg,
+            &context,
+            &options,
+            &mut injections,
+            &self.render_cache,
+        )?;
         // A JSON context contains no images/external links, so apply is effectively a no-op (no dirty scopes).
         injections.apply(&mut pkg)?;
         canonicalize_content_types(&mut pkg, false)?;
@@ -327,7 +392,7 @@ impl DocxTemplate {
     pub fn render_session(&self, options: &RenderOptions) -> Result<RenderSession, Error> {
         let pkg = self.open_package()?;
         let options = self.effective_render_options(options);
-        RenderSession::new(pkg, &options)
+        RenderSession::new(pkg, &options, Arc::clone(&self.render_cache))
     }
 
     /// Upstream `DocxTemplate.get_undeclared_template_variables()` (P7):
@@ -432,11 +497,16 @@ pub struct RenderSession {
     injections: ImageInjections,
     /// P7 media/embedded replacement registry (the replace_* family, committed at finish).
     replacements: Replacements,
+    render_cache: Arc<TemplateRenderCache>,
 }
 
 impl RenderSession {
     /// Locates the main document and builds the image injection registry (raises an OPC error when the main-document rels is missing).
-    fn new(pkg: Package, options: &RenderOptions) -> Result<Self, Error> {
+    fn new(
+        pkg: Package,
+        options: &RenderOptions,
+        render_cache: Arc<TemplateRenderCache>,
+    ) -> Result<Self, Error> {
         let main_name = pkg.main_document_uri()?.as_str().to_string();
         let injections = ImageInjections::new(&pkg, &main_name)?;
         Ok(Self {
@@ -444,6 +514,7 @@ impl RenderSession {
             options: options.clone(),
             injections,
             replacements: Replacements::new(),
+            render_cache,
         })
     }
 
@@ -572,7 +643,13 @@ impl RenderSession {
     /// Renders every part (body -> headers -> footers -> core properties -> footnotes, P5),
     /// commits the media part / per-scope rels / Content Types changes, and performs final package validation.
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
-        render_all_parts(&mut self.pkg, context, &self.options, &mut self.injections)?;
+        render_all_parts(
+            &mut self.pkg,
+            context,
+            &self.options,
+            &mut self.injections,
+            &self.render_cache,
+        )?;
 
         // Write media parts first, then write back each owner's rels/CT, guaranteeing the final validation finds no dangling relationships/types.
         self.injections.apply(&mut self.pkg)?;
@@ -623,13 +700,20 @@ fn render_all_parts(
     context: &RenderContext,
     options: &RenderOptions,
     injections: &mut ImageInjections,
+    render_cache: &TemplateRenderCache,
 ) -> Result<(), Error> {
     let main_name = pkg.main_document_uri()?.as_str().to_string();
+    let prepared_context = prepare_render_context(context, &main_name)?;
 
     // 1. Body: fix_tables + fix_docpr_ids; image relationships belong to the main document.
     injections.begin_owner(pkg, &main_name)?;
     let body_src = read_xml_part(pkg, &main_name)?;
-    let body = render_document_xml_ctx(&body_src, context, options, injections)?;
+    let body_template =
+        render_cache.get_or_prepare(&main_name, CachedPartKind::Document, &body_src, || {
+            prepare_document_xml_template(&body_src, options)
+        })?;
+    let body =
+        render_document_xml_from_template(&body_template, &prepared_context, options, injections)?;
     pkg.set_part_bytes(&main_name, body.xml.into_bytes())?;
 
     // 2/3. Headers and footers (two rels enumeration passes, ordered like
@@ -639,7 +723,16 @@ fn render_all_parts(
     for name in stories {
         injections.begin_owner(pkg, &name)?;
         let src = read_xml_part(pkg, &name)?;
-        let outcome = render_story_xml_ctx(&src, context, options, injections, &name)?;
+        let template = render_cache.get_or_prepare(&name, CachedPartKind::Story, &src, || {
+            prepare_story_xml_template(&src, options, &name)
+        })?;
+        let outcome = render_story_xml_from_template(
+            &template,
+            &prepared_context,
+            options,
+            injections,
+            &name,
+        )?;
         pkg.set_part_bytes(&name, outcome.xml.into_bytes())?;
     }
 
@@ -648,7 +741,7 @@ fn render_all_parts(
     let core_name = ensure_core_properties_part(pkg)?;
     let core_src = read_xml_part(pkg, &core_name)?;
     let rendered =
-        render_core_properties_ctx_with_options(&core_src, context, options, injections)?;
+        render_core_properties_prepared(&core_src, &prepared_context, options, injections)?;
     pkg.set_part_bytes(&core_name, rendered.into_bytes())?;
 
     // 5. Notes: generic binary parts; the rendered strings are written back
@@ -666,7 +759,11 @@ fn render_all_parts(
         {
             continue;
         }
-        let rendered = render_footnotes_xml_ctx(&src, context, options, &name)?;
+        let template = render_cache.get_or_prepare(&name, CachedPartKind::Notes, &src, || {
+            prepare_footnotes_xml_template(&src, options, &name)
+        })?;
+        let rendered =
+            render_footnotes_xml_from_template(&template, &prepared_context, options, &name)?;
         pkg.set_part_bytes(&name, rendered.into_bytes())?;
     }
 
@@ -1187,9 +1284,29 @@ impl RenderedDocument {
         Ok(())
     }
 
+    /// Save to a file using explicit ZIP serialization options.
+    pub fn save_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+    ) -> Result<(), Error> {
+        self.pkg.save_with_options(path, options)?;
+        Ok(())
+    }
+
     /// Write to any seekable writer.
     pub fn write_to(&self, writer: impl Write + std::io::Seek) -> Result<(), Error> {
         self.pkg.write_to(writer)?;
+        Ok(())
+    }
+
+    /// Write to any seekable writer using explicit ZIP serialization options.
+    pub fn write_to_with_options(
+        &self,
+        writer: impl Write + std::io::Seek,
+        options: &WriteOptions,
+    ) -> Result<(), Error> {
+        self.pkg.write_to_with_options(writer, options)?;
         Ok(())
     }
 
@@ -1197,6 +1314,13 @@ impl RenderedDocument {
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut buf = Cursor::new(Vec::new());
         self.pkg.write_to(&mut buf)?;
+        Ok(buf.into_inner())
+    }
+
+    /// Serialize to in-memory DOCX bytes using explicit ZIP options.
+    pub fn to_bytes_with_options(&self, options: &WriteOptions) -> Result<Vec<u8>, Error> {
+        let mut buf = Cursor::new(Vec::new());
+        self.pkg.write_to_with_options(&mut buf, options)?;
         Ok(buf.into_inner())
     }
 }
@@ -1254,3 +1378,53 @@ pub use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph, RichTe
 pub use docxtpl_template::{
     minijinja, EnvironmentConfigurator, RenderOptions, RenderValue, TemplateErrorKind,
 };
+
+#[cfg(test)]
+mod render_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const SOURCE_ONE: &str = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{ value }}</w:t></w:r></w:p></w:body></w:document>"#;
+    const SOURCE_TWO: &str = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{ other }}</w:t></w:r></w:p></w:body></w:document>"#;
+
+    #[test]
+    fn render_cache_reuses_unchanged_source_and_invalidates_changed_source() {
+        let cache = TemplateRenderCache::default();
+        let options = RenderOptions::compat();
+        let preparations = Cell::new(0usize);
+        let prepare = |source: &str| {
+            preparations.set(preparations.get() + 1);
+            prepare_document_xml_template(source, &options)
+        };
+
+        let first = cache
+            .get_or_prepare(
+                "word/document.xml",
+                CachedPartKind::Document,
+                SOURCE_ONE,
+                || prepare(SOURCE_ONE),
+            )
+            .expect("prepare first source");
+        let second = cache
+            .get_or_prepare(
+                "word/document.xml",
+                CachedPartKind::Document,
+                SOURCE_ONE,
+                || prepare(SOURCE_ONE),
+            )
+            .expect("reuse first source");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(preparations.get(), 1);
+
+        let changed = cache
+            .get_or_prepare(
+                "word/document.xml",
+                CachedPartKind::Document,
+                SOURCE_TWO,
+                || prepare(SOURCE_TWO),
+            )
+            .expect("prepare changed source");
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(preparations.get(), 2);
+    }
+}

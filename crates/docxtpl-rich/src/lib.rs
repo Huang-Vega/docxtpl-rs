@@ -25,7 +25,12 @@ mod inline_image;
 mod listing;
 mod richtext;
 
-pub use image::{probe, py_round, ImageError, ImageInfo};
-pub use inline_image::{render_inline_image, scaled_dimensions, InlineImage};
+pub use image::{
+    probe, probe_with_digest, py_round, sha1_digest, ImageDigest, ImageError, ImageInfo,
+};
+pub use inline_image::{
+    render_inline_image, render_inline_image_with_info, scaled_dimensions, InlineImage,
+    InlineImageLoadError, LazyImageFile,
+};
 pub use listing::Listing;
 pub use richtext::{RichText, RichTextParagraph, RichTextProps};

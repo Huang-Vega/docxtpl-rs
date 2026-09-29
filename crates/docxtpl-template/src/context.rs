@@ -22,9 +22,10 @@
 //! broken images not referenced by any template do not raise an error (matching
 //! upstream behavior).
 
-use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph};
+use docxtpl_rich::{ImageDigest, ImageInfo, InlineImage, Listing, RichText, RichTextParagraph};
 use serde_json::Value as JsonValue;
 use std::fmt;
+use std::sync::Arc;
 
 /// The top-level JSON render context is not an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +139,15 @@ pub struct ImageRels {
     pub hyperlink_rid: Option<String>,
 }
 
+/// Relationship IDs together with metadata from the image probe that allocated them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImage {
+    /// Relationships allocated or reused for this image occurrence.
+    pub rels: ImageRels,
+    /// Parsed dimensions, format, and digest of the image bytes.
+    pub info: ImageInfo,
+}
+
 /// Image registry: resolves an [`InlineImage`] to relationship IDs (ADR-005).
 ///
 /// The template crate does not depend on the OPC package layer; the concrete
@@ -153,6 +163,38 @@ pub trait ImageRegistry {
     /// the rendering pipeline merges it into `TemplateErrorKind::Image`
     /// (oracle exception `UnrecognizedImageError`).
     fn resolve_image(&mut self, image: &InlineImage) -> Result<ImageRels, ImageResolveError>;
+
+    /// Resolves an image and returns the probe result used for XML generation.
+    ///
+    /// The default preserves compatibility with existing registry implementations.
+    /// Registries that already probe for package deduplication should override this
+    /// method so the image bytes are hashed and parsed only once.
+    fn resolve_image_with_info(
+        &mut self,
+        image: &InlineImage,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        let rels = self.resolve_image(image)?;
+        let (info, _) = image
+            .probe_with_digest()
+            .map_err(|error| ImageResolveError {
+                message: error.to_string(),
+            })?;
+        Ok(ResolvedImage { rels, info })
+    }
+
+    /// Resolves an image using metadata and a digest computed by the caller.
+    ///
+    /// The default keeps third-party registries source compatible. Package
+    /// registries can override this method to consume parallel probe results
+    /// without hashing the image again.
+    fn resolve_preprobed_image(
+        &mut self,
+        image: &InlineImage,
+        _info: &ImageInfo,
+        _digest: ImageDigest,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        self.resolve_image_with_info(image)
+    }
 }
 
 /// Image registration failure: carries only a message (package details belong
@@ -196,6 +238,8 @@ pub enum RenderValue {
     Listing(Listing),
     /// Inline image.
     Image(InlineImage),
+    /// Reference-counted inline image for contexts that reuse large image bytes.
+    SharedImage(Arc<InlineImage>),
     /// Subdoc fragment (P6, ADR-007): the XML fragment string assembled from
     /// the body children of an external docx after its parts are merged into
     /// the main package (aligned with upstream `Subdoc.__str__`).
@@ -282,6 +326,12 @@ impl From<Listing> for RenderValue {
 impl From<InlineImage> for RenderValue {
     fn from(value: InlineImage) -> Self {
         Self::Image(value)
+    }
+}
+
+impl From<Arc<InlineImage>> for RenderValue {
+    fn from(value: Arc<InlineImage>) -> Self {
+        Self::SharedImage(value)
     }
 }
 

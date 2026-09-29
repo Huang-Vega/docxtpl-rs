@@ -5,7 +5,14 @@
 //! forward support for the `title` / `descr` accessibility metadata already merged in upstream
 //! master.
 
-use crate::image::{probe, py_round, ImageError, ImageInfo};
+use std::borrow::Cow;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::image::{probe, probe_with_digest, py_round, ImageDigest, ImageError, ImageInfo};
+use sha1::{Digest, Sha1};
 
 const MAX_INLINE_IMAGE_XML_BYTES: usize = 64 * 1024 * 1024;
 
@@ -18,7 +25,8 @@ const MAX_INLINE_IMAGE_XML_BYTES: usize = 64 * 1024 * 1024;
 pub struct InlineImage {
     /// File path given by the caller (used only to derive the basename).
     pub path: String,
-    /// Image bytes (read at construction or supplied explicitly).
+    /// Image bytes (read at construction or supplied explicitly). This is
+    /// empty for images created with [`InlineImage::from_path_lazy`].
     pub blob: Vec<u8>,
     /// Width in EMU; `None` means use the native size or derive it from the height.
     pub width: Option<i64>,
@@ -31,6 +39,59 @@ pub struct InlineImage {
     /// Image alternative description; `Some("")` also writes an empty attribute, per upstream
     /// master.
     pub descr: Option<String>,
+    lazy_file: Option<LazyImageFile>,
+}
+
+/// Snapshot of a path-backed image used by [`InlineImage::from_path_lazy`].
+#[derive(Debug, Clone)]
+pub struct LazyImageFile {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl LazyImageFile {
+    /// Source path captured when the lazy image was constructed.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// File length captured when the lazy image was constructed.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the captured file was empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Modification timestamp captured when the lazy image was constructed.
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
+    }
+
+    fn validate_metadata(&self, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+        let modified = metadata.modified().ok();
+        if metadata.len() != self.len || modified != self.modified {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("lazy image source changed: {}", self.path.display()),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Failure while loading or probing an inline image.
+#[derive(Debug, thiserror::Error)]
+pub enum InlineImageLoadError {
+    /// The path-backed image could not be opened or changed after construction.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The image format or metadata is invalid.
+    #[error(transparent)]
+    Image(#[from] ImageError),
 }
 
 impl InlineImage {
@@ -46,6 +107,40 @@ impl InlineImage {
     ) -> std::io::Result<Self> {
         let blob = std::fs::read(path)?;
         Ok(Self::from_bytes(path, blob, width, height, anchor))
+    }
+
+    /// Constructs a path-backed image without reading its contents.
+    ///
+    /// The file length and modification timestamp are captured immediately and
+    /// validated whenever the image is read. The caller must keep the file
+    /// unchanged until the rendered document has been written.
+    pub fn from_path_lazy(
+        path: &str,
+        width: Option<i64>,
+        height: Option<i64>,
+        anchor: Option<String>,
+    ) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("lazy image source is not a regular file: {path}"),
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            blob: Vec::new(),
+            width,
+            height,
+            anchor,
+            title: None,
+            descr: None,
+            lazy_file: Some(LazyImageFile {
+                path: PathBuf::from(path),
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }),
+        })
     }
 
     /// Constructs from in-memory bytes; `path_name` still participates in basename computation.
@@ -64,7 +159,78 @@ impl InlineImage {
             anchor,
             title: None,
             descr: None,
+            lazy_file: None,
         }
+    }
+
+    /// Returns the path snapshot for a lazy image.
+    pub fn lazy_file(&self) -> Option<&LazyImageFile> {
+        self.lazy_file.as_ref()
+    }
+
+    /// Source byte length used for bounded parallel-probe scheduling.
+    pub fn source_len(&self) -> u64 {
+        self.lazy_file
+            .as_ref()
+            .map_or(self.blob.len() as u64, LazyImageFile::len)
+    }
+
+    /// Reads lazy image bytes or borrows the bytes of an eager image.
+    pub fn bytes(&self) -> std::io::Result<Cow<'_, [u8]>> {
+        let Some(source) = &self.lazy_file else {
+            return Ok(Cow::Borrowed(&self.blob));
+        };
+        let before = std::fs::metadata(&source.path)?;
+        source.validate_metadata(&before)?;
+        let bytes = std::fs::read(&source.path)?;
+        let after = std::fs::metadata(&source.path)?;
+        source.validate_metadata(&after)?;
+        if bytes.len() as u64 != source.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("lazy image source changed: {}", source.path.display()),
+            ));
+        }
+        Ok(Cow::Owned(bytes))
+    }
+
+    /// Loads, probes, and hashes this image without retaining lazy file bytes.
+    pub fn probe_with_digest(&self) -> Result<(ImageInfo, ImageDigest), InlineImageLoadError> {
+        let Some(source) = &self.lazy_file else {
+            return Ok(probe_with_digest(&self.blob)?);
+        };
+        let before = std::fs::metadata(&source.path)?;
+        source.validate_metadata(&before)?;
+        let mut file = File::open(&source.path)?;
+        let mut hasher = Sha1::new();
+        let mut header = Vec::new();
+        let mut info = None;
+        let mut total = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > source.len {
+                return Err(changed_source_error(&source.path).into());
+            }
+            hasher.update(&buffer[..read]);
+            if info.is_none() {
+                header.extend_from_slice(&buffer[..read]);
+                info = probe(&header).ok();
+            }
+        }
+        let after = std::fs::metadata(&source.path)?;
+        source.validate_metadata(&after)?;
+        if total != source.len {
+            return Err(changed_source_error(&source.path).into());
+        }
+        let digest: ImageDigest = hasher.finalize().into();
+        let mut info = info.ok_or(ImageError::Unrecognized)?;
+        info.sha1 = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok((info, digest))
     }
 
     /// Sets image accessibility metadata.
@@ -91,6 +257,13 @@ impl InlineImage {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
+}
+
+fn changed_source_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("lazy image source changed: {}", path.display()),
+    )
 }
 
 /// Escapes text per lxml's serialization rules for double-quoted XML attributes.
@@ -214,8 +387,23 @@ pub fn render_inline_image(
     blip_rid: &str,
     hyperlink_rid: Option<&str>,
 ) -> Result<String, ImageError> {
-    let info = probe(&img.blob)?;
-    let (cx, cy) = scaled_dimensions(&info, img.width, img.height)?;
+    let bytes = img.bytes().map_err(|_| ImageError::Unrecognized)?;
+    let info = probe(&bytes)?;
+    render_inline_image_with_info(img, &info, shape_id, blip_rid, hyperlink_rid)
+}
+
+/// Generates inline-image XML using image metadata that was already probed.
+///
+/// This avoids hashing and parsing the same image again when a package-level
+/// registry also needs its format and SHA-1 digest for media deduplication.
+pub fn render_inline_image_with_info(
+    img: &InlineImage,
+    info: &ImageInfo,
+    shape_id: i64,
+    blip_rid: &str,
+    hyperlink_rid: Option<&str>,
+) -> Result<String, ImageError> {
+    let (cx, cy) = scaled_dimensions(info, img.width, img.height)?;
     let raw_filename = img.filename();
     let mut metadata_xml_bytes = escaped_xml_attr_len(&raw_filename)?;
     for value in [img.title.as_deref(), img.descr.as_deref()]
@@ -383,10 +571,31 @@ mod tests {
     }
 
     #[test]
+    fn lazy_path_probe_matches_eager_without_retaining_bytes() -> TestResult {
+        let eager = InlineImage::from_path(PNG_PATH, None, None, None)?;
+        let lazy = InlineImage::from_path_lazy(PNG_PATH, None, None, None)?;
+        assert!(lazy.blob.is_empty());
+        assert_eq!(lazy.filename(), eager.filename());
+        assert_eq!(lazy.probe_with_digest()?, eager.probe_with_digest()?);
+        Ok(())
+    }
+
+    #[test]
     fn render_no_anchor_byte_matches_upstream() -> TestResult {
         let img = InlineImage::from_path(PNG_PATH, None, None, None)?;
         let xml = render_inline_image(&img, 1, "rId9", None)?;
         assert_eq!(xml, EXPECTED_WITHOUT_ANCHOR);
+        Ok(())
+    }
+
+    #[test]
+    fn preprobed_render_matches_public_render_entry() -> TestResult {
+        let img = InlineImage::from_path(PNG_PATH, None, None, None)?;
+        let info = probe(&img.blob)?;
+        assert_eq!(
+            render_inline_image(&img, 1, "rId9", None)?,
+            render_inline_image_with_info(&img, &info, 1, "rId9", None)?
+        );
         Ok(())
     }
 

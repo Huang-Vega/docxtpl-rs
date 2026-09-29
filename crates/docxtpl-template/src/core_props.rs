@@ -8,14 +8,13 @@
 
 use docxtpl_xml::XmlDocument;
 use docxtpl_xml::XmlLimits;
-use minijinja::Environment;
 use serde_json::Value as JsonValue;
 
 use crate::context::{ImageRegistry, NullRegistry, RenderContext};
 use crate::error::{RenderError, TemplateErrorKind};
 use crate::render::{
-    build_jinja_env_with_options, context_to_minijinja, render_inline_value_with_limit,
-    substitute_images_with_limit, RenderOptions,
+    render_inline_value_with_limit, substitute_images_with_limit, ImageProbeOptions,
+    PreparedRenderContext, RenderOptions,
 };
 
 /// Dublin Core elements namespace (dc:title, etc.).
@@ -78,7 +77,19 @@ pub fn render_core_properties_ctx_with_options(
     options: &RenderOptions,
     registry: &mut dyn ImageRegistry,
 ) -> Result<String, RenderError> {
+    let prepared = crate::render::prepare_render_context(context, CORE_PART)?;
+    render_core_properties_prepared(src_xml, &prepared, options, registry)
+}
+
+/// Renders core properties with a context prepared once for a multi-part render.
+pub fn render_core_properties_prepared(
+    src_xml: &str,
+    context: &PreparedRenderContext<'_>,
+    options: &RenderOptions,
+    registry: &mut dyn ImageRegistry,
+) -> Result<String, RenderError> {
     let max = options.max_rendered_xml_bytes();
+    let environment = crate::render::build_jinja_env_with_options(options);
     let mut doc = XmlDocument::parse_strict(src_xml, &XmlLimits::default()).map_err(|e| {
         RenderError::Xml {
             part: CORE_PART.to_string(),
@@ -86,9 +97,6 @@ pub fn render_core_properties_ctx_with_options(
         }
     })?;
 
-    let env: Environment<'static> = build_jinja_env_with_options(options);
-    // No real drawing can occur in core.xml; a fixed shape_id of 1 suffices.
-    let (jinja_root, pending_images) = context_to_minijinja(context, CORE_PART)?;
     let doc_root = doc.root();
     // The six properties are rendered independently, so the per-template
     // writer limit is not an aggregate bound.  Count a conservative upper
@@ -109,14 +117,26 @@ pub fn render_core_properties_ctx_with_options(
             doc.element_text(id)
                 .map_or_else(String::new, str::to_string)
         });
-        let rendered =
-            render_inline_value_with_limit(&env, &initial, jinja_root.clone(), CORE_PART, max)?;
+        let rendered = render_inline_value_with_limit(
+            &environment,
+            &initial,
+            context.root.clone(),
+            CORE_PART,
+            max,
+        )?;
         // Pathological case where a property value references an image:
         // resolve in order of appearance (relationships belong to the current
         // registry scope, as in the main flow); normal documents never put
         // images inside dc elements.
-        let rendered =
-            substitute_images_with_limit(&rendered, registry, &pending_images, 1, CORE_PART, max)?;
+        let rendered = substitute_images_with_limit(
+            &rendered,
+            registry,
+            &context.pending_images,
+            1,
+            CORE_PART,
+            max,
+            ImageProbeOptions::from_render_options(options),
+        )?;
         add_core_text_budget(&mut serialized_budget, &rendered, max)?;
         let element = match existing {
             Some(id) => id,

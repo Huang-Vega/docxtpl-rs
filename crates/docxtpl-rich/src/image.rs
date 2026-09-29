@@ -9,6 +9,9 @@
 
 use sha1::{Digest, Sha1};
 
+/// Binary SHA-1 digest used by package-level image deduplication.
+pub type ImageDigest = [u8; 20];
+
 /// Parsed image header (fields visible to the probe, aligned with python-docx `Image`).
 ///
 /// # Examples
@@ -109,7 +112,20 @@ pub fn py_round(x: f64) -> f64 {
 /// JPEG (first APP0/APP1 and first SOFn, per JFIF/Exif), GIF, BMP (BITMAPINFOHEADER),
 /// TIFF (SHORT/LONG/RATIONAL entries in IFD0).
 pub fn probe(blob: &[u8]) -> Result<ImageInfo, ImageError> {
-    let sha1 = sha1_hex(blob);
+    probe_with_digest(blob).map(|(info, _)| info)
+}
+
+/// Parses image bytes and returns both compatible metadata and the binary digest.
+///
+/// Callers that use SHA-1 as an internal map key can avoid decoding the
+/// hexadecimal string stored in [`ImageInfo`].
+pub fn probe_with_digest(blob: &[u8]) -> Result<(ImageInfo, ImageDigest), ImageError> {
+    let digest = sha1_digest(blob);
+    let info = probe_with_sha1(blob, digest_hex(&digest))?;
+    Ok((info, digest))
+}
+
+fn probe_with_sha1(blob: &[u8], sha1: String) -> Result<ImageInfo, ImageError> {
     if has_signature(blob, 0, b"\x89PNG\r\n\x1a\n") {
         let (px_w, px_h, dpi_x, dpi_y) = parse_png(blob)?;
         return Ok(ImageInfo {
@@ -190,12 +206,18 @@ fn has_signature(blob: &[u8], offset: usize, sig: &[u8]) -> bool {
     blob.len() >= offset + sig.len() && &blob[offset..offset + sig.len()] == sig
 }
 
-/// SHA-1 of the full blob, rendered as lowercase hexadecimal.
-fn sha1_hex(blob: &[u8]) -> String {
-    let digest = Sha1::digest(blob);
+/// Computes the binary SHA-1 digest of the complete image blob.
+#[must_use]
+pub fn sha1_digest(blob: &[u8]) -> ImageDigest {
+    Sha1::digest(blob).into()
+}
+
+fn digest_hex(digest: &ImageDigest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex = String::with_capacity(40);
-    for byte in digest.iter() {
-        hex.push_str(&format!("{byte:02x}"));
+    for byte in digest {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
     }
     hex
 }
