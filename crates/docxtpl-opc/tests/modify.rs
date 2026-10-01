@@ -3,10 +3,11 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::io::Cursor;
 
 use common::*;
-use docxtpl_opc::{FilePartSource, OpcError, Package, PackageLimits};
+use docxtpl_opc::{FilePartSource, InterruptibleWriteError, OpcError, Package, PackageLimits};
 
 fn open(bytes: &[u8]) -> Package {
     Package::from_reader(Cursor::new(bytes), &PackageLimits::default()).expect("open package")
@@ -211,6 +212,48 @@ fn write_report_counts_modified_file_backed_replacement() {
     assert_eq!(report.output_bytes, out.len() as u64);
     assert!(report.rewritten_source_bytes >= replacement.len() as u64);
     assert!(!pkg.part("word/document.xml").unwrap().is_loaded());
+}
+
+#[test]
+fn interruptible_write_stops_with_a_distinct_error() {
+    let pkg = open(&minimal_docx());
+    let checks = Cell::new(0usize);
+    let should_cancel = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        next >= 3
+    };
+    let mut out = Vec::new();
+
+    let error = pkg
+        .write_to_with_report_interruptible(
+            Cursor::new(&mut out),
+            &docxtpl_opc::WriteOptions::compatible(),
+            &should_cancel,
+        )
+        .expect_err("write should stop after cancellation");
+
+    assert!(matches!(error, InterruptibleWriteError::Cancelled));
+    assert!(checks.get() >= 3);
+}
+
+#[test]
+fn cancelled_atomic_save_preserves_existing_destination() {
+    let pkg = open(&minimal_docx());
+    let directory = tempfile::tempdir().expect("tempdir");
+    let destination = directory.path().join("output.docx");
+    std::fs::write(&destination, b"preserved").expect("write old destination");
+
+    let error = pkg
+        .save_with_report_interruptible(
+            &destination,
+            &docxtpl_opc::WriteOptions::compatible(),
+            &|| true,
+        )
+        .expect_err("pre-cancelled save should fail");
+
+    assert!(matches!(error, InterruptibleWriteError::Cancelled));
+    assert_eq!(std::fs::read(destination).unwrap(), b"preserved");
 }
 
 #[test]

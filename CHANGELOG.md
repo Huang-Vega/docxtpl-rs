@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Added a bounded `RunTextIndex` MVP for literal search and safe single- or
+  cross-run replacement in body/header/footer story paragraphs. It includes
+  explicit formatting policies, structural boundaries, stale-index detection,
+  and text/match/replacement-growth limits.
+- Added cloneable `CancellationToken` support across plain and rich rendering,
+  transactional post-processing, validation, and interruptible ZIP output.
+- Added interruptible OPC save/write APIs. Cancelled atomic file saves preserve
+  the previous destination; stream APIs explicitly permit partial output.
+- Existing 1.2.0 APIs retain their behavior; all new capabilities are additive
+  and opt-in.
+
 ## [1.2.0] - 2026-10-01
 
 - Started the 1.2 editing path: `RenderedDocument::edit_package` lets callers

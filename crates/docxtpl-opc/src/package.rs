@@ -11,7 +11,7 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
 
 use crate::content_types::ContentTypes;
-use crate::error::OpcError;
+use crate::error::{InterruptibleWriteError, OpcError};
 use crate::limits::PackageLimits;
 use crate::part::{FilePartSource, LazyArchive, Part};
 use crate::rels::{Relationship, Relationships, TargetMode};
@@ -1040,10 +1040,6 @@ impl Package {
             Some(parent) => tempfile::NamedTempFile::new_in(parent)?,
             None => tempfile::NamedTempFile::new_in(".")?,
         };
-        // Stream the ZIP directly to the target file to avoid a second
-        // in-memory copy of `max_output_size` scale. The temporary file lives
-        // in the same directory and is persisted only on success, so a write
-        // failure never leaves a truncated target document.
         let report = self.write_to_with_report(temporary.as_file_mut(), options)?;
         temporary.as_file_mut().sync_all()?;
         if overwrites_source {
@@ -1058,6 +1054,66 @@ impl Package {
                 }
             }
             return Err(OpcError::Io(error.error));
+        }
+        if overwrites_source {
+            if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
+                source.reopen(source_path)?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Save atomically while checking for cooperative cancellation during
+    /// ZIP serialization. A cancelled write never replaces the destination.
+    pub fn save_with_report_interruptible(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<PackageWriteReport, InterruptibleWriteError> {
+        if should_cancel() {
+            return Err(InterruptibleWriteError::Cancelled);
+        }
+        let path = path.as_ref();
+        self.validate()?;
+        let overwrites_source = self
+            .source_path
+            .as_ref()
+            .zip(std::fs::canonicalize(path).ok().as_ref())
+            .is_some_and(|(source, target)| source == target);
+        let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
+        let mut temporary = match parent {
+            Some(parent) => tempfile::NamedTempFile::new_in(parent).map_err(OpcError::Io)?,
+            None => tempfile::NamedTempFile::new_in(".").map_err(OpcError::Io)?,
+        };
+        // Stream the ZIP directly to the target file to avoid a second
+        // in-memory copy of `max_output_size` scale. The temporary file lives
+        // in the same directory and is persisted only on success, so a write
+        // failure never leaves a truncated target document.
+        let report = self.write_to_with_report_interruptible(
+            temporary.as_file_mut(),
+            options,
+            should_cancel,
+        )?;
+        if should_cancel() {
+            return Err(InterruptibleWriteError::Cancelled);
+        }
+        temporary.as_file_mut().sync_all().map_err(OpcError::Io)?;
+        if should_cancel() {
+            return Err(InterruptibleWriteError::Cancelled);
+        }
+        if overwrites_source {
+            if let Some(source) = &self.source {
+                source.close()?;
+            }
+        }
+        if let Err(error) = temporary.persist(path) {
+            if overwrites_source {
+                if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
+                    let _ = source.reopen(source_path);
+                }
+            }
+            return Err(OpcError::Io(error.error).into());
         }
         if overwrites_source {
             if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
@@ -1140,6 +1196,56 @@ impl Package {
         }
     }
 
+    /// Write to a seekable stream while checking for cooperative cancellation
+    /// before every underlying write, flush, and seek operation.
+    pub fn write_to_with_report_interruptible(
+        &self,
+        mut writer: impl Write + Seek,
+        options: &WriteOptions,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<PackageWriteReport, InterruptibleWriteError> {
+        if should_cancel() {
+            return Err(InterruptibleWriteError::Cancelled);
+        }
+        self.validate()?;
+        let max = self.limits.max_output_size;
+        let mut interruptible = InterruptibleWriter::new(&mut writer, should_cancel);
+        let mut limited = CountingWriter::new(&mut interruptible, max);
+        let result = write_zip(&self.parts, self.source.as_deref(), &mut limited, options);
+        let exceeded = limited.exceeded();
+        let attempted = limited.attempted();
+        let cancelled = limited.inner.tripped || should_cancel();
+        match result {
+            Ok(mut report) => {
+                if cancelled {
+                    return Err(InterruptibleWriteError::Cancelled);
+                }
+                if let Err(error) = limited.flush() {
+                    if should_cancel() {
+                        return Err(InterruptibleWriteError::Cancelled);
+                    }
+                    return Err(OpcError::Io(error).into());
+                }
+                report.output_bytes = limited.position();
+                Ok(report)
+            }
+            Err(err) => {
+                if cancelled {
+                    Err(InterruptibleWriteError::Cancelled)
+                } else if exceeded {
+                    Err(OpcError::LimitExceeded {
+                        kind: "output",
+                        value: attempted,
+                        max,
+                    }
+                    .into())
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Validate that the internal targets of a set of relationships all hit
     /// parts that exist in the package.
     fn check_rels_targets(
@@ -1177,6 +1283,56 @@ impl Package {
             }
         }
         Ok(())
+    }
+}
+
+struct InterruptibleWriter<'a, W> {
+    inner: W,
+    should_cancel: &'a dyn Fn() -> bool,
+    tripped: bool,
+}
+
+impl<'a, W> InterruptibleWriter<'a, W> {
+    fn new(inner: W, should_cancel: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            inner,
+            should_cancel,
+            tripped: false,
+        }
+    }
+
+    fn check(&mut self) -> std::io::Result<()> {
+        if self.tripped {
+            return Ok(());
+        }
+        if (self.should_cancel)() {
+            self.tripped = true;
+            // `write_all` retries `Interrupted` indefinitely. Use a terminal
+            // I/O kind and translate it to InterruptibleWriteError::Cancelled
+            // after the ZIP writer unwinds.
+            Err(std::io::Error::other("operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<W: Write> Write for InterruptibleWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for InterruptibleWriter<'_, W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(pos)
     }
 }
 

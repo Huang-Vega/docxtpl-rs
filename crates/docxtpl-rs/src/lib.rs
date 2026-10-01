@@ -59,13 +59,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use docxtpl_opc::{resolve_part_target, OpcError, PartUri, Relationship, TargetMode};
 pub use docxtpl_opc::{
-    MediaCompression, Package, PackageEvictionReport, PackageLimits, PackageResidency,
-    PackageTransaction, PackageWriteReport, WriteOptions,
+    InterruptibleWriteError, MediaCompression, Package, PackageEvictionReport, PackageLimits,
+    PackageResidency, PackageTransaction, PackageWriteReport, WriteOptions,
 };
 use docxtpl_template::{
     find_undeclared_variables, normalize_part_xml, prepare_document_xml_template,
@@ -80,11 +81,81 @@ pub use docxtpl_template::{JsonContextError, RenderContext};
 mod images;
 mod replacements;
 mod subdoc;
+mod text_index;
+
+pub use text_index::{
+    FormattingPolicy, RunTextIndex, RunTextLimits, TextFragment, TextIndexError, TextMatch,
+};
 
 use images::ImageInjections;
 use replacements::{picture_map, Replacements};
 
 const DEFAULT_DOCUMENT_BYTES: u64 = 600 * 1024 * 1024;
+
+/// Cloneable cooperative cancellation signal for rendering, post-processing,
+/// validation, and ZIP output.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. The operation stops at its next checkpoint.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Return [`CancellationError::Cancelled`] when cancellation has been requested.
+    pub fn check(&self) -> Result<(), CancellationError> {
+        if self.is_cancelled() {
+            Err(CancellationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn check_cancellation(token: Option<&CancellationToken>) -> Result<(), Error> {
+    if token.is_some_and(CancellationToken::is_cancelled) {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "operation cancelled",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Error returned by opt-in operations that carry a [`CancellationToken`].
+#[derive(Debug, thiserror::Error)]
+pub enum CancellationError {
+    /// The cancellation token requested that the operation stop.
+    #[error("operation cancelled")]
+    Cancelled,
+    /// An ordinary rendering, editing, validation, or output failure.
+    #[error(transparent)]
+    Operation(#[from] Error),
+}
+
+impl CancellationError {
+    fn from_operation(error: Error, cancellation: &CancellationToken) -> Self {
+        if cancellation.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Operation(error)
+        }
+    }
+}
 
 /// Content type of the footnotes part (upstream render_footnotes filters
 /// package.parts by it; this CT is not registered in the python-docx PartFactory, so it is handled as a generic
@@ -348,10 +419,33 @@ impl DocxTemplate {
         context: &serde_json::Value,
         options: &RenderOptions,
     ) -> Result<RenderedDocument, Error> {
+        self.render_checked(context, options, None)
+    }
+
+    /// Render with cooperative cancellation checkpoints between package open,
+    /// each story phase, canonicalization, and final validation.
+    pub fn render_with_cancellation(
+        &self,
+        context: &serde_json::Value,
+        options: &RenderOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderedDocument, CancellationError> {
+        self.render_checked(context, options, Some(cancellation))
+            .map_err(|error| CancellationError::from_operation(error, cancellation))
+    }
+
+    fn render_checked(
+        &self,
+        context: &serde_json::Value,
+        options: &RenderOptions,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RenderedDocument, Error> {
+        check_cancellation(cancellation)?;
         let options = self.effective_render_options(options);
         // Open a fresh package per render: DocxTemplate is reusable and state does not leak across renders (spec §2.2).
         let package_open_started = Instant::now();
         let mut pkg = self.open_package()?;
+        check_cancellation(cancellation)?;
         let package_open_elapsed = package_open_started.elapsed();
         let render_started = Instant::now();
         let main_name = pkg.main_document_uri()?.as_str().to_string();
@@ -371,13 +465,17 @@ impl DocxTemplate {
             &options,
             &mut injections,
             &self.render_cache,
+            cancellation,
         )?;
+        check_cancellation(cancellation)?;
         // A JSON context contains no images/external links, so apply is effectively a no-op (no dirty scopes).
         injections.apply(&mut pkg)?;
         canonicalize_content_types(&mut pkg, false)?;
 
         // Validate the package once more before writing out: no dangling relationships or missing parts allowed.
+        check_cancellation(cancellation)?;
         pkg.validate()?;
+        check_cancellation(cancellation)?;
 
         Ok(RenderedDocument {
             pkg,
@@ -402,6 +500,18 @@ impl DocxTemplate {
         options: &RenderOptions,
     ) -> Result<RenderedDocument, Error> {
         self.render_session(options)?.finish(context)
+    }
+
+    /// Render a rich context with cooperative cancellation.
+    pub fn render_ctx_with_cancellation(
+        &self,
+        context: &RenderContext,
+        options: &RenderOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderedDocument, CancellationError> {
+        self.render_session(options)
+            .map_err(|error| CancellationError::from_operation(error, cancellation))?
+            .finish_with_cancellation(context, cancellation)
     }
 
     /// Open a one-shot rich-content render session: inside the session one may first call [`RenderSession::build_url_id`]
@@ -524,6 +634,7 @@ pub struct RenderSession {
     replacements: Replacements,
     render_cache: Arc<TemplateRenderCache>,
     package_open_elapsed: Duration,
+    cancellation: Option<CancellationToken>,
 }
 
 impl RenderSession {
@@ -543,6 +654,7 @@ impl RenderSession {
             replacements: Replacements::new(),
             render_cache,
             package_open_elapsed,
+            cancellation: None,
         })
     }
 
@@ -671,6 +783,7 @@ impl RenderSession {
     /// Renders every part (body -> headers -> footers -> core properties -> footnotes, P5),
     /// commits the media part / per-scope rels / Content Types changes, and performs final package validation.
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
+        check_cancellation(self.cancellation.as_ref())?;
         let render_started = Instant::now();
         render_all_parts(
             &mut self.pkg,
@@ -678,11 +791,26 @@ impl RenderSession {
             &self.options,
             &mut self.injections,
             &self.render_cache,
+            self.cancellation.as_ref(),
         )?;
 
         // Write media parts first, then write back each owner's rels/CT, guaranteeing the final validation finds no dangling relationships/types.
+        check_cancellation(self.cancellation.as_ref())?;
         self.injections.apply(&mut self.pkg)?;
         self.finish_replacements(false, render_started.elapsed())
+    }
+
+    /// Finish a rich-content session with cooperative cancellation. This is
+    /// the cancellable counterpart for sessions that pre-register hyperlinks,
+    /// subdocuments, or replacement operations before rendering.
+    pub fn finish_with_cancellation(
+        mut self,
+        context: &RenderContext,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderedDocument, CancellationError> {
+        self.cancellation = Some(cancellation.clone());
+        self.finish(context)
+            .map_err(|error| CancellationError::from_operation(error, cancellation))
     }
 
     /// Upstream "save without render" path (P7, save() L887-889): the
@@ -705,15 +833,20 @@ impl RenderSession {
         normalize_all_known_xml_parts: bool,
         prior_render_elapsed: Duration,
     ) -> Result<RenderedDocument, Error> {
+        check_cancellation(self.cancellation.as_ref())?;
         let replacements_started = Instant::now();
         let main_name = self.pkg.main_document_uri()?.as_str().to_string();
         // pre_processing: swap image part blobs on the final XML (before docx.save).
         self.replacements
             .apply_pic_replacements(&mut self.pkg, &main_name)?;
+        check_cancellation(self.cancellation.as_ref())?;
         canonicalize_content_types(&mut self.pkg, normalize_all_known_xml_parts)?;
         // post_processing: CRC/zipname byte replacement over the final part set.
+        check_cancellation(self.cancellation.as_ref())?;
         self.replacements.apply_byte_replacements(&mut self.pkg)?;
+        check_cancellation(self.cancellation.as_ref())?;
         self.pkg.validate()?;
+        check_cancellation(self.cancellation.as_ref())?;
 
         let max_rendered_xml_bytes = self.options.max_rendered_xml_bytes();
         Ok(RenderedDocument {
@@ -741,11 +874,14 @@ fn render_all_parts(
     options: &RenderOptions,
     injections: &mut ImageInjections,
     render_cache: &TemplateRenderCache,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(), Error> {
+    check_cancellation(cancellation)?;
     let main_name = pkg.main_document_uri()?.as_str().to_string();
     let prepared_context = prepare_render_context(context, &main_name)?;
 
     // 1. Body: fix_tables + fix_docpr_ids; image relationships belong to the main document.
+    check_cancellation(cancellation)?;
     injections.begin_owner(pkg, &main_name)?;
     let body_src = read_xml_part(pkg, &main_name)?;
     let body_template =
@@ -761,6 +897,7 @@ fn render_all_parts(
     // resolve_listing still run, but without fix_tables / fix_docpr_ids.
     let stories = story_parts(pkg, &main_name)?;
     for name in stories {
+        check_cancellation(cancellation)?;
         injections.begin_owner(pkg, &name)?;
         let src = read_xml_part(pkg, &name)?;
         let template = render_cache.get_or_prepare(&name, CachedPartKind::Story, &src, || {
@@ -778,6 +915,7 @@ fn render_all_parts(
 
     // 4. Core properties: upstream render() unconditionally runs render_properties. The target resolves via the root
     // rels core-properties relationship; when missing, python-docx creates the default part.
+    check_cancellation(cancellation)?;
     let core_name = ensure_core_properties_part(pkg)?;
     let core_src = read_xml_part(pkg, &core_name)?;
     let rendered =
@@ -787,6 +925,7 @@ fn render_all_parts(
     // 5. Notes: generic binary parts; the rendered strings are written back
     // as-is (preserving their XML declarations).
     for name in note_parts(pkg) {
+        check_cancellation(cancellation)?;
         // Note parts are generic python-docx Parts. Their blobs are decoded as
         // UTF-8 and written back verbatim, so unlike the XmlPart paths above
         // they intentionally remain UTF-8-only.
@@ -807,6 +946,7 @@ fn render_all_parts(
         pkg.set_part_bytes(&name, rendered.into_bytes())?;
     }
 
+    check_cancellation(cancellation)?;
     Ok(())
 }
 
@@ -1893,6 +2033,7 @@ pub struct PostprocessPipeline<'a> {
     package: &'a mut Package,
     max_rendered_xml_bytes: usize,
     reports: Vec<PassReport>,
+    cancellation: Option<CancellationToken>,
 }
 
 /// Transactional operations available to one post-processing pass.
@@ -1900,6 +2041,7 @@ pub struct PostprocessTransaction<'transaction, 'package> {
     transaction: &'transaction mut PackageTransaction<'package>,
     max_rendered_xml_bytes: usize,
     media_registry: Option<MediaRegistry>,
+    cancellation: Option<CancellationToken>,
 }
 
 #[derive(Default)]
@@ -1918,6 +2060,12 @@ pub struct MediaRegistration {
 }
 
 impl PostprocessTransaction<'_, '_> {
+    /// Check the pipeline's cooperative cancellation token. Long-running
+    /// custom passes should call this at their own natural checkpoints.
+    pub fn check_cancelled(&self) -> Result<(), Error> {
+        check_cancellation(self.cancellation.as_ref())
+    }
+
     /// Read a part without marking it as touched.
     pub fn part(&self, name: &str) -> Option<&docxtpl_opc::Part> {
         self.transaction.part(name)
@@ -2052,9 +2200,11 @@ impl PostprocessTransaction<'_, '_> {
         scope: StoryScope,
         mut edit: impl FnMut(&mut StoryEditor) -> Result<(), Error>,
     ) -> Result<StoryEditReport, Error> {
+        self.check_cancelled()?;
         let stories = editable_story_parts(self.transaction.package(), scope)?;
         let mut report = StoryEditReport::default();
         for (name, kind) in stories {
+            self.check_cancelled()?;
             let external_hyperlink_rids = self
                 .transaction
                 .package()
@@ -2089,6 +2239,7 @@ impl PostprocessTransaction<'_, '_> {
                 external_hyperlink_rids,
             };
             edit(&mut story)?;
+            self.check_cancelled()?;
             if story.validate_internal_links {
                 story.validate_bookmarks_and_internal_links()?;
             }
@@ -2113,6 +2264,7 @@ impl PostprocessTransaction<'_, '_> {
                 report.changed_parts.push(name);
             }
         }
+        self.check_cancelled()?;
         Ok(report)
     }
 }
@@ -2125,6 +2277,7 @@ impl PostprocessPipeline<'_> {
         policy: FailurePolicy,
         pass: impl FnOnce(&mut PostprocessTransaction<'_, '_>) -> Result<(), Error>,
     ) -> Result<&mut Self, Error> {
+        check_cancellation(self.cancellation.as_ref())?;
         let name = name.into();
         let started = Instant::now();
         let mut transaction = self.package.transaction();
@@ -2133,8 +2286,9 @@ impl PostprocessPipeline<'_> {
                 transaction: &mut transaction,
                 max_rendered_xml_bytes: self.max_rendered_xml_bytes,
                 media_registry: None,
+                cancellation: self.cancellation.clone(),
             };
-            pass(&mut postprocess)
+            pass(&mut postprocess).and_then(|()| postprocess.check_cancelled())
         };
         match result {
             Ok(_) => {
@@ -2154,6 +2308,16 @@ impl PostprocessPipeline<'_> {
             Err(error) => {
                 let touched_parts = transaction.touched_parts();
                 transaction.rollback();
+                if self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "operation cancelled",
+                    )));
+                }
                 match policy {
                     FailurePolicy::Abort => Err(error),
                     FailurePolicy::WarnAndRollback => {
@@ -2201,11 +2365,32 @@ impl RenderedDocument {
         &mut self,
         configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
     ) -> Result<PostprocessReport, Error> {
+        self.postprocess_checked(configure, None)
+    }
+
+    /// Run rollback-capable passes with cooperative cancellation. A cancelled
+    /// active pass is always rolled back, regardless of its failure policy.
+    pub fn postprocess_with_cancellation(
+        &mut self,
+        cancellation: &CancellationToken,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
+    ) -> Result<PostprocessReport, CancellationError> {
+        self.postprocess_checked(configure, Some(cancellation.clone()))
+            .map_err(|error| CancellationError::from_operation(error, cancellation))
+    }
+
+    fn postprocess_checked(
+        &mut self,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<PostprocessReport, Error> {
+        check_cancellation(cancellation.as_ref())?;
         self.edited = true;
         let mut pipeline = PostprocessPipeline {
             package: &mut self.pkg,
             max_rendered_xml_bytes: self.max_rendered_xml_bytes,
             reports: Vec::new(),
+            cancellation,
         };
         let result = configure(&mut pipeline);
         let reports = std::mem::take(&mut pipeline.reports);
@@ -2259,6 +2444,27 @@ impl RenderedDocument {
         Ok(())
     }
 
+    /// Validate and atomically save with cooperative cancellation. The old
+    /// destination remains untouched when cancellation interrupts ZIP output.
+    pub fn save_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), CancellationError> {
+        self.save_with_options_and_cancellation(path, &WriteOptions::compatible(), cancellation)
+    }
+
+    /// Save with explicit ZIP options and cooperative cancellation.
+    pub fn save_with_options_and_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<(), CancellationError> {
+        self.save_with_report_and_cancellation(path, options, cancellation)
+            .map(|_| ())
+    }
+
     /// Validate and save the document while returning structured render and
     /// ZIP serialization metrics.
     pub fn save_with_report(
@@ -2275,6 +2481,31 @@ impl RenderedDocument {
         Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
     }
 
+    /// Validate and atomically save with structured metrics and cooperative
+    /// cancellation checkpoints through ZIP serialization.
+    pub fn save_with_report_and_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderReport, CancellationError> {
+        cancellation.check()?;
+        let validation_started = Instant::now();
+        self.pkg
+            .validate()
+            .map_err(|error| CancellationError::Operation(Error::Opc(error)))?;
+        cancellation.check()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self
+            .pkg
+            .save_with_report_interruptible(path, options, &|| cancellation.is_cancelled())
+            .map_err(map_interruptible_opc_error)?;
+        let zip_write_elapsed = write_started.elapsed();
+        cancellation.check()?;
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
     /// Validate and write to a seekable stream while returning structured metrics.
     pub fn write_to_with_report(
         &self,
@@ -2287,6 +2518,32 @@ impl RenderedDocument {
         let write_started = Instant::now();
         let package_write = self.pkg.write_to_with_report(writer, options)?;
         let zip_write_elapsed = write_started.elapsed();
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
+    /// Validate and write to a stream with metrics and cooperative
+    /// cancellation. Unlike file saving, a caller-provided stream can contain
+    /// a partial ZIP after cancellation.
+    pub fn write_to_with_report_and_cancellation(
+        &self,
+        writer: impl Write + std::io::Seek,
+        options: &WriteOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderReport, CancellationError> {
+        cancellation.check()?;
+        let validation_started = Instant::now();
+        self.pkg
+            .validate()
+            .map_err(|error| CancellationError::Operation(Error::Opc(error)))?;
+        cancellation.check()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self
+            .pkg
+            .write_to_with_report_interruptible(writer, options, &|| cancellation.is_cancelled())
+            .map_err(map_interruptible_opc_error)?;
+        let zip_write_elapsed = write_started.elapsed();
+        cancellation.check()?;
         Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
     }
 
@@ -2354,6 +2611,13 @@ impl Error {
             Error::Render(e) => e.kind(),
             _ => None,
         }
+    }
+}
+
+fn map_interruptible_opc_error(error: InterruptibleWriteError) -> CancellationError {
+    match error {
+        InterruptibleWriteError::Cancelled => CancellationError::Cancelled,
+        InterruptibleWriteError::Opc(error) => CancellationError::Operation(Error::Opc(error)),
     }
 }
 

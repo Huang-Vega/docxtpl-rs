@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
 use docxtpl_rs::{
-    Bookmark, DocxTemplate, FailurePolicy, Package, PackageLimits, RenderOptions, StoryKind,
-    StoryScope,
+    Bookmark, CancellationError, CancellationToken, DocxTemplate, FailurePolicy, FormattingPolicy,
+    Package, PackageLimits, RenderOptions, RunTextLimits, StoryKind, StoryScope,
 };
 use serde_json::json;
 
@@ -22,6 +22,90 @@ const DRAWING_TEMPLATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/templates/r3_docpr.docx"
 );
+
+#[test]
+fn public_run_text_index_finds_and_replaces_literal_text() -> Result<(), Box<dyn std::error::Error>>
+{
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "indexed"}), &RenderOptions::compat())?;
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("replace-indexed", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_story(StoryScope::Body, |story| {
+                let paragraphs: Vec<_> = story
+                    .document()
+                    .descendants(story.document().root())
+                    .into_iter()
+                    .filter(|node| {
+                        story
+                            .document()
+                            .tag(*node)
+                            .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p")
+                    })
+                    .collect();
+                for paragraph in paragraphs {
+                    let index = story.run_text_index(paragraph, RunTextLimits::default())?;
+                    if let Some(matched) = index.find_literal("indexed")?.into_iter().next() {
+                        story.replace_text_match(
+                            &index,
+                            &matched,
+                            "replaced",
+                            FormattingPolicy::InheritFirstRun,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                panic!("rendered body should contain indexed text")
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let bytes = document.to_bytes()?;
+    let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(xml.contains("replaced"));
+    assert!(!xml.contains("indexed"));
+    Ok(())
+}
+
+#[test]
+fn cancellation_is_distinct_and_rolls_back_active_pass() -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        template
+            .render_with_cancellation(
+                &json!({"name": "value"}),
+                &RenderOptions::compat(),
+                &cancelled
+            )
+            .unwrap_err(),
+        CancellationError::Cancelled
+    ));
+
+    let mut document = template.render(&json!({"name": "original"}), &RenderOptions::compat())?;
+    let token = CancellationToken::new();
+    let error = document
+        .postprocess_with_cancellation(&token, |pipeline| {
+            pipeline.pass("cancelled", FailurePolicy::WarnAndRollback, |transaction| {
+                transaction.set_part_bytes("word/document.xml", b"broken".to_vec())?;
+                token.cancel();
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .expect_err("cancellation must abort even with warning policy");
+    assert!(matches!(error, CancellationError::Cancelled));
+
+    let bytes = document.to_bytes()?;
+    let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(xml.contains("original"));
+    Ok(())
+}
 
 #[test]
 fn rendered_document_can_be_edited_before_its_only_write() -> Result<(), Box<dyn std::error::Error>>

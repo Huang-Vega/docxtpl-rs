@@ -12,9 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-docxtpl-compat = { version = "=1.2.0", path = "../docxtpl-compat" }
-docxtpl-rich = { version = "=1.2.0", path = "../docxtpl-rich" }
-docxtpl-xml = { version = "=1.2.0", path = "../docxtpl-xml" }
+docxtpl-compat = { version = "=1.2.1", path = "../docxtpl-compat" }
+docxtpl-rich = { version = "=1.2.1", path = "../docxtpl-rich" }
+docxtpl-xml = { version = "=1.2.1", path = "../docxtpl-xml" }
 html-escape = "0.2"
 minijinja = { version = "2", features = ["fuel", "json", "preserve_order", "unicode", "urlencode"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat", "rand", "wordcount"] }

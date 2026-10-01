@@ -107,3 +107,14 @@ pub enum OpcError {
         reason: String,
     },
 }
+
+/// Error returned only by the opt-in interruptible output APIs.
+#[derive(Debug, thiserror::Error)]
+pub enum InterruptibleWriteError {
+    /// The caller-provided cooperative cancellation check requested a stop.
+    #[error("operation cancelled")]
+    Cancelled,
+    /// Ordinary OPC validation or ZIP output failure.
+    #[error(transparent)]
+    Opc(#[from] OpcError),
+}
