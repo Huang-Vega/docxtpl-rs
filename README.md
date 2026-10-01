@@ -6,14 +6,13 @@ This is an independent Rust implementation. It is not an official port and is
 not affiliated with or endorsed by the Python docxtpl project. Python docxtpl
 is used only as the pinned development-time compatibility oracle; it is not a
 runtime dependency of any published Rust crate.
-The current stable version is `1.2.1`, retaining the P0–P7 compatibility
-baseline and controlled single-package post-processing pipeline. The workspace
-is developing `1.3.0`; its first additive milestone extends the editable story
-API to body, headers, footers, footnotes, endnotes, and Word comments, and adds
-bounded regex/capture replacement with composable run-format overrides. It remains
-aligned with Python docxtpl 0.20.2. The 1.0 line is the first public compatibility
-baseline; earlier development
-snapshots are not supported release or migration targets. See the
+The current stable version is `1.3.0`. It retains the P0–P7 compatibility
+baseline and controlled single-package post-processing pipeline while adding
+the unified editable-story API, bounded regex/capture replacement, persistent
+prepared-template caching, unified execution control, and runtime-neutral async
+scheduling. It remains aligned with Python docxtpl 0.20.2. The 1.0 line is the
+first public compatibility baseline; earlier development snapshots are not
+supported release or migration targets. See the
 [1.0 release-line guide](https://github.com/Huang-Vega/docxtpl-rs/blob/master/MIGRATION.md)
 for the public API baseline and adoption checklist.
 
@@ -29,16 +28,16 @@ cargo run -p docxtpl-cli -- render template.docx context.json output.docx
 Use the exact stable version:
 
 ```sh
-cargo add docxtpl-rs@1.2.1
-cargo install docxtpl-cli --version 1.2.1 --locked
+cargo add docxtpl-rs@1.3.0
+cargo install docxtpl-cli --version 1.3.0 --locked
 ```
 
 The release procedure and crate order are described in
 [RELEASING.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/RELEASING.md).
 Release evidence is tracked in
-[docs/release-readiness.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/docs/release-readiness.md).
+[docs/1.3.0-release-readiness.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/docs/1.3.0-release-readiness.md).
 
-The developing 1.3 API can opt into a caller-owned persistent preprocessing
+The 1.3 API can opt into a caller-owned persistent preprocessing
 cache. The supplied root receives an isolated `docxtpl-rs-prepared-v1`
 subdirectory; ordinary templates do not create a disk cache:
 
@@ -62,7 +61,7 @@ let control = RenderControl::new().with_timeout(Duration::from_secs(30));
 // template.render_with_control(&context, &options, &control)?;
 ```
 
-The developing 1.3 API also provides runtime-neutral async scheduling without
+The 1.3 API also provides runtime-neutral async scheduling without
 making Tokio or another runtime a core dependency. Inject a blocking executor,
 set an explicit bound for running plus queued work, then await the returned
 `RenderTask` in the caller's runtime:

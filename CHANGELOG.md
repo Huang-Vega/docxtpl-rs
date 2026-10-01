@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-01
+
 - Started 1.3.0 development with an additive unified editable-story API. The
   new selection and editor types cover body, headers, footers, footnotes,
   endnotes, and Word comments without extending the exhaustively matchable 1.2

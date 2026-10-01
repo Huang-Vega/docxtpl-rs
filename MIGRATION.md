@@ -1,8 +1,30 @@
 # Migration guide
 
-## 1.2 editing API preview
+## 1.2 to 1.3
 
-The unreleased 1.2 line adds an opt-in editing path for applications that need
+Version 1.3.0 is additive relative to the frozen 1.2 public API. Existing
+rendering, editing, cancellation, and output entry points retain their behavior;
+no source migration is required. Applications may adopt the new capabilities
+independently:
+
+- use `EditableStorySelection` and `for_each_editable_story` for body, header,
+  footer, footnote, endnote, and comment editing;
+- use the bounded regex and capture-replacement methods on `RunTextIndex`, with
+  optional `RunFormatOverrides`;
+- attach an explicitly owned `PreparedTemplateCache` when preprocessing should
+  persist across template instances;
+- use `RenderControl` and the `RenderLimits` alias for unified cancellation,
+  deadline, and resource-budget terminology;
+- inject a blocking executor into `AsyncRenderDispatcher` when async scheduling
+  and bounded in-flight backpressure are required.
+
+The old `StoryScope`, `StoryKind`, `CancellationToken`, `CancellationError`, and
+`ResourceLimits` types remain available. In particular, 1.3 does not add
+variants to the exhaustively matchable 1.2 story enums.
+
+## 1.2 editing API
+
+The 1.2 line added an opt-in editing path for applications that need
 to post-process a rendered document without first serializing and reopening an
 intermediate DOCX:
 
