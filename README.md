@@ -6,10 +6,9 @@ This is an independent Rust implementation. It is not an official port and is
 not affiliated with or endorsed by the Python docxtpl project. Python docxtpl
 is used only as the pinned development-time compatibility oracle; it is not a
 runtime dependency of any published Rust crate.
-The current stable version is `1.2.0`; the workspace is developing `1.2.1` while
-retaining the P0–P7 compatibility baseline and controlled single-package
-post-processing pipeline. It remains aligned
-with Python docxtpl 0.20.2. The 1.0 line is the first public compatibility
+The current stable version is `1.2.1`, retaining the P0–P7 compatibility
+baseline and controlled single-package post-processing pipeline. It remains
+aligned with Python docxtpl 0.20.2. The 1.0 line is the first public compatibility
 baseline; earlier development
 snapshots are not supported release or migration targets. See the
 [1.0 release-line guide](https://github.com/Huang-Vega/docxtpl-rs/blob/master/MIGRATION.md)
@@ -27,8 +26,8 @@ cargo run -p docxtpl-cli -- render template.docx context.json output.docx
 Use the exact stable version:
 
 ```sh
-cargo add docxtpl-rs@1.2.0
-cargo install docxtpl-cli --version 1.2.0 --locked
+cargo add docxtpl-rs@1.2.1
+cargo install docxtpl-cli --version 1.2.1 --locked
 ```
 
 The release procedure and crate order are described in

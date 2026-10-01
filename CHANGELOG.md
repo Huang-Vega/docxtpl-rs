@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-01
+
 - Added a bounded `RunTextIndex` MVP for literal search and safe single- or
   cross-run replacement in body/header/footer story paragraphs. It includes
   explicit formatting policies, structural boundaries, stale-index detection,
