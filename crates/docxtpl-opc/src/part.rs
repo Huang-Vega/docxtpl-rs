@@ -3,7 +3,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -14,6 +14,117 @@ use zip::DateTime;
 use crate::rels::Relationships;
 use crate::uri::PartUri;
 use crate::OpcError;
+
+/// An immutable snapshot of a file used as an OPC part source.
+///
+/// The snapshot records the file length, modification time, and SHA-1 digest.
+/// [`crate::Package`] verifies all three again while serializing the part, so
+/// replacing or truncating the source after this snapshot was created fails
+/// instead of silently producing a different package.
+#[derive(Debug, Clone)]
+pub struct FilePartSource {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: [u8; 20],
+}
+
+impl FilePartSource {
+    /// Snapshot a regular file without retaining its contents in memory.
+    ///
+    /// # Failure cases
+    ///
+    /// Returns [`OpcError::Io`] when the path cannot be read, is not a regular
+    /// file, or changes while its digest is being computed.
+    pub fn snapshot(path: impl AsRef<Path>) -> Result<Self, OpcError> {
+        let path = path.as_ref();
+        let before = std::fs::metadata(path)?;
+        if !before.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file-backed part source is not a file: {}", path.display()),
+            )
+            .into());
+        }
+        let len = before.len();
+        let modified = before.modified().ok();
+        let mut file = File::open(path)?;
+        let mut hasher = Sha1::new();
+        let mut read_len = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            read_len = read_len.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+        validate_file_metadata(path, len, modified)?;
+        if read_len != len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file-backed part source changed: {}", path.display()),
+            )
+            .into());
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            digest: hasher.finalize().into(),
+        })
+    }
+
+    /// Capture file metadata while using a digest already computed by a
+    /// streaming parser. The digest and metadata are verified again when the
+    /// package is written.
+    pub fn snapshot_with_digest(
+        path: impl AsRef<Path>,
+        digest: [u8; 20],
+    ) -> Result<Self, OpcError> {
+        let path = path.as_ref();
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file-backed part source is not a file: {}", path.display()),
+            )
+            .into());
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            digest,
+        })
+    }
+
+    /// Captured file length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the captured file is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, u64, Option<SystemTime>, [u8; 20]) {
+        (self.path, self.len, self.modified, self.digest)
+    }
+
+    pub(crate) fn read_verified(&self) -> Result<Vec<u8>, OpcError> {
+        Ok(read_verified_file(
+            &self.path,
+            self.len,
+            self.modified,
+            self.digest,
+        )?)
+    }
+}
 
 pub(crate) struct LazyArchive {
     file: Mutex<Option<File>>,
@@ -36,6 +147,11 @@ impl LazyArchive {
         self.lock()?.take();
         Ok(())
     }
+
+    pub(crate) fn reopen(&self, path: &Path) -> Result<(), OpcError> {
+        *self.lock()? = Some(File::open(path)?);
+        Ok(())
+    }
 }
 
 enum PartData {
@@ -50,9 +166,51 @@ enum PartData {
     Lazy {
         source: Arc<LazyArchive>,
         entry_index: usize,
-        max_bytes: u64,
+        len: u64,
         cache: OnceLock<Result<Vec<u8>, String>>,
     },
+}
+
+impl Clone for PartData {
+    fn clone(&self) -> Self {
+        fn clone_cache(
+            source: &OnceLock<Result<Vec<u8>, String>>,
+        ) -> OnceLock<Result<Vec<u8>, String>> {
+            let target = OnceLock::new();
+            if let Some(value) = source.get() {
+                let _ = target.set(value.clone());
+            }
+            target
+        }
+
+        match self {
+            Self::Loaded(data) => Self::Loaded(data.clone()),
+            Self::FileBacked {
+                path,
+                len,
+                modified,
+                digest,
+                cache,
+            } => Self::FileBacked {
+                path: path.clone(),
+                len: *len,
+                modified: *modified,
+                digest: *digest,
+                cache: clone_cache(cache),
+            },
+            Self::Lazy {
+                source,
+                entry_index,
+                len,
+                cache,
+            } => Self::Lazy {
+                source: Arc::clone(source),
+                entry_index: *entry_index,
+                len: *len,
+                cache: clone_cache(cache),
+            },
+        }
+    }
 }
 
 /// A single part (including directory entries: `is_dir() == true` with empty
@@ -83,6 +241,21 @@ pub struct Part {
     last_modified: Option<DateTime>,
 }
 
+impl Clone for Part {
+    fn clone(&self) -> Self {
+        Self {
+            uri: self.uri.clone(),
+            data: self.data.clone(),
+            source_index: self.source_index,
+            modified: self.modified,
+            dir: self.dir,
+            relationships: self.relationships.clone(),
+            compression: self.compression,
+            last_modified: self.last_modified,
+        }
+    }
+}
+
 impl Part {
     pub(crate) fn new(
         uri: PartUri,
@@ -107,7 +280,7 @@ impl Part {
         uri: PartUri,
         source: Arc<LazyArchive>,
         entry_index: usize,
-        max_bytes: u64,
+        len: u64,
         dir: bool,
         compression: CompressionMethod,
         last_modified: Option<DateTime>,
@@ -120,7 +293,7 @@ impl Part {
                 PartData::Lazy {
                     source,
                     entry_index,
-                    max_bytes,
+                    len,
                     cache: OnceLock::new(),
                 }
             },
@@ -167,6 +340,21 @@ impl Part {
         self.modified = true;
     }
 
+    pub(crate) fn replace_file_backed(&mut self, source: FilePartSource) {
+        let (path, len, modified, digest) = source.into_parts();
+        self.data = PartData::FileBacked {
+            path,
+            len,
+            modified,
+            digest,
+            cache: OnceLock::new(),
+        };
+        self.source_index = None;
+        self.modified = true;
+        self.dir = false;
+        self.last_modified = None;
+    }
+
     pub(crate) fn compression_method(&self) -> CompressionMethod {
         self.compression
     }
@@ -177,6 +365,58 @@ impl Part {
 
     pub(crate) fn source_index(&self) -> Option<usize> {
         self.source_index
+    }
+
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self.data, PartData::FileBacked { .. })
+    }
+
+    pub(crate) fn resident_len(&self) -> u64 {
+        match &self.data {
+            PartData::Loaded(data) => data.len() as u64,
+            PartData::FileBacked { cache, .. } | PartData::Lazy { cache, .. } => cache
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |data| data.len() as u64),
+        }
+    }
+
+    pub(crate) fn evictable_len(&self) -> u64 {
+        if self.modified {
+            return 0;
+        }
+        match &self.data {
+            PartData::Lazy { cache, .. } => cache
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |data| data.len() as u64),
+            PartData::Loaded(_) | PartData::FileBacked { .. } => 0,
+        }
+    }
+
+    pub(crate) fn is_evictable(&self) -> bool {
+        !self.modified
+            && matches!(&self.data, PartData::Lazy { cache, .. } if cache.get().is_some())
+    }
+
+    pub(crate) fn evict_clean_cache(&mut self) -> Option<u64> {
+        if self.modified {
+            return None;
+        }
+        match &mut self.data {
+            PartData::Lazy { cache, .. } => cache
+                .take()
+                .map(|result| result.map_or(0, |data| data.len() as u64)),
+            PartData::Loaded(_) | PartData::FileBacked { .. } => None,
+        }
+    }
+
+    pub(crate) fn content_len(&self) -> Result<u64, OpcError> {
+        match &self.data {
+            PartData::Loaded(data) => Ok(data.len() as u64),
+            PartData::FileBacked { len, .. } => Ok(*len),
+            PartData::Lazy { len, .. } => Ok(*len),
+        }
     }
 
     pub(crate) fn set_source_index(&mut self, index: usize) {
@@ -245,8 +485,9 @@ impl Part {
             PartData::Lazy {
                 source,
                 entry_index,
-                max_bytes,
+                len,
                 cache,
+                ..
             } => match cache.get_or_init(|| {
                 let mut source_file = source.lock().map_err(|error| error.to_string())?;
                 let file = source_file.as_mut().ok_or_else(|| {
@@ -265,12 +506,13 @@ impl Part {
                 let mut data = Vec::new();
                 entry
                     .by_ref()
-                    .take(max_bytes.saturating_add(1))
+                    .take(len.saturating_add(1))
                     .read_to_end(&mut data)
                     .map_err(|error| error.to_string())?;
-                if data.len() as u64 > *max_bytes {
+                if data.len() as u64 != *len {
                     return Err(format!(
-                        "uncompressed entry exceeds the {max_bytes}-byte limit"
+                        "source ZIP changed: expected {len} uncompressed bytes, got {}",
+                        data.len()
                     ));
                 }
                 Ok(data)

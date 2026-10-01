@@ -6,7 +6,7 @@ mod common;
 use std::io::Cursor;
 
 use common::*;
-use docxtpl_opc::{OpcError, Package, PackageLimits};
+use docxtpl_opc::{FilePartSource, OpcError, Package, PackageLimits};
 
 fn open(bytes: &[u8]) -> Package {
     Package::from_reader(Cursor::new(bytes), &PackageLimits::default()).expect("open package")
@@ -149,4 +149,203 @@ fn set_part_bytes_invalid_rels_is_rejected_and_keeps_old_bytes() {
             .unwrap(),
         DOCUMENT_RELS_XML.as_bytes()
     );
+}
+
+#[test]
+fn set_file_backed_part_streams_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_path = dir.path().join("document.xml");
+    let replacement = b"<w:document><w:body><w:p/></w:body></w:document>";
+    std::fs::write(&source_path, replacement).expect("write replacement");
+    let source = FilePartSource::snapshot(&source_path).expect("snapshot replacement");
+    let mut pkg = open(&minimal_docx());
+
+    pkg.set_file_backed_part("word/document.xml", source)
+        .expect("set file-backed document");
+
+    let part = pkg.part("word/document.xml").unwrap();
+    assert!(part.is_modified());
+    assert!(!part.is_loaded(), "replacement should stay file-backed");
+
+    let mut out = Vec::new();
+    pkg.write_to(Cursor::new(&mut out))
+        .expect("stream file-backed package");
+    assert!(
+        !pkg.part("word/document.xml").unwrap().is_loaded(),
+        "streaming must not populate the in-memory cache"
+    );
+    let reopened = open(&out);
+    assert_eq!(
+        reopened.part("word/document.xml").unwrap().bytes().unwrap(),
+        replacement
+    );
+}
+
+#[test]
+fn write_report_counts_modified_file_backed_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_path = dir.path().join("document.xml");
+    let replacement = b"<w:document><w:body/></w:document>";
+    std::fs::write(&source_path, replacement).expect("write replacement");
+    let source = FilePartSource::snapshot(&source_path).expect("snapshot replacement");
+    let mut pkg = open(&minimal_docx());
+    pkg.set_file_backed_part("word/document.xml", source)
+        .expect("set file-backed document");
+
+    let mut out = Vec::new();
+    let report = pkg
+        .write_to_with_report(
+            Cursor::new(&mut out),
+            &docxtpl_opc::WriteOptions::compatible(),
+        )
+        .expect("write with report");
+
+    assert_eq!(report.total_parts, pkg.part_count());
+    assert_eq!(
+        report.raw_copied_parts, 0,
+        "reader-backed input has no raw source"
+    );
+    assert_eq!(report.rewritten_parts, pkg.part_count());
+    assert_eq!(report.file_backed_parts, 1);
+    assert_eq!(report.modified_parts, 1);
+    assert_eq!(report.output_bytes, out.len() as u64);
+    assert!(report.rewritten_source_bytes >= replacement.len() as u64);
+    assert!(!pkg.part("word/document.xml").unwrap().is_loaded());
+}
+
+#[test]
+fn file_backed_part_rejects_changed_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_path = dir.path().join("document.xml");
+    std::fs::write(&source_path, DOCUMENT_XML).expect("write replacement");
+    let source = FilePartSource::snapshot(&source_path).expect("snapshot replacement");
+    let mut pkg = open(&minimal_docx());
+    pkg.set_file_backed_part("word/document.xml", source)
+        .expect("set file-backed document");
+    std::fs::write(&source_path, b"changed").expect("change replacement");
+
+    let mut out = Vec::new();
+    let err = pkg
+        .write_to(Cursor::new(&mut out))
+        .expect_err("changed source must fail");
+    assert!(err.to_string().contains("source changed"), "got: {err:?}");
+}
+
+#[test]
+fn file_part_snapshot_rejects_directories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = FilePartSource::snapshot(dir.path()).expect_err("directory is not a file");
+    assert!(err.to_string().contains("not a file"), "got: {err:?}");
+}
+
+#[test]
+fn package_transaction_rolls_back_touched_and_added_parts_on_drop() {
+    let mut pkg = open(&minimal_docx());
+    let original = pkg
+        .part("word/document.xml")
+        .unwrap()
+        .bytes()
+        .unwrap()
+        .to_vec();
+    {
+        let mut transaction = pkg.transaction();
+        transaction
+            .set_part_bytes("word/document.xml", b"changed".to_vec())
+            .expect("replace document");
+        transaction
+            .add_part("word/temporary.bin", vec![1, 2, 3])
+            .expect("add temporary part");
+        assert!(transaction.changed());
+        assert_eq!(
+            transaction.touched_parts(),
+            vec![
+                "word/document.xml".to_string(),
+                "word/temporary.bin".to_string()
+            ]
+        );
+    }
+
+    assert_eq!(
+        pkg.part("word/document.xml").unwrap().bytes().unwrap(),
+        original
+    );
+    assert!(!pkg.contains("word/temporary.bin"));
+    pkg.validate().expect("rolled-back package is valid");
+}
+
+#[test]
+fn package_transaction_commit_keeps_changes() {
+    let mut pkg = open(&minimal_docx());
+    let changed = b"<w:document><w:body/></w:document>";
+    {
+        let mut transaction = pkg.transaction();
+        transaction
+            .set_part_bytes("word/document.xml", changed.to_vec())
+            .expect("replace document");
+        transaction.commit();
+    }
+
+    assert_eq!(
+        pkg.part("word/document.xml").unwrap().bytes().unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn package_transaction_restores_relationship_derived_views() {
+    let mut pkg = open(&minimal_docx());
+    let original_id = pkg
+        .relationships_of("word/document.xml")
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .id
+        .clone();
+    {
+        let mut transaction = pkg.transaction();
+        let changed_rels = concat!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId9" Type="http://example.com/rel" Target="styles.xml"/>"#,
+            "</Relationships>"
+        );
+        transaction
+            .set_part_bytes(
+                "word/_rels/document.xml.rels",
+                changed_rels.as_bytes().to_vec(),
+            )
+            .expect("replace relationships");
+        transaction.rollback();
+    }
+
+    let relationships = pkg.relationships_of("word/document.xml").unwrap();
+    assert!(relationships.get(&original_id).is_some());
+    assert!(relationships.get("rId9").is_none());
+    pkg.validate().expect("rolled-back package is valid");
+}
+
+#[test]
+fn validation_failure_does_not_replace_existing_output() {
+    let mut pkg = open(&minimal_docx());
+    let dangling_rels = concat!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        r#"<Relationship Id="rId1" Type="http://example.com/missing" Target="missing.xml"/>"#,
+        "</Relationships>"
+    );
+    pkg.set_part_bytes(
+        "word/_rels/document.xml.rels",
+        dangling_rels.as_bytes().to_vec(),
+    )
+    .expect("install syntactically valid dangling relationship");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("output.docx");
+    let sentinel = b"previous valid output";
+    std::fs::write(&output, sentinel).expect("write existing target");
+
+    let error = pkg
+        .save(&output)
+        .expect_err("final validation must reject dangling relationship");
+
+    assert!(error.to_string().contains("does not match any part"));
+    assert_eq!(std::fs::read(output).unwrap(), sentinel);
 }

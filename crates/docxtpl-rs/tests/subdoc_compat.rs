@@ -5,6 +5,8 @@
 //! at a time and keep the assertions semantic (not byte-for-byte), notably for
 //! docxcompose's randomly generated `w:nsid` values.
 
+mod test_support;
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,7 +37,7 @@ fn sub_fixture() -> PathBuf {
 fn tempdir(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create temporary directory under the project target directory")
 }
 

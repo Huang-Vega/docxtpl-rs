@@ -59,11 +59,12 @@ fn roundtrip_all_rt_fixtures_byte_identical() {
             .collect();
         before.sort();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        pkg.save(tmp.path())
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("roundtrip.docx");
+        pkg.save(&output)
             .unwrap_or_else(|e| panic!("{name}: failed to write: {e}"));
 
-        let reopened = Package::open(tmp.path(), &limits)
+        let reopened = Package::open(&output, &limits)
             .unwrap_or_else(|e| panic!("{name}: failed to reopen: {e}"));
         reopened
             .validate()

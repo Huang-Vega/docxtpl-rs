@@ -1,5 +1,7 @@
 //! Minimal DOCX integration regressions for the publicly documented P6 rejection boundaries.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -95,7 +97,7 @@ fn add_custom_properties(src: &Path, dst: &Path) {
 }
 
 fn assert_subdoc_rejected(fragment: &str, expected: &str) {
-    let workspace_target = root().join("target");
+    let workspace_target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p6-boundary-")
         .tempdir_in(workspace_target)
@@ -116,7 +118,7 @@ fn assert_subdoc_rejected(fragment: &str, expected: &str) {
 }
 
 fn assert_subdoc_accepted(fragment: &str) {
-    let workspace_target = root().join("target");
+    let workspace_target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p6-compatible-")
         .tempdir_in(workspace_target)
@@ -212,7 +214,7 @@ fn rejects_footnote_reference() {
 
 #[test]
 fn accepts_when_both_documents_have_multiple_sections() {
-    let workspace_target = root().join("target");
+    let workspace_target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p6-sections-")
         .tempdir_in(workspace_target)
@@ -242,7 +244,7 @@ fn accepts_when_both_documents_have_multiple_sections() {
 fn ignores_nonstandard_document_scoped_custom_properties_part() {
     let dir = tempfile::Builder::new()
         .prefix("p6-custom-props-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let variant = dir.path().join("sub.docx");
     add_custom_properties(

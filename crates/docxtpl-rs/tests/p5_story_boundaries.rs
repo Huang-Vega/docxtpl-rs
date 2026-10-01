@@ -1,5 +1,7 @@
 //! Minimal package-level regressions for the P5 DEV-0007 story enumeration boundaries.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -150,7 +152,7 @@ fn zip_part_from_bytes(docx: &[u8], name: &str) -> Vec<u8> {
 fn render_variant(relationship: &str) {
     let dir = tempfile::Builder::new()
         .prefix("p5-story-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -183,7 +185,7 @@ fn relationship_types_that_only_end_in_header_or_footer_are_not_stories() {
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
     let dir = tempfile::Builder::new()
         .prefix("p5-story-rel-type-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -222,7 +224,7 @@ fn relationship_types_that_only_end_in_header_or_footer_are_not_stories() {
 fn orphan_story_is_ignored_but_endnotes_are_rendered() {
     let dir = tempfile::Builder::new()
         .prefix("p5-orphan-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -262,7 +264,7 @@ fn header_image_error_reports_part_name() {
 fn core_properties_syntax_error_reports_part_name() {
     let dir = tempfile::Builder::new()
         .prefix("p5-core-props-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -286,7 +288,7 @@ fn core_properties_syntax_error_reports_part_name() {
 fn multi_section_footnotes_are_rendered_once() {
     let dir = tempfile::Builder::new()
         .prefix("p5-footnotes-once-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_footnotes_basic.docx");
     let with_sections = dir.path().join("two-sections.docx");

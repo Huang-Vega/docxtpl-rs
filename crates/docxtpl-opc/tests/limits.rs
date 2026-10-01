@@ -175,8 +175,12 @@ fn stored_entries_are_exempt_from_ratio_limit() {
 fn output_size_limit() {
     // 16KiB of incompressible data: writing it must exceed 4KiB
     let blob = incompressible(16 * 1024);
+    let content_types = CONTENT_TYPES_XML.replace(
+        "</Types>",
+        r#"<Default Extension="bin" ContentType="application/octet-stream"/></Types>"#,
+    );
     let bytes = build_zip(&[
-        ("[Content_Types].xml", CONTENT_TYPES_XML.as_bytes()),
+        ("[Content_Types].xml", content_types.as_bytes()),
         ("_rels/.rels", ROOT_RELS_XML.as_bytes()),
         ("word/document.xml", DOCUMENT_XML.as_bytes()),
         ("blob.bin", &blob),
@@ -215,6 +219,23 @@ fn output_size_limit() {
     // No truncated file should be left when the limit is exceeded
     assert!(!dir.path().join("x.docx").exists());
 
+    // An existing destination is also preserved: save never truncates it
+    // before validation and bounded ZIP serialization succeed.
+    let existing = dir.path().join("existing.docx");
+    let sentinel = b"previous valid output";
+    std::fs::write(&existing, sentinel).expect("write existing target");
+    let err = pkg
+        .save(&existing)
+        .expect_err("limited save over existing target must fail");
+    assert!(matches!(
+        err,
+        OpcError::LimitExceeded { kind: "output", .. }
+    ));
+    assert_eq!(
+        std::fs::read(&existing).expect("read preserved target"),
+        sentinel
+    );
+
     // Under the default limits it writes successfully and round-trips
     let default_pkg =
         open_with(&bytes, &PackageLimits::default()).expect("open with default limits");
@@ -228,4 +249,54 @@ fn output_size_limit() {
         reopened.part("blob.bin").unwrap().bytes().unwrap(),
         blob.as_slice()
     );
+}
+
+#[test]
+fn mutations_obey_entry_and_uncompressed_limits() {
+    let bytes = build_zip(&[
+        ("[Content_Types].xml", CONTENT_TYPES_XML.as_bytes()),
+        ("_rels/.rels", ROOT_RELS_XML.as_bytes()),
+        ("word/document.xml", DOCUMENT_XML.as_bytes()),
+    ]);
+    let existing_total =
+        (CONTENT_TYPES_XML.len() + ROOT_RELS_XML.len() + DOCUMENT_XML.len()) as u64;
+
+    let entry_limits = PackageLimits {
+        max_entries: 3,
+        ..PackageLimits::default()
+    };
+    let mut pkg = open_with(&bytes, &entry_limits).expect("open at entry limit");
+    assert!(matches!(
+        pkg.add_part("extra.xml", Vec::new()),
+        Err(OpcError::LimitExceeded {
+            kind: "entries",
+            ..
+        })
+    ));
+
+    let single_limits = PackageLimits {
+        max_entry_uncompressed: 1024,
+        ..PackageLimits::default()
+    };
+    let mut pkg = open_with(&bytes, &single_limits).expect("open below single-entry limit");
+    assert!(matches!(
+        pkg.set_part_bytes("word/document.xml", vec![0; 1025]),
+        Err(OpcError::LimitExceeded {
+            kind: "entry_uncompressed",
+            ..
+        })
+    ));
+
+    let total_limits = PackageLimits {
+        max_total_uncompressed: existing_total + 10,
+        ..PackageLimits::default()
+    };
+    let mut pkg = open_with(&bytes, &total_limits).expect("open below total limit");
+    assert!(matches!(
+        pkg.add_part("extra.xml", vec![0; 11]),
+        Err(OpcError::LimitExceeded {
+            kind: "total_uncompressed",
+            ..
+        })
+    ));
 }

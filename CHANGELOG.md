@@ -1,5 +1,60 @@
 # Changelog
 
+## [Unreleased]
+
+## [1.2.0] - 2026-10-01
+
+- Started the 1.2 editing path: `RenderedDocument::edit_package` lets callers
+  modify the rendered OPC package before its final serialization, and every
+  output method revalidates package integrity after editing.
+- Added `FilePartSource::snapshot`, file-backed part replacement, and a
+  snapshot-based add API. File-backed replacements remain streaming during ZIP
+  output and fail if their source changes.
+- Added an on-demand `PackageTransaction` undo journal and a rendered-document
+  post-processing pipeline. Each pass commits independently; failed passes
+  always roll back and can either abort the pipeline or emit a structured
+  warning and continue.
+- Added bounded body/header/footer story editing. Each selected story is parsed
+  once, exposes one shared editable XML DOM for multiple operations, and is
+  serialized at most once with the existing body/story namespace behavior.
+- Extended JPEG probing to accept valid SOI/SOF images without JFIF or Exif
+  application segments. The generic path safely skips variable-length marker
+  segments, rejects truncated or invalid lengths, and uses the 72 dpi fallback;
+  existing JFIF/Exif DPI selection remains unchanged.
+- Added opt-in structured output metrics. `PackageWriteReport` distinguishes
+  raw-copied and rewritten entries and reports file-backed/loaded/modified
+  counts and final bytes; `RenderReport` adds package-open, render,
+  post-processing, validation, and final ZIP-write timings.
+- Added transactional relationship and media registration for post-processing.
+  Exact owner/type/target/mode relationships and SHA-1-identical media are
+  reused; new `rId` and `imageN` values fill deterministic gaps, path-backed
+  media stays streaming, and Content Types changes roll back with the pass.
+- Added exact package part-buffer residency snapshots and safe clean-part cache
+  eviction. Only unmodified lazy parts backed by the still-open source ZIP are
+  evicted; modified, reader-created, and file-backed content remains resident.
+  ZIP write reports now include resident content bytes at serialization start.
+- Completed the output safety closure: every package serialization validates
+  OPC integrity, file saves use a synced same-directory temporary file before
+  replacement, and failed validation or bounded writing preserves an existing
+  destination. Part mutations enforce entry-count, per-entry, and total
+  uncompressed package limits before changing state.
+- Added deterministic bookmark and internal-hyperlink primitives to
+  `StoryEditor`. Bookmark names are normalized and bounded, numeric ids fill
+  gaps, repeated creation/linking is idempotent, and story write-back rejects
+  duplicate or unmatched bookmarks and dangling internal anchors.
+- Added existing-Drawing external hyperlink support. Post-processing can
+  register an idempotent owner-scoped external relationship and attach it to
+  both `wp:docPr` and `pic:cNvPr`; duplicate click nodes, wrong node types, and
+  relationship ids outside the story's external hyperlinks are rejected.
+- Made integration-test temporary directories honor `CARGO_TARGET_DIR`, so
+  isolated and project-local build layouts no longer depend on a pre-existing
+  workspace `target` directory.
+- Replaced fixture ownership metadata with the neutral project identity
+  `docxtpl-rs` and audited the candidate diff and DOCX archives for local paths,
+  host addresses, SSH material, and user identifiers.
+- Corrected the CLI process status so `--help` and `--version` exit successfully
+  while actual argument errors continue to return status 2.
+
 ## [1.1.0] - 2026-09-29
 
 - Added bounded parallel image probing and hashing with deterministic package

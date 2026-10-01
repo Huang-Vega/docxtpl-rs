@@ -2,7 +2,8 @@
 //! python-docx 1.2.0 `docx/image/*`.
 //!
 //! - Signatures are matched in order (upstream `_ImageHeaderFactory`): PNG@0, JFIF@6, Exif@6,
-//!   GIF87a/GIF89a@0, TIFF (MM/II)@0, BMP@0; if none match, returns [`ImageError::Unrecognized`].
+//!   then a safe generic JPEG SOI/SOF marker path, GIF87a/GIF89a@0, TIFF (MM/II)@0, BMP@0;
+//!   if none match, returns [`ImageError::Unrecognized`].
 //! - Upstream truncation/missing-segment exceptions (UnexpectedEndOfFileError, KeyError, etc.)
 //!   are all collapsed into `Unrecognized` (a failed probe means the image cannot be identified).
 //! - Wherever `int(round(x))` is used, Python's banker's rounding is applied (see [`py_round`]).
@@ -109,7 +110,8 @@ pub fn py_round(x: f64) -> f64 {
 /// Parses image bytes and returns sha1, pixel dimensions, dpi, extension, and content type.
 ///
 /// Supported formats and field semantics align with python-docx 1.2.0: PNG (IHDR/pHYs chunks),
-/// JPEG (first APP0/APP1 and first SOFn, per JFIF/Exif), GIF, BMP (BITMAPINFOHEADER),
+/// JPEG (first APP0/APP1 and first SOFn per JFIF/Exif, plus generic SOI/SOF JPEGs),
+/// GIF, BMP (BITMAPINFOHEADER),
 /// TIFF (SHORT/LONG/RATIONAL entries in IFD0).
 pub fn probe(blob: &[u8]) -> Result<ImageInfo, ImageError> {
     probe_with_digest(blob).map(|(info, _)| info)
@@ -152,6 +154,18 @@ fn probe_with_sha1(blob: &[u8], sha1: String) -> Result<ImageInfo, ImageError> {
     }
     if has_signature(blob, 6, b"Exif") {
         let (px_w, px_h, dpi_x, dpi_y) = parse_jpeg(blob, JpegKind::Exif)?;
+        return Ok(ImageInfo {
+            sha1,
+            px_w,
+            px_h,
+            dpi_x,
+            dpi_y,
+            ext: "jpg",
+            content_type: "image/jpeg",
+        });
+    }
+    if has_signature(blob, 0, b"\xFF\xD8") {
+        let (px_w, px_h, dpi_x, dpi_y) = parse_jpeg(blob, JpegKind::Generic)?;
         return Ok(ImageInfo {
             sha1,
             px_w,
@@ -316,10 +330,12 @@ fn png_dpi(px_per_unit: u32, unit: u8) -> u32 {
 enum JpegKind {
     Jfif,
     Exif,
+    Generic,
 }
 
-/// Marker scan: per [`JpegKind`], take the first APP0 or APP1 and the first SOFn;
-/// a missing required marker or SOF is treated as unrecognized.
+/// Marker scan: take the first SOFn, and for compatible JFIF/Exif inputs the
+/// corresponding first APP segment. Generic JPEGs need only SOI plus a valid
+/// SOF and use the standard 72 dpi fallback.
 fn parse_jpeg(blob: &[u8], kind: JpegKind) -> Result<(u32, u32, u32, u32), ImageError> {
     let mut app0 = None;
     let mut app1 = None;
@@ -332,25 +348,32 @@ fn parse_jpeg(blob: &[u8], kind: JpegKind) -> Result<(u32, u32, u32, u32), Image
         } else {
             // Segment length = BE u16 at segment start (includes the 2 length bytes, excludes the 2 marker bytes)
             let seg_len = be_u16(blob, seg_off).ok_or(ImageError::Unrecognized)? as usize;
+            if seg_len < 2 {
+                return Err(ImageError::Unrecognized);
+            }
+            let segment_end = seg_off
+                .checked_add(seg_len)
+                .ok_or(ImageError::Unrecognized)?;
+            let segment = blob
+                .get(seg_off..segment_end)
+                .ok_or(ImageError::Unrecognized)?;
             // First APP0 (segment-relative offsets: units@9, x_density@10, y_density@12)
-            if code == 0xE0 && app0.is_none() {
-                let units = byte_at(blob, seg_off + 9).ok_or(ImageError::Unrecognized)?;
-                let x_density = be_u16(blob, seg_off + 10).ok_or(ImageError::Unrecognized)?;
-                let y_density = be_u16(blob, seg_off + 12).ok_or(ImageError::Unrecognized)?;
+            if kind == JpegKind::Jfif
+                && code == 0xE0
+                && app0.is_none()
+                && segment.get(2..6) == Some(&b"JFIF"[..])
+            {
+                let units = byte_at(segment, 9).ok_or(ImageError::Unrecognized)?;
+                let x_density = be_u16(segment, 10).ok_or(ImageError::Unrecognized)?;
+                let y_density = be_u16(segment, 12).ok_or(ImageError::Unrecognized)?;
                 app0 = Some((units, x_density, y_density));
             }
             // First APP1. python-docx returns the default 72 dpi for a non-Exif APP1,
             // and parses the rest of the payload as TIFF for `Exif\0\0`.
-            if code == 0xE1 && app1.is_none() {
-                let signature = blob.get(seg_off + 2..seg_off + 8);
+            if kind == JpegKind::Exif && code == 0xE1 && app1.is_none() {
+                let signature = segment.get(2..8);
                 let dpi = if signature == Some(&b"Exif\0\0"[..]) {
-                    let tiff_start = seg_off.checked_add(8).ok_or(ImageError::Unrecognized)?;
-                    let segment_end = seg_off
-                        .checked_add(seg_len)
-                        .ok_or(ImageError::Unrecognized)?;
-                    let tiff = blob
-                        .get(tiff_start..segment_end)
-                        .ok_or(ImageError::Unrecognized)?;
+                    let tiff = segment.get(8..).ok_or(ImageError::Unrecognized)?;
                     parse_tiff_dpi(tiff)?
                 } else {
                     (72, 72)
@@ -359,11 +382,11 @@ fn parse_jpeg(blob: &[u8], kind: JpegKind) -> Result<(u32, u32, u32, u32), Image
             }
             // First SOFn (segment-relative offsets: px_h@3, px_w@5)
             if is_sof(code) && sof.is_none() {
-                let px_h = be_u16(blob, seg_off + 3).ok_or(ImageError::Unrecognized)?;
-                let px_w = be_u16(blob, seg_off + 5).ok_or(ImageError::Unrecognized)?;
+                let px_h = be_u16(segment, 3).ok_or(ImageError::Unrecognized)?;
+                let px_w = be_u16(segment, 5).ok_or(ImageError::Unrecognized)?;
                 sof = Some((u32::from(px_w), u32::from(px_h)));
             }
-            seg_off + seg_len
+            segment_end
         };
         // EOI: end of scan; SOS: upstream marker collection stops here
         if code == 0xD9 || code == 0xDA {
@@ -379,6 +402,7 @@ fn parse_jpeg(blob: &[u8], kind: JpegKind) -> Result<(u32, u32, u32, u32), Image
             (jpeg_dpi(units, x_density), jpeg_dpi(units, y_density))
         }
         JpegKind::Exif => app1.ok_or(ImageError::Unrecognized)?,
+        JpegKind::Generic => (72, 72),
     };
     Ok((px_w, px_h, dpi_x, dpi_y))
 }
@@ -748,6 +772,56 @@ mod tests {
         assert_eq!((info.px_w, info.px_h), (4, 2));
         assert_eq!((info.dpi_x, info.dpi_y), (300, 150));
         Ok(())
+    }
+
+    #[test]
+    fn jpeg_without_jfif_or_exif_uses_sof_and_default_dpi() -> TestResult {
+        let jpeg = jpeg_with_segments(&[
+            (0xDB, vec![0; 65]),
+            (0xFE, b"camera generated".to_vec()),
+            (0xC2, sof_payload(4032, 3024)),
+        ]);
+
+        let info = probe(&jpeg)?;
+        assert_eq!((info.px_w, info.px_h), (4032, 3024));
+        assert_eq!((info.dpi_x, info.dpi_y), (72, 72));
+        assert_eq!(info.ext, "jpg");
+        assert_eq!(info.content_type, "image/jpeg");
+        Ok(())
+    }
+
+    #[test]
+    fn generic_jpeg_safely_skips_variable_length_app_segments() -> TestResult {
+        let jpeg = jpeg_with_segments(&[
+            (0xE2, b"ICC_PROFILE\0chunk".to_vec()),
+            (0xE4, vec![0x55; 257]),
+            (0xC0, sof_payload(640, 480)),
+        ]);
+
+        let info = probe(&jpeg)?;
+        assert_eq!((info.px_w, info.px_h), (640, 480));
+        assert_eq!((info.dpi_x, info.dpi_y), (72, 72));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_jpeg_rejects_truncated_and_invalid_length_segments() {
+        let truncated = vec![0xFF, 0xD8, 0xFF, 0xE2, 0x00, 0x10, 1, 2, 3];
+        assert!(matches!(probe(&truncated), Err(ImageError::Unrecognized)));
+
+        for length in [0u16, 1u16] {
+            let mut invalid = vec![0xFF, 0xD8, 0xFF, 0xE2];
+            invalid.extend_from_slice(&length.to_be_bytes());
+            invalid.extend_from_slice(&[0xFF, 0xC0]);
+            push_jpeg_segment(&mut invalid, 0xC0, &sof_payload(10, 20));
+            assert!(matches!(probe(&invalid), Err(ImageError::Unrecognized)));
+        }
+    }
+
+    #[test]
+    fn generic_jpeg_requires_a_supported_sof() {
+        let jpeg = jpeg_with_segments(&[(0xE2, b"metadata".to_vec()), (0xDB, vec![0; 65])]);
+        assert!(matches!(probe(&jpeg), Err(ImageError::Unrecognized)));
     }
 
     #[test]

@@ -56,13 +56,17 @@
 //! [`DocxTemplate`] is read-only and reusable: the file entry reopens the source path on every render, and the bytes/reader
 //! entries reopen the package from the retained original bytes; transient render state never leaks across renders.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use docxtpl_opc::{resolve_part_target, OpcError, Package, PartUri, Relationship, TargetMode};
-pub use docxtpl_opc::{MediaCompression, PackageLimits, WriteOptions};
+use docxtpl_opc::{resolve_part_target, OpcError, PartUri, Relationship, TargetMode};
+pub use docxtpl_opc::{
+    MediaCompression, Package, PackageEvictionReport, PackageLimits, PackageResidency,
+    PackageTransaction, PackageWriteReport, WriteOptions,
+};
 use docxtpl_template::{
     find_undeclared_variables, normalize_part_xml, prepare_document_xml_template,
     prepare_footnotes_xml_template, prepare_render_context, prepare_story_xml_template,
@@ -91,6 +95,10 @@ const CT_FOOTNOTES: &str =
 /// string rendering path as footnotes.
 const CT_ENDNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
+const IMAGE_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+const HYPERLINK_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 
 /// Transitional OOXML story relationship types used by python-docx/docxtpl.
 /// Match the complete URI: a custom relationship whose type merely ends in
@@ -342,7 +350,10 @@ impl DocxTemplate {
     ) -> Result<RenderedDocument, Error> {
         let options = self.effective_render_options(options);
         // Open a fresh package per render: DocxTemplate is reusable and state does not leak across renders (spec §2.2).
+        let package_open_started = Instant::now();
         let mut pkg = self.open_package()?;
+        let package_open_elapsed = package_open_started.elapsed();
+        let render_started = Instant::now();
         let main_name = pkg.main_document_uri()?.as_str().to_string();
         let context =
             RenderContext::try_from_json(context).map_err(|source| RenderError::Template {
@@ -368,7 +379,14 @@ impl DocxTemplate {
         // Validate the package once more before writing out: no dangling relationships or missing parts allowed.
         pkg.validate()?;
 
-        Ok(RenderedDocument { pkg })
+        Ok(RenderedDocument {
+            pkg,
+            edited: false,
+            max_rendered_xml_bytes: options.max_rendered_xml_bytes(),
+            package_open_elapsed,
+            render_elapsed: render_started.elapsed(),
+            postprocess_passes: Vec::new(),
+        })
     }
 
     /// Render with a rich-content context (P4, ADR-005): the context may contain RichText /
@@ -390,9 +408,16 @@ impl DocxTemplate {
     /// to pre-register external hyperlink relationships (mirroring the upstream `tpl.build_url_id` call before rendering),
     /// then call [`RenderSession::finish`] to complete the render.
     pub fn render_session(&self, options: &RenderOptions) -> Result<RenderSession, Error> {
+        let package_open_started = Instant::now();
         let pkg = self.open_package()?;
+        let package_open_elapsed = package_open_started.elapsed();
         let options = self.effective_render_options(options);
-        RenderSession::new(pkg, &options, Arc::clone(&self.render_cache))
+        RenderSession::new(
+            pkg,
+            &options,
+            Arc::clone(&self.render_cache),
+            package_open_elapsed,
+        )
     }
 
     /// Upstream `DocxTemplate.get_undeclared_template_variables()` (P7):
@@ -498,6 +523,7 @@ pub struct RenderSession {
     /// P7 media/embedded replacement registry (the replace_* family, committed at finish).
     replacements: Replacements,
     render_cache: Arc<TemplateRenderCache>,
+    package_open_elapsed: Duration,
 }
 
 impl RenderSession {
@@ -506,6 +532,7 @@ impl RenderSession {
         pkg: Package,
         options: &RenderOptions,
         render_cache: Arc<TemplateRenderCache>,
+        package_open_elapsed: Duration,
     ) -> Result<Self, Error> {
         let main_name = pkg.main_document_uri()?.as_str().to_string();
         let injections = ImageInjections::new(&pkg, &main_name)?;
@@ -515,6 +542,7 @@ impl RenderSession {
             injections,
             replacements: Replacements::new(),
             render_cache,
+            package_open_elapsed,
         })
     }
 
@@ -643,6 +671,7 @@ impl RenderSession {
     /// Renders every part (body -> headers -> footers -> core properties -> footnotes, P5),
     /// commits the media part / per-scope rels / Content Types changes, and performs final package validation.
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
+        let render_started = Instant::now();
         render_all_parts(
             &mut self.pkg,
             context,
@@ -653,7 +682,7 @@ impl RenderSession {
 
         // Write media parts first, then write back each owner's rels/CT, guaranteeing the final validation finds no dangling relationships/types.
         self.injections.apply(&mut self.pkg)?;
-        self.finish_replacements(false)
+        self.finish_replacements(false, render_started.elapsed())
     }
 
     /// Upstream "save without render" path (P7, save() L887-889): the
@@ -665,7 +694,8 @@ impl RenderSession {
     /// exit must not be mixed with [`RenderSession::build_url_id`] /
     /// [`RenderSession::new_subdoc`] (its staged/merged content must not be applied).
     pub fn finish_without_render(self) -> Result<RenderedDocument, Error> {
-        self.finish_replacements(true)
+        let render_started = Instant::now();
+        self.finish_replacements(true, render_started.elapsed())
     }
 
     /// pre_processing (replace_pic) -> CT normalization (python-docx rebuilds the CT on every save)
@@ -673,7 +703,9 @@ impl RenderSession {
     fn finish_replacements(
         mut self,
         normalize_all_known_xml_parts: bool,
+        prior_render_elapsed: Duration,
     ) -> Result<RenderedDocument, Error> {
+        let replacements_started = Instant::now();
         let main_name = self.pkg.main_document_uri()?.as_str().to_string();
         // pre_processing: swap image part blobs on the final XML (before docx.save).
         self.replacements
@@ -683,7 +715,15 @@ impl RenderSession {
         self.replacements.apply_byte_replacements(&mut self.pkg)?;
         self.pkg.validate()?;
 
-        Ok(RenderedDocument { pkg: self.pkg })
+        let max_rendered_xml_bytes = self.options.max_rendered_xml_bytes();
+        Ok(RenderedDocument {
+            pkg: self.pkg,
+            edited: false,
+            max_rendered_xml_bytes,
+            package_open_elapsed: self.package_open_elapsed,
+            render_elapsed: prior_render_elapsed.saturating_add(replacements_started.elapsed()),
+            postprocess_passes: Vec::new(),
+        })
     }
 }
 
@@ -880,6 +920,53 @@ fn story_parts(pkg: &Package, main_name: &str) -> Result<Vec<String>, Error> {
         }
     }
     Ok(parts)
+}
+
+/// Enumerate editable stories in stable body/header/footer order.
+fn editable_story_parts(
+    pkg: &Package,
+    scope: StoryScope,
+) -> Result<Vec<(String, StoryKind)>, Error> {
+    let main_name = pkg.main_document_uri()?.as_str().to_string();
+    let mut stories = Vec::new();
+    if matches!(scope, StoryScope::Body | StoryScope::BodyHeadersFooters) {
+        stories.push((main_name.clone(), StoryKind::Body));
+    }
+    if matches!(scope, StoryScope::Body) {
+        return Ok(stories);
+    }
+
+    let main_uri = PartUri::new(&main_name)?;
+    let base_dir = main_uri.parent();
+    let Some(rels) = pkg.relationships_of(&main_name) else {
+        return Ok(stories);
+    };
+    for (rel_type, kind) in [
+        (REL_TYPE_HEADER, StoryKind::Header),
+        (REL_TYPE_FOOTER, StoryKind::Footer),
+    ] {
+        for rel in rels.iter() {
+            if rel.target_mode != TargetMode::Internal || rel.rel_type != rel_type {
+                continue;
+            }
+            let Some(target) = resolve_part_target(base_dir.as_ref(), &rel.target) else {
+                continue;
+            };
+            let name = target.as_str();
+            let Some(part) = pkg.part(name) else {
+                continue;
+            };
+            if part.bytes()?.is_empty()
+                || stories
+                    .iter()
+                    .any(|(existing, _)| existing.as_str() == name)
+            {
+                continue;
+            }
+            stories.push((name.to_string(), kind));
+        }
+    }
+    Ok(stories)
 }
 
 /// Enumerate footnote and endnote parts by content type. Both are generic
@@ -1275,11 +1362,888 @@ fn unix_seconds_to_w3cdtf(seconds: u64) -> String {
 #[derive(Debug)]
 pub struct RenderedDocument {
     pkg: Package,
+    edited: bool,
+    max_rendered_xml_bytes: usize,
+    package_open_elapsed: Duration,
+    render_elapsed: Duration,
+    postprocess_passes: Vec<PassReport>,
+}
+
+/// Structured timings and ZIP metrics for one completed output write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderReport {
+    /// Time spent opening the template package for this render.
+    pub package_open_elapsed: Duration,
+    /// Time spent rendering and applying render-session replacements.
+    pub render_elapsed: Duration,
+    /// Sum of completed post-processing pass durations.
+    pub postprocess_elapsed: Duration,
+    /// Final OPC integrity validation time immediately before output.
+    pub validation_elapsed: Duration,
+    /// Final ZIP serialization time.
+    pub zip_write_elapsed: Duration,
+    /// Completed post-processing passes in execution order.
+    pub postprocess_passes: Vec<PassReport>,
+    /// Aggregate metrics from the single final ZIP serialization.
+    pub package_write: PackageWriteReport,
+}
+
+/// Which Word story parts to visit in a post-processing operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryScope {
+    /// Visit only the main document part.
+    Body,
+    /// Visit internal header and footer parts referenced by the main document.
+    HeadersFooters,
+    /// Visit the main document followed by referenced headers and footers.
+    BodyHeadersFooters,
+}
+
+/// Kind of Word story currently being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryKind {
+    /// Main document body.
+    Body,
+    /// Header part.
+    Header,
+    /// Footer part.
+    Footer,
+}
+
+/// One parsed Word story DOM.
+pub struct StoryEditor {
+    name: String,
+    kind: StoryKind,
+    document: docxtpl_xml::XmlDocument,
+    changed: bool,
+    validate_internal_links: bool,
+    external_hyperlink_rids: HashSet<String>,
+}
+
+/// A bookmark target created or found inside one Word story.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    /// Numeric `w:id` shared by `bookmarkStart` and `bookmarkEnd`.
+    pub id: String,
+    /// Unique `w:name` used by internal hyperlink anchors.
+    pub name: String,
+}
+
+impl StoryEditor {
+    /// OPC part name of this story.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Story kind, which selects the correct serialization behavior.
+    #[must_use]
+    pub const fn kind(&self) -> StoryKind {
+        self.kind
+    }
+
+    /// Read the parsed DOM without marking it for serialization.
+    #[must_use]
+    pub const fn document(&self) -> &docxtpl_xml::XmlDocument {
+        &self.document
+    }
+
+    /// Mutably access the DOM and mark this story for one final serialization.
+    pub fn document_mut(&mut self) -> &mut docxtpl_xml::XmlDocument {
+        self.changed = true;
+        &mut self.document
+    }
+
+    /// Whether mutable DOM access has requested serialization.
+    #[must_use]
+    pub const fn is_changed(&self) -> bool {
+        self.changed
+    }
+
+    /// Find a bookmark by name, or create one around `target`.
+    ///
+    /// New ids fill the first non-negative numeric gap. Names are normalized
+    /// to Word-safe characters, limited to 40 characters, and suffixed
+    /// deterministically when needed. Repeating the call with an existing
+    /// normalized name returns that bookmark without changing the DOM.
+    pub fn get_or_create_bookmark(
+        &mut self,
+        target: docxtpl_xml::NodeId,
+        preferred_name: &str,
+    ) -> Result<Bookmark, Error> {
+        self.validate_internal_links = true;
+        let starts = bookmark_starts(&self.document);
+        let base_name = normalize_bookmark_name(preferred_name);
+        if let Some((_, id, name)) = starts.iter().find(|(_, _, name)| *name == base_name) {
+            return Ok(Bookmark {
+                id: id.clone(),
+                name: name.clone(),
+            });
+        }
+
+        let used_ids: HashSet<u64> = starts
+            .iter()
+            .filter_map(|(_, id, _)| id.parse().ok())
+            .collect();
+        let mut numeric_id = 0u64;
+        while used_ids.contains(&numeric_id) {
+            numeric_id = numeric_id.saturating_add(1);
+        }
+        let used_names: HashSet<&str> = starts.iter().map(|(_, _, name)| name.as_str()).collect();
+        let name = unique_bookmark_name(&base_name, &used_names);
+        let parent = self
+            .document
+            .parent(target)
+            .ok_or_else(|| OpcError::Malformed {
+                reason: "bookmark target must be attached below the story root".to_string(),
+            })?;
+        let position = self
+            .document
+            .children(parent)
+            .iter()
+            .position(|node| *node == target)
+            .ok_or_else(|| OpcError::Malformed {
+                reason: "bookmark target is not attached to its reported parent".to_string(),
+            })?;
+        let id = numeric_id.to_string();
+        let start = self
+            .document
+            .new_w_element(
+                "bookmarkStart",
+                vec![("id".into(), id.clone()), ("name".into(), name.clone())],
+            )
+            .map_err(|error| OpcError::Malformed {
+                reason: error.to_string(),
+            })?;
+        let end = self
+            .document
+            .new_w_element("bookmarkEnd", vec![("id".into(), id.clone())])
+            .map_err(|error| OpcError::Malformed {
+                reason: error.to_string(),
+            })?;
+        self.document.insert_child_at(parent, position, start);
+        self.document.insert_child_at(parent, position + 2, end);
+        self.changed = true;
+        Ok(Bookmark { id, name })
+    }
+
+    /// Wrap `target` in an internal `w:hyperlink` to `bookmark`.
+    ///
+    /// An existing parent hyperlink with the same anchor is reused. Nesting a
+    /// hyperlink inside a different hyperlink is rejected.
+    pub fn attach_internal_link(
+        &mut self,
+        target: docxtpl_xml::NodeId,
+        bookmark: &Bookmark,
+    ) -> Result<docxtpl_xml::NodeId, Error> {
+        self.validate_internal_links = true;
+        let parent = self
+            .document
+            .parent(target)
+            .ok_or_else(|| OpcError::Malformed {
+                reason: "internal-link target must be attached below the story root".to_string(),
+            })?;
+        if is_word_element(&self.document, parent, "hyperlink") {
+            if self.document.attr(parent, docxtpl_xml::ns_uri::W, "anchor")
+                == Some(bookmark.name.as_str())
+            {
+                return Ok(parent);
+            }
+            return Err(OpcError::Malformed {
+                reason: "cannot nest an internal hyperlink inside another hyperlink".to_string(),
+            }
+            .into());
+        }
+        let position = self
+            .document
+            .children(parent)
+            .iter()
+            .position(|node| *node == target)
+            .ok_or_else(|| OpcError::Malformed {
+                reason: "internal-link target is not attached to its reported parent".to_string(),
+            })?;
+        let hyperlink = self
+            .document
+            .new_w_element("hyperlink", vec![("anchor".into(), bookmark.name.clone())])
+            .map_err(|error| OpcError::Malformed {
+                reason: error.to_string(),
+            })?;
+        self.document.insert_child_at(parent, position, hyperlink);
+        self.document.append_child(hyperlink, target);
+        self.changed = true;
+        Ok(hyperlink)
+    }
+
+    /// Attach or replace the external hyperlink on an existing `w:drawing`.
+    ///
+    /// The relationship id must be an external hyperlink relationship owned
+    /// by this story. The link is written to `wp:docPr` and every picture
+    /// `pic:cNvPr` below the drawing, matching Word's clickable-picture shape.
+    /// Repeating the call with the same id does not change the DOM.
+    pub fn attach_drawing_external_link(
+        &mut self,
+        drawing: docxtpl_xml::NodeId,
+        relationship_id: &str,
+    ) -> Result<(), Error> {
+        if !is_word_element(&self.document, drawing, "drawing") {
+            return Err(OpcError::Malformed {
+                reason: "external-link target must be a w:drawing element".to_string(),
+            }
+            .into());
+        }
+        if !self.external_hyperlink_rids.contains(relationship_id) {
+            return Err(OpcError::Malformed {
+                reason: format!(
+                    "story {:?} has no external hyperlink relationship {relationship_id:?}",
+                    self.name
+                ),
+            }
+            .into());
+        }
+        let properties: Vec<_> = self
+            .document
+            .descendants(drawing)
+            .into_iter()
+            .filter(|node| {
+                self.document.tag(*node).is_some_and(|tag| {
+                    (tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr")
+                        || (tag.ns == docxtpl_xml::ns_uri::PIC && tag.local == "cNvPr")
+                })
+            })
+            .collect();
+        if !properties.iter().any(|node| {
+            self.document
+                .tag(*node)
+                .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr")
+        }) {
+            return Err(OpcError::Malformed {
+                reason: "w:drawing has no wp:docPr element".to_string(),
+            }
+            .into());
+        }
+
+        let mut changed = false;
+        for property in properties {
+            let links: Vec<_> = self
+                .document
+                .children(property)
+                .iter()
+                .copied()
+                .filter(|node| {
+                    self.document.tag(*node).is_some_and(|tag| {
+                        tag.ns == docxtpl_xml::ns_uri::A && tag.local == "hlinkClick"
+                    })
+                })
+                .collect();
+            if links.len() > 1 {
+                return Err(OpcError::Malformed {
+                    reason: "drawing properties contain duplicate a:hlinkClick elements"
+                        .to_string(),
+                }
+                .into());
+            }
+            if let Some(link) = links.first().copied() {
+                if self.document.attr(link, docxtpl_xml::ns_uri::R, "id") != Some(relationship_id) {
+                    self.document.set_attr(
+                        link,
+                        docxtpl_xml::ns_uri::R,
+                        "id",
+                        relationship_id.to_string(),
+                    );
+                    changed = true;
+                }
+            } else {
+                let link = self
+                    .document
+                    .new_prefixed_element("a", docxtpl_xml::ns_uri::A, "hlinkClick", Vec::new())
+                    .map_err(|error| OpcError::Malformed {
+                        reason: error.to_string(),
+                    })?;
+                self.document.set_attr(
+                    link,
+                    docxtpl_xml::ns_uri::R,
+                    "id",
+                    relationship_id.to_string(),
+                );
+                self.document.append_child(property, link);
+                changed = true;
+            }
+        }
+        self.changed |= changed;
+        Ok(())
+    }
+
+    fn validate_bookmarks_and_internal_links(&self) -> Result<(), Error> {
+        let starts = bookmark_starts(&self.document);
+        let start_count = self
+            .document
+            .descendants(self.document.root())
+            .into_iter()
+            .filter(|node| is_word_element(&self.document, *node, "bookmarkStart"))
+            .count();
+        if starts.len() != start_count {
+            return Err(OpcError::Malformed {
+                reason: format!(
+                    "story {:?} has bookmarkStart without w:id or w:name",
+                    self.name
+                ),
+            }
+            .into());
+        }
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        for (_, id, name) in &starts {
+            if !ids.insert(id.as_str()) {
+                return Err(OpcError::Malformed {
+                    reason: format!(
+                        "story {:?} contains duplicate bookmark id {id:?}",
+                        self.name
+                    ),
+                }
+                .into());
+            }
+            if !names.insert(name.as_str()) {
+                return Err(OpcError::Malformed {
+                    reason: format!(
+                        "story {:?} contains duplicate bookmark name {name:?}",
+                        self.name
+                    ),
+                }
+                .into());
+            }
+        }
+        let mut end_ids = HashSet::new();
+        for node in self.document.descendants(self.document.root()) {
+            if is_word_element(&self.document, node, "bookmarkEnd") {
+                let id = self
+                    .document
+                    .attr(node, docxtpl_xml::ns_uri::W, "id")
+                    .ok_or_else(|| OpcError::Malformed {
+                        reason: format!("story {:?} has bookmarkEnd without w:id", self.name),
+                    })?;
+                if !end_ids.insert(id) || !ids.contains(id) {
+                    return Err(OpcError::Malformed {
+                        reason: format!(
+                            "story {:?} has unmatched bookmarkEnd id {id:?}",
+                            self.name
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+        if let Some(id) = ids.iter().find(|id| !end_ids.contains(**id)) {
+            return Err(OpcError::Malformed {
+                reason: format!(
+                    "story {:?} has unmatched bookmarkStart id {id:?}",
+                    self.name
+                ),
+            }
+            .into());
+        }
+        for node in self.document.descendants(self.document.root()) {
+            if is_word_element(&self.document, node, "hyperlink") {
+                if let Some(anchor) = self.document.attr(node, docxtpl_xml::ns_uri::W, "anchor") {
+                    if !names.contains(anchor) {
+                        return Err(OpcError::Malformed {
+                            reason: format!(
+                                "story {:?} has internal hyperlink to missing bookmark {anchor:?}",
+                                self.name
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_word_element(
+    document: &docxtpl_xml::XmlDocument,
+    node: docxtpl_xml::NodeId,
+    local: &str,
+) -> bool {
+    document
+        .tag(node)
+        .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == local)
+}
+
+fn bookmark_starts(
+    document: &docxtpl_xml::XmlDocument,
+) -> Vec<(docxtpl_xml::NodeId, String, String)> {
+    document
+        .descendants(document.root())
+        .into_iter()
+        .filter(|node| is_word_element(document, *node, "bookmarkStart"))
+        .filter_map(|node| {
+            Some((
+                node,
+                document
+                    .attr(node, docxtpl_xml::ns_uri::W, "id")?
+                    .to_string(),
+                document
+                    .attr(node, docxtpl_xml::ns_uri::W, "name")?
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn normalize_bookmark_name(preferred: &str) -> String {
+    let mut name: String = preferred
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    if name.is_empty() {
+        name.push_str("bookmark");
+    }
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || character == '_')
+    {
+        name.insert(0, '_');
+        name.truncate(40);
+    }
+    name
+}
+
+fn unique_bookmark_name(base: &str, used: &HashSet<&str>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    for number in 2u64.. {
+        let suffix = format!("_{number}");
+        let keep = 40usize.saturating_sub(suffix.chars().count());
+        let mut candidate: String = base.chars().take(keep).collect();
+        candidate.push_str(&suffix);
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 bookmark suffix space exhausted")
+}
+
+/// Counters from one `for_each_story` operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryEditReport {
+    /// Parts parsed into a DOM.
+    pub parsed_parts: usize,
+    /// Parts serialized after mutable access.
+    pub serialized_parts: usize,
+    /// Parts whose serialized bytes differed and were written to the transaction.
+    pub changed_parts: Vec<String>,
+}
+
+/// Behavior when a post-processing pass returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailurePolicy {
+    /// Roll back the failing pass and return its error immediately.
+    Abort,
+    /// Roll back the failing pass, record a warning, and continue the pipeline.
+    WarnAndRollback,
+}
+
+/// A recoverable post-processing warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostprocessWarning {
+    /// Name of the pass that failed.
+    pub pass: String,
+    /// Stable warning category.
+    pub code: &'static str,
+    /// Human-readable error detail.
+    pub message: String,
+}
+
+/// Result of one successfully committed or recoverably rolled-back pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    /// Caller-assigned pass name.
+    pub name: String,
+    /// Whether changes from this pass were committed.
+    pub changed: bool,
+    /// Whether attempted changes were rolled back.
+    pub rolled_back: bool,
+    /// Existing or newly-added parts touched by the pass.
+    pub touched_parts: Vec<String>,
+    /// Recoverable warnings emitted by this pass.
+    pub warnings: Vec<PostprocessWarning>,
+    /// Wall-clock duration of the pass, including rollback when applicable.
+    pub elapsed: Duration,
+}
+
+/// Aggregate result of a post-processing pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostprocessReport {
+    /// Pass reports in execution order.
+    pub passes: Vec<PassReport>,
+}
+
+/// A sequential, pass-transactional editor for one rendered document.
+pub struct PostprocessPipeline<'a> {
+    package: &'a mut Package,
+    max_rendered_xml_bytes: usize,
+    reports: Vec<PassReport>,
+}
+
+/// Transactional operations available to one post-processing pass.
+pub struct PostprocessTransaction<'transaction, 'package> {
+    transaction: &'transaction mut PackageTransaction<'package>,
+    max_rendered_xml_bytes: usize,
+    media_registry: Option<MediaRegistry>,
+}
+
+#[derive(Default)]
+struct MediaRegistry {
+    by_digest: HashMap<docxtpl_rich::ImageDigest, String>,
+    used_numbers: BTreeSet<u64>,
+}
+
+/// Result of registering an image in `word/media`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRegistration {
+    /// Package part name, such as `word/media/image3.png`.
+    pub part_name: String,
+    /// Whether the image bytes already existed in the package or this pass.
+    pub reused: bool,
+}
+
+impl PostprocessTransaction<'_, '_> {
+    /// Read a part without marking it as touched.
+    pub fn part(&self, name: &str) -> Option<&docxtpl_opc::Part> {
+        self.transaction.part(name)
+    }
+
+    /// Replace an existing part with in-memory bytes.
+    pub fn set_part_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), Error> {
+        self.transaction.set_part_bytes(name, bytes)?;
+        Ok(())
+    }
+
+    /// Replace an existing part with a verified file-backed source.
+    pub fn set_file_backed_part(
+        &mut self,
+        name: &str,
+        source: docxtpl_opc::FilePartSource,
+    ) -> Result<(), Error> {
+        self.transaction.set_file_backed_part(name, source)?;
+        Ok(())
+    }
+
+    /// Append a byte-backed part.
+    pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), Error> {
+        self.transaction.add_part(name, bytes)?;
+        Ok(())
+    }
+
+    /// Append a file-backed part.
+    pub fn add_file_backed_part(
+        &mut self,
+        name: &str,
+        source: docxtpl_opc::FilePartSource,
+    ) -> Result<(), Error> {
+        self.transaction.add_file_backed_part(name, source)?;
+        Ok(())
+    }
+
+    /// Return an existing relationship id or register a new one for `owner`.
+    pub fn relate(
+        &mut self,
+        owner: &str,
+        rel_type: &str,
+        target: &str,
+        target_mode: TargetMode,
+    ) -> Result<String, Error> {
+        Ok(self
+            .transaction
+            .get_or_add_relationship(owner, rel_type, target, target_mode)?)
+    }
+
+    /// Register or reuse an external hyperlink relationship for one story.
+    pub fn relate_external_hyperlink(&mut self, owner: &str, url: &str) -> Result<String, Error> {
+        if url.is_empty() {
+            return Err(OpcError::Malformed {
+                reason: "external hyperlink URL must not be empty".to_string(),
+            }
+            .into());
+        }
+        self.relate(owner, HYPERLINK_REL_TYPE, url, TargetMode::External)
+    }
+
+    /// Register a path-backed image as a file-backed media part.
+    ///
+    /// Existing media is deduplicated by SHA-1, while new names fill the first
+    /// available `imageN` slot deterministically. Content Types are updated in
+    /// the same transaction.
+    pub fn register_media_path(&mut self, path: &str) -> Result<MediaRegistration, Error> {
+        let image = InlineImage::from_path_lazy(path, None, None, None)?;
+        let (info, digest) = image.probe_with_digest()?;
+        if self.media_registry.is_none() {
+            let mut registry = MediaRegistry::default();
+            for part in self.transaction.package().parts() {
+                if !part.name().starts_with("word/media/") {
+                    continue;
+                }
+                registry
+                    .by_digest
+                    .entry(docxtpl_rich::sha1_digest(part.bytes()?))
+                    .or_insert_with(|| part.name().to_string());
+                if let Some(number) = images::image_number(part.name()) {
+                    registry.used_numbers.insert(number);
+                }
+            }
+            self.media_registry = Some(registry);
+        }
+        let registry = self.media_registry.as_mut().expect("initialized above");
+        if let Some(part_name) = registry.by_digest.get(&digest) {
+            return Ok(MediaRegistration {
+                part_name: part_name.clone(),
+                reused: true,
+            });
+        }
+
+        let mut number = 1u64;
+        while registry.used_numbers.contains(&number) {
+            number = number.saturating_add(1);
+        }
+        let part_name = format!("word/media/image{number}.{}", info.ext);
+        let source = docxtpl_opc::FilePartSource::snapshot_with_digest(path, digest)?;
+        self.transaction.add_file_backed_part(&part_name, source)?;
+        self.transaction
+            .register_content_type(&part_name, info.content_type)?;
+        registry.used_numbers.insert(number);
+        registry.by_digest.insert(digest, part_name.clone());
+        Ok(MediaRegistration {
+            part_name,
+            reused: false,
+        })
+    }
+
+    /// Relate an owner part to registered image media, reusing an exact
+    /// existing relationship when present.
+    pub fn relate_image(
+        &mut self,
+        owner: &str,
+        media: &MediaRegistration,
+    ) -> Result<String, Error> {
+        let target = images::relative_to_owner(owner, &media.part_name);
+        self.relate(owner, IMAGE_REL_TYPE, &target, TargetMode::Internal)
+    }
+
+    /// Validate the current pass state before it is committed.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.transaction.validate()?;
+        Ok(())
+    }
+
+    /// Parse each selected story once, run all caller edits on its shared DOM,
+    /// and serialize that story at most once.
+    pub fn for_each_story(
+        &mut self,
+        scope: StoryScope,
+        mut edit: impl FnMut(&mut StoryEditor) -> Result<(), Error>,
+    ) -> Result<StoryEditReport, Error> {
+        let stories = editable_story_parts(self.transaction.package(), scope)?;
+        let mut report = StoryEditReport::default();
+        for (name, kind) in stories {
+            let external_hyperlink_rids = self
+                .transaction
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == HYPERLINK_REL_TYPE
+                        && relationship.target_mode == TargetMode::External
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let bytes = self
+                .transaction
+                .part(&name)
+                .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                .bytes()?;
+            let xml = decode_xml_bytes(bytes, &name)?;
+            let document =
+                docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
+                    .map_err(|source| RenderError::Xml {
+                        part: name.clone(),
+                        source,
+                    })?;
+            report.parsed_parts += 1;
+            let mut story = StoryEditor {
+                name: name.clone(),
+                kind,
+                document,
+                changed: false,
+                validate_internal_links: false,
+                external_hyperlink_rids,
+            };
+            edit(&mut story)?;
+            if story.validate_internal_links {
+                story.validate_bookmarks_and_internal_links()?;
+            }
+            if !story.changed {
+                continue;
+            }
+            let serialized = match kind {
+                StoryKind::Body => story.document.try_serialize(self.max_rendered_xml_bytes),
+                StoryKind::Header | StoryKind::Footer => story
+                    .document
+                    .try_serialize_story(self.max_rendered_xml_bytes),
+            }
+            .map_err(|_| RenderError::Limit {
+                part: name.clone(),
+                kind: "rendered_xml_bytes",
+                max: self.max_rendered_xml_bytes as u64,
+            })?;
+            report.serialized_parts += 1;
+            if serialized.as_bytes() != bytes {
+                self.transaction
+                    .set_part_bytes(&name, serialized.into_bytes())?;
+                report.changed_parts.push(name);
+            }
+        }
+        Ok(report)
+    }
+}
+
+impl PostprocessPipeline<'_> {
+    /// Execute one pass in an isolated package transaction.
+    pub fn pass(
+        &mut self,
+        name: impl Into<String>,
+        policy: FailurePolicy,
+        pass: impl FnOnce(&mut PostprocessTransaction<'_, '_>) -> Result<(), Error>,
+    ) -> Result<&mut Self, Error> {
+        let name = name.into();
+        let started = Instant::now();
+        let mut transaction = self.package.transaction();
+        let result = {
+            let mut postprocess = PostprocessTransaction {
+                transaction: &mut transaction,
+                max_rendered_xml_bytes: self.max_rendered_xml_bytes,
+                media_registry: None,
+            };
+            pass(&mut postprocess)
+        };
+        match result {
+            Ok(_) => {
+                let changed = transaction.changed();
+                let touched_parts = transaction.touched_parts();
+                transaction.commit();
+                self.reports.push(PassReport {
+                    name,
+                    changed,
+                    rolled_back: false,
+                    touched_parts,
+                    warnings: Vec::new(),
+                    elapsed: started.elapsed(),
+                });
+                Ok(self)
+            }
+            Err(error) => {
+                let touched_parts = transaction.touched_parts();
+                transaction.rollback();
+                match policy {
+                    FailurePolicy::Abort => Err(error),
+                    FailurePolicy::WarnAndRollback => {
+                        let warning = PostprocessWarning {
+                            pass: name.clone(),
+                            code: "pass_rolled_back",
+                            message: error.to_string(),
+                        };
+                        self.reports.push(PassReport {
+                            name,
+                            changed: false,
+                            rolled_back: true,
+                            touched_parts,
+                            warnings: vec![warning],
+                            elapsed: started.elapsed(),
+                        });
+                        Ok(self)
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl RenderedDocument {
+    /// Return current package part-buffer residency without materializing
+    /// additional parts.
+    #[must_use]
+    pub fn residency(&self) -> PackageResidency {
+        self.pkg.residency()
+    }
+
+    /// Release clean lazy part buffers that remain reloadable from the source
+    /// template ZIP.
+    pub fn evict_clean_part_caches(&mut self) -> PackageEvictionReport {
+        self.pkg.evict_clean_part_caches()
+    }
+
+    /// Run a sequence of rollback-capable post-processing passes.
+    ///
+    /// Successfully completed passes remain committed. A failing pass always
+    /// rolls back its own changes; [`FailurePolicy`] controls whether the
+    /// pipeline aborts or records a warning and continues.
+    pub fn postprocess(
+        &mut self,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
+    ) -> Result<PostprocessReport, Error> {
+        self.edited = true;
+        let mut pipeline = PostprocessPipeline {
+            package: &mut self.pkg,
+            max_rendered_xml_bytes: self.max_rendered_xml_bytes,
+            reports: Vec::new(),
+        };
+        let result = configure(&mut pipeline);
+        let reports = std::mem::take(&mut pipeline.reports);
+        drop(pipeline);
+        self.postprocess_passes.extend(reports.clone());
+        result?;
+        Ok(PostprocessReport { passes: reports })
+    }
+
+    /// Edit the rendered OPC package before its final serialization.
+    ///
+    /// The document is marked as edited before the callback runs, including
+    /// when the callback returns an error after making partial changes. Every
+    /// subsequent output operation revalidates package integrity first.
+    /// This low-level entry point does not provide rollback; use a transactional
+    /// post-processing pipeline when pass-level rollback is required.
+    pub fn edit_package<T>(
+        &mut self,
+        edit: impl FnOnce(&mut Package) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.edited = true;
+        edit(&mut self.pkg)
+    }
+
+    /// Whether the rendered package has entered the explicit editing path.
+    #[must_use]
+    pub const fn is_edited(&self) -> bool {
+        self.edited
+    }
+
+    fn validate_for_output(&self) -> Result<(), Error> {
+        self.pkg.validate()?;
+        Ok(())
+    }
+
     /// Save to a file (unchanged parts keep their original bytes, see ADR-002 DEV-0004).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        self.validate_for_output()?;
         self.pkg.save(path)?;
         Ok(())
     }
@@ -1290,12 +2254,66 @@ impl RenderedDocument {
         path: impl AsRef<Path>,
         options: &WriteOptions,
     ) -> Result<(), Error> {
+        self.validate_for_output()?;
         self.pkg.save_with_options(path, options)?;
         Ok(())
     }
 
+    /// Validate and save the document while returning structured render and
+    /// ZIP serialization metrics.
+    pub fn save_with_report(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+    ) -> Result<RenderReport, Error> {
+        let validation_started = Instant::now();
+        self.pkg.validate()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self.pkg.save_with_report(path, options)?;
+        let zip_write_elapsed = write_started.elapsed();
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
+    /// Validate and write to a seekable stream while returning structured metrics.
+    pub fn write_to_with_report(
+        &self,
+        writer: impl Write + std::io::Seek,
+        options: &WriteOptions,
+    ) -> Result<RenderReport, Error> {
+        let validation_started = Instant::now();
+        self.pkg.validate()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self.pkg.write_to_with_report(writer, options)?;
+        let zip_write_elapsed = write_started.elapsed();
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
+    fn render_report(
+        &self,
+        validation_elapsed: Duration,
+        zip_write_elapsed: Duration,
+        package_write: PackageWriteReport,
+    ) -> RenderReport {
+        RenderReport {
+            package_open_elapsed: self.package_open_elapsed,
+            render_elapsed: self.render_elapsed,
+            postprocess_elapsed: self
+                .postprocess_passes
+                .iter()
+                .map(|pass| pass.elapsed)
+                .sum(),
+            validation_elapsed,
+            zip_write_elapsed,
+            postprocess_passes: self.postprocess_passes.clone(),
+            package_write,
+        }
+    }
+
     /// Write to any seekable writer.
     pub fn write_to(&self, writer: impl Write + std::io::Seek) -> Result<(), Error> {
+        self.validate_for_output()?;
         self.pkg.write_to(writer)?;
         Ok(())
     }
@@ -1306,12 +2324,14 @@ impl RenderedDocument {
         writer: impl Write + std::io::Seek,
         options: &WriteOptions,
     ) -> Result<(), Error> {
+        self.validate_for_output()?;
         self.pkg.write_to_with_options(writer, options)?;
         Ok(())
     }
 
     /// Serialize to in-memory docx bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.validate_for_output()?;
         let mut buf = Cursor::new(Vec::new());
         self.pkg.write_to(&mut buf)?;
         Ok(buf.into_inner())
@@ -1319,6 +2339,7 @@ impl RenderedDocument {
 
     /// Serialize to in-memory DOCX bytes using explicit ZIP options.
     pub fn to_bytes_with_options(&self, options: &WriteOptions) -> Result<Vec<u8>, Error> {
+        self.validate_for_output()?;
         let mut buf = Cursor::new(Vec::new());
         self.pkg.write_to_with_options(&mut buf, options)?;
         Ok(buf.into_inner())
@@ -1372,6 +2393,10 @@ pub enum Error {
     /// File IO error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// A path-backed image could not be loaded or recognized.
+    #[error(transparent)]
+    InlineImage(#[from] docxtpl_rich::InlineImageLoadError),
 }
 
 pub use docxtpl_rich::{InlineImage, Listing, RichText, RichTextParagraph, RichTextProps};

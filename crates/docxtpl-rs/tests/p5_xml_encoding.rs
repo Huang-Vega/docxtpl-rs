@@ -1,5 +1,7 @@
 //! Python/lxml accepts BOM-tagged Unicode XmlPart inputs and serializes them as UTF-8.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -158,8 +160,7 @@ fn zip_part(docx: &[u8], name: &str) -> Vec<u8> {
 }
 
 fn render_encoded_variant(encodings: [WireEncoding; 4], marker: &str) -> Vec<u8> {
-    let target = root().join("target");
-    std::fs::create_dir_all(&target).expect("create project target");
+    let target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p5-xml-encoding-")
         .tempdir_in(target)
@@ -285,8 +286,7 @@ fn utf8_bom_xml_parts_render_and_drop_the_bom() {
 }
 
 fn render_invalid_document(prefix: &str, transform: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Error {
-    let target = root().join("target");
-    std::fs::create_dir_all(&target).expect("create project target");
+    let target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(target)
@@ -373,8 +373,7 @@ fn utf8_bytes_with_a_wide_encoding_declaration_are_rejected() {
 
 #[test]
 fn footnotes_remain_utf8_only_like_upstream_generic_parts() {
-    let target = root().join("target");
-    std::fs::create_dir_all(&target).expect("create project target");
+    let target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p5-footnotes-utf16-")
         .tempdir_in(target)

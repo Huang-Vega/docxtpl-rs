@@ -1979,7 +1979,7 @@ def main():
             "expected": EXPECTED_OVERRIDES.get(fx["id"], "ok"),
             "allowed_normalizations": [],
             "known_deviations": [],
-            "owner": "vegah",
+            "owner": "docxtpl-rs",
             "issue": "",
         }
         # P7: emit the field only when True (both runner/oracle sides treat

@@ -1,5 +1,7 @@
 //! Non-oracle branch regressions for the P7 replacement family and picture map.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -263,7 +265,7 @@ fn one_template_can_render_multiple_independent_outputs() {
 
 #[test]
 fn reusable_path_template_invalidates_preprocessing_when_source_changes() {
-    let workspace_target = root().join("target");
+    let workspace_target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("render-cache-invalidation-")
         .tempdir_in(workspace_target)
@@ -337,7 +339,7 @@ fn unmatched_byte_replacements_are_silent() {
 
 #[test]
 fn replace_pic_matches_description() {
-    let workspace_target = root().join("target");
+    let workspace_target = test_support::target_dir();
     let dir = tempfile::Builder::new()
         .prefix("p7-descr-")
         .tempdir_in(workspace_target)

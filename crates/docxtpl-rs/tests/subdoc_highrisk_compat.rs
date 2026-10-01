@@ -4,6 +4,8 @@
 //! The fixtures are assembled at runtime so every assertion is about one
 //! isolated package behavior rather than an opaque checked-in binary.
 
+mod test_support;
+
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -52,7 +54,7 @@ fn sub_fixture() -> PathBuf {
 fn tempdir(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create temporary directory below the project target directory")
 }
 

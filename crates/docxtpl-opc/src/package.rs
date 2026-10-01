@@ -13,8 +13,8 @@ use zip::CompressionMethod;
 use crate::content_types::ContentTypes;
 use crate::error::OpcError;
 use crate::limits::PackageLimits;
-use crate::part::{LazyArchive, Part};
-use crate::rels::{Relationships, TargetMode};
+use crate::part::{FilePartSource, LazyArchive, Part};
+use crate::rels::{Relationship, Relationships, TargetMode};
 use crate::uri::{
     collapse_segments, is_rels_path, owner_of_rels_path, percent_decode, rels_path_for,
     resolve_relative_to, PartUri,
@@ -44,6 +44,59 @@ pub enum MediaCompression {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteOptions {
     media_compression: MediaCompression,
+}
+
+/// Aggregate metrics from one OPC ZIP serialization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageWriteReport {
+    /// Total entries written, including directory entries.
+    pub total_parts: usize,
+    /// Entries copied from the source ZIP without decompression/recompression.
+    pub raw_copied_parts: usize,
+    /// Compressed source bytes passed through raw-copy.
+    pub raw_copied_compressed_bytes: u64,
+    /// Uncompressed size represented by raw-copied entries.
+    pub raw_copied_uncompressed_bytes: u64,
+    /// Entries serialized through the normal writer path.
+    pub rewritten_parts: usize,
+    /// Source content bytes supplied to rewritten ZIP entries.
+    pub rewritten_source_bytes: u64,
+    /// Parts backed by external files when serialization began.
+    pub file_backed_parts: usize,
+    /// Parts already resident in memory when serialization began.
+    pub loaded_parts: usize,
+    /// Bytes resident in part-content buffers when serialization began.
+    pub resident_bytes: u64,
+    /// Parts marked modified when serialization began.
+    pub modified_parts: usize,
+    /// Final ZIP stream length.
+    pub output_bytes: u64,
+}
+
+/// Point-in-time memory residency of package part contents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageResidency {
+    /// Parts whose content bytes are currently resident.
+    pub resident_parts: usize,
+    /// Bytes held by resident part-content buffers.
+    pub resident_bytes: u64,
+    /// Resident clean lazy parts reloadable from the source ZIP.
+    pub evictable_parts: usize,
+    /// Bytes that [`Package::evict_clean_part_caches`] can currently release.
+    pub evictable_bytes: u64,
+}
+
+/// Result of one clean-part cache eviction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageEvictionReport {
+    /// Residency immediately before eviction.
+    pub before: PackageResidency,
+    /// Residency immediately after eviction.
+    pub after: PackageResidency,
+    /// Number of lazy part caches cleared.
+    pub evicted_parts: usize,
+    /// Bytes released from lazy part caches.
+    pub evicted_bytes: u64,
 }
 
 impl WriteOptions {
@@ -83,7 +136,104 @@ pub struct Package {
     root_rels: Relationships,
 }
 
+/// A rollback-capable mutation scope over an OPC package.
+///
+/// Only parts touched through this value are snapshotted. Unmodified lazy and
+/// file-backed parts are neither materialized nor cloned. Dropping an
+/// uncommitted transaction rolls it back automatically.
+pub struct PackageTransaction<'a> {
+    package: &'a mut Package,
+    original_part_count: usize,
+    backups: HashMap<String, Part>,
+    original_content_types: Option<ContentTypes>,
+    original_root_rels: Option<Relationships>,
+    committed: bool,
+}
+
 impl Package {
+    /// Start a rollback-capable package mutation scope.
+    pub fn transaction(&mut self) -> PackageTransaction<'_> {
+        let original_part_count = self.parts.len();
+        PackageTransaction {
+            package: self,
+            original_part_count,
+            backups: HashMap::new(),
+            original_content_types: None,
+            original_root_rels: None,
+            committed: false,
+        }
+    }
+
+    fn check_mutation_limits(
+        &self,
+        replaced_index: Option<usize>,
+        new_len: u64,
+    ) -> Result<(), OpcError> {
+        if replaced_index.is_none() && self.parts.len() >= self.limits.max_entries {
+            return Err(OpcError::LimitExceeded {
+                kind: "entries",
+                value: self.parts.len().saturating_add(1) as u64,
+                max: self.limits.max_entries as u64,
+            });
+        }
+        if new_len > self.limits.max_entry_uncompressed {
+            return Err(OpcError::LimitExceeded {
+                kind: "entry_uncompressed",
+                value: new_len,
+                max: self.limits.max_entry_uncompressed,
+            });
+        }
+        let mut total = 0u64;
+        for (index, part) in self.parts.iter().enumerate() {
+            if Some(index) != replaced_index {
+                total = total.saturating_add(part.content_len()?);
+            }
+        }
+        total = total.saturating_add(new_len);
+        if total > self.limits.max_total_uncompressed {
+            return Err(OpcError::LimitExceeded {
+                kind: "total_uncompressed",
+                value: total,
+                max: self.limits.max_total_uncompressed,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return exact current residency of part-content buffers.
+    #[must_use]
+    pub fn residency(&self) -> PackageResidency {
+        PackageResidency {
+            resident_parts: self.parts.iter().filter(|part| part.is_loaded()).count(),
+            resident_bytes: self.parts.iter().map(Part::resident_len).sum(),
+            evictable_parts: self.parts.iter().filter(|part| part.is_evictable()).count(),
+            evictable_bytes: self.parts.iter().map(Part::evictable_len).sum(),
+        }
+    }
+
+    /// Release buffers of clean lazy parts that can be read again from the
+    /// still-open source ZIP.
+    ///
+    /// Modified, in-memory-created, directory, and file-backed parts are never
+    /// evicted. Reader-backed packages therefore produce a no-op report.
+    pub fn evict_clean_part_caches(&mut self) -> PackageEvictionReport {
+        let before = self.residency();
+        let mut evicted_parts = 0;
+        let mut evicted_bytes = 0u64;
+        for part in &mut self.parts {
+            if let Some(bytes) = part.evict_clean_cache() {
+                evicted_parts += 1;
+                evicted_bytes = evicted_bytes.saturating_add(bytes);
+            }
+        }
+        PackageEvictionReport {
+            before,
+            after: self.residency(),
+            evicted_parts,
+            evicted_bytes,
+        }
+    }
+
     /// Open an OPC package from a file.
     ///
     /// # Failure cases
@@ -296,7 +446,7 @@ impl Package {
                     uri,
                     Arc::clone(source),
                     entry_number,
-                    limits.max_entry_uncompressed,
+                    declared,
                     is_dir,
                     compression,
                     last_modified,
@@ -467,6 +617,7 @@ impl Package {
                 uri: name.to_string(),
             });
         };
+        self.check_mutation_limits(Some(index), bytes.len() as u64)?;
         let xml = String::from_utf8_lossy(&bytes).into_owned();
         if name == "[Content_Types].xml" {
             self.content_types = ContentTypes::parse(&xml)?;
@@ -577,6 +728,7 @@ impl Package {
     /// # Ok::<(), docxtpl_opc::OpcError>(())
     /// ```
     pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), OpcError> {
+        self.check_mutation_limits(None, bytes.len() as u64)?;
         let uri = PartUri::new(name)?;
         if self.index.contains_key(name) {
             return Err(OpcError::DuplicateEntry {
@@ -607,6 +759,7 @@ impl Package {
         modified: Option<std::time::SystemTime>,
         digest: [u8; 20],
     ) -> Result<(), OpcError> {
+        self.check_mutation_limits(None, len)?;
         let uri = PartUri::new(name)?;
         if self.index.contains_key(name) {
             return Err(OpcError::DuplicateEntry {
@@ -622,6 +775,68 @@ impl Package {
             modified,
             digest,
         ));
+        Ok(())
+    }
+
+    /// Append a file-backed part from a verified source snapshot.
+    ///
+    /// This is the high-level counterpart to [`Self::add_file_backed_part`];
+    /// it keeps snapshot collection in one place and still verifies the file
+    /// again while writing the ZIP.
+    pub fn add_file_backed_part_source(
+        &mut self,
+        name: &str,
+        source: FilePartSource,
+    ) -> Result<(), OpcError> {
+        self.check_mutation_limits(None, source.len())?;
+        let uri = PartUri::new(name)?;
+        if self.index.contains_key(name) {
+            return Err(OpcError::DuplicateEntry {
+                uri: name.to_string(),
+                scope: "exact",
+            });
+        }
+        let (path, len, modified, digest) = source.into_parts();
+        self.index.insert(name.to_string(), self.parts.len());
+        self.parts
+            .push(Part::new_file_backed(uri, path, len, modified, digest));
+        Ok(())
+    }
+
+    /// Replace an existing part with a verified file-backed source.
+    ///
+    /// Relationship and Content Types parts are parsed before mutation so the
+    /// package's derived views stay synchronized. Ordinary binary parts remain
+    /// unmaterialized until explicitly read and are streamed during ZIP output.
+    pub fn set_file_backed_part(
+        &mut self,
+        name: &str,
+        source: FilePartSource,
+    ) -> Result<(), OpcError> {
+        let Some(&index) = self.index.get(name) else {
+            return Err(OpcError::PartNotFound {
+                uri: name.to_string(),
+            });
+        };
+        self.check_mutation_limits(Some(index), source.len())?;
+
+        if name == "[Content_Types].xml" {
+            let bytes = source.read_verified()?;
+            let xml = String::from_utf8_lossy(&bytes);
+            self.content_types = ContentTypes::parse(&xml)?;
+        } else if name == "_rels/.rels" {
+            let bytes = source.read_verified()?;
+            let xml = String::from_utf8_lossy(&bytes);
+            self.root_rels = Relationships::parse_in(&xml, name)?;
+        } else if let Some(owner) = owner_of_rels_path(self.parts[index].uri()) {
+            if let Some(&owner_index) = self.index.get(&owner) {
+                let bytes = source.read_verified()?;
+                let xml = String::from_utf8_lossy(&bytes);
+                let rels = Relationships::parse_in(&xml, name)?;
+                self.parts[owner_index].set_relationships(rels);
+            }
+        }
+        self.parts[index].replace_file_backed(source);
         Ok(())
     }
 
@@ -776,11 +991,10 @@ impl Package {
 
     /// Save to a file.
     ///
-    /// For a new path, the ZIP is first streamed to a temporary file in the
-    /// same directory and then atomically persisted; an existing path is
-    /// truncated and written directly, to stay compatible with a target handle
-    /// on Windows that the caller still holds open. See
-    /// [`Package::write_to`] for write details.
+    /// The ZIP is streamed to a temporary file in the destination directory,
+    /// flushed to storage, and then atomically persisted over the destination.
+    /// A validation or write failure leaves an existing destination unchanged.
+    /// See [`Package::write_to`] for write details.
     ///
     /// # Failure cases
     ///
@@ -805,33 +1019,22 @@ impl Package {
         path: impl AsRef<Path>,
         options: &WriteOptions,
     ) -> Result<(), OpcError> {
+        self.save_with_report(path, options).map(|_| ())
+    }
+
+    /// Save to a file and return aggregate ZIP serialization metrics.
+    pub fn save_with_report(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+    ) -> Result<PackageWriteReport, OpcError> {
         let path = path.as_ref();
+        self.validate()?;
         let overwrites_source = self
             .source_path
             .as_ref()
             .zip(std::fs::canonicalize(path).ok().as_ref())
             .is_some_and(|(source, target)| source == target);
-        if overwrites_source {
-            // Windows cannot reliably use rename to overwrite a source file
-            // that is still open. Materialize all parts first, then close the
-            // lazy backend and write with truncation; only same-path saves pay
-            // this memory cost.
-            for part in &self.parts {
-                part.bytes()?;
-            }
-            if let Some(source) = &self.source {
-                source.close()?;
-            }
-            return self.write_to_with_options(std::fs::File::create(path)?, options);
-        }
-        if path.exists() && !overwrites_source {
-            // On Windows the target may still be held open by the caller (a
-            // NamedTempFile, for example), so rename/persist cannot replace it;
-            // a direct truncated write still keeps the streaming memory
-            // profile. Brand-new file paths go through the same-directory
-            // temporary file below so a failure never leaves a truncated file.
-            return self.write_to_with_options(std::fs::File::create(path)?, options);
-        }
         let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
         let mut temporary = match parent {
             Some(parent) => tempfile::NamedTempFile::new_in(parent)?,
@@ -841,11 +1044,27 @@ impl Package {
         // in-memory copy of `max_output_size` scale. The temporary file lives
         // in the same directory and is persisted only on success, so a write
         // failure never leaves a truncated target document.
-        self.write_to_with_options(temporary.as_file_mut(), options)?;
-        temporary
-            .persist(path)
-            .map_err(|error| OpcError::Io(error.error))?;
-        Ok(())
+        let report = self.write_to_with_report(temporary.as_file_mut(), options)?;
+        temporary.as_file_mut().sync_all()?;
+        if overwrites_source {
+            if let Some(source) = &self.source {
+                source.close()?;
+            }
+        }
+        if let Err(error) = temporary.persist(path) {
+            if overwrites_source {
+                if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
+                    let _ = source.reopen(source_path);
+                }
+            }
+            return Err(OpcError::Io(error.error));
+        }
+        if overwrites_source {
+            if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
+                source.reopen(source_path)?;
+            }
+        }
+        Ok(report)
     }
 
     /// Write to any seekable writer stream.
@@ -886,15 +1105,26 @@ impl Package {
         mut writer: impl Write + Seek,
         options: &WriteOptions,
     ) -> Result<(), OpcError> {
+        self.write_to_with_report(&mut writer, options).map(|_| ())
+    }
+
+    /// Write to a seekable stream and return aggregate ZIP serialization metrics.
+    pub fn write_to_with_report(
+        &self,
+        mut writer: impl Write + Seek,
+        options: &WriteOptions,
+    ) -> Result<PackageWriteReport, OpcError> {
+        self.validate()?;
         let max = self.limits.max_output_size;
         let mut limited = CountingWriter::new(&mut writer, max);
         let result = write_zip(&self.parts, self.source.as_deref(), &mut limited, options);
         let exceeded = limited.exceeded();
         let attempted = limited.attempted();
         match result {
-            Ok(()) => {
+            Ok(mut report) => {
                 limited.flush()?;
-                Ok(())
+                report.output_bytes = limited.position();
+                Ok(report)
             }
             Err(err) => {
                 if exceeded {
@@ -950,6 +1180,215 @@ impl Package {
     }
 }
 
+impl PackageTransaction<'_> {
+    /// Read the package's current transactional state.
+    ///
+    /// Mutations are intentionally available only through transaction methods
+    /// so they can participate in rollback.
+    pub fn package(&self) -> &Package {
+        self.package
+    }
+
+    /// Read a part without marking it as touched.
+    pub fn part(&self, name: &str) -> Option<&Part> {
+        self.package.part(name)
+    }
+
+    /// Whether this transaction has changed or added any part.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        !self.backups.is_empty() || self.package.parts.len() != self.original_part_count
+    }
+
+    /// Names of existing parts snapshotted by this transaction, in sorted order.
+    pub fn touched_parts(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.backups.keys().cloned().collect();
+        names.extend(
+            self.package.parts[self.original_part_count..]
+                .iter()
+                .map(|part| part.name().to_string()),
+        );
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn backup_part(&mut self, name: &str) -> Result<(), OpcError> {
+        let Some(&index) = self.package.index.get(name) else {
+            return Err(OpcError::PartNotFound {
+                uri: name.to_string(),
+            });
+        };
+        if index < self.original_part_count && !self.backups.contains_key(name) {
+            self.backups
+                .insert(name.to_string(), self.package.parts[index].clone());
+        }
+        Ok(())
+    }
+
+    fn backup_derived_views(&mut self, name: &str) -> Result<(), OpcError> {
+        if name == "[Content_Types].xml" && self.original_content_types.is_none() {
+            self.original_content_types = Some(self.package.content_types.clone());
+        } else if name == "_rels/.rels" && self.original_root_rels.is_none() {
+            self.original_root_rels = Some(self.package.root_rels.clone());
+        } else if let Some(index) = self.package.index.get(name).copied() {
+            if let Some(owner) = owner_of_rels_path(self.package.parts[index].uri()) {
+                if self.package.index.contains_key(&owner) {
+                    self.backup_part(&owner)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace an existing part and include it in this transaction's undo log.
+    pub fn set_part_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), OpcError> {
+        self.backup_part(name)?;
+        self.backup_derived_views(name)?;
+        self.package.set_part_bytes(name, bytes)
+    }
+
+    /// Replace an existing part with a file-backed source and journal the old part.
+    pub fn set_file_backed_part(
+        &mut self,
+        name: &str,
+        source: FilePartSource,
+    ) -> Result<(), OpcError> {
+        self.backup_part(name)?;
+        self.backup_derived_views(name)?;
+        self.package.set_file_backed_part(name, source)
+    }
+
+    /// Append a byte-backed part inside this transaction.
+    pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), OpcError> {
+        self.package.add_part(name, bytes)
+    }
+
+    /// Append a file-backed part inside this transaction.
+    pub fn add_file_backed_part(
+        &mut self,
+        name: &str,
+        source: FilePartSource,
+    ) -> Result<(), OpcError> {
+        self.package.add_file_backed_part_source(name, source)
+    }
+
+    /// Return an existing matching relationship or append a deterministically
+    /// allocated relationship to `owner`.
+    ///
+    /// The owner's `.rels` part and its parsed relationship view participate
+    /// in this transaction and are restored together on rollback.
+    pub fn get_or_add_relationship(
+        &mut self,
+        owner: &str,
+        rel_type: &str,
+        target: &str,
+        target_mode: TargetMode,
+    ) -> Result<String, OpcError> {
+        let owner_index =
+            self.package
+                .index
+                .get(owner)
+                .copied()
+                .ok_or_else(|| OpcError::PartNotFound {
+                    uri: owner.to_string(),
+                })?;
+        let mut relationships = self.package.parts[owner_index]
+            .relationships()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(existing) = relationships.find_matching(rel_type, target, target_mode) {
+            return Ok(existing.id.clone());
+        }
+
+        let id = relationships.next_r_id();
+        relationships.push(Relationship {
+            id: id.clone(),
+            rel_type: rel_type.to_string(),
+            target: target.to_string(),
+            target_mode,
+        });
+        let rels_path = rels_path_for(self.package.parts[owner_index].uri());
+        let bytes = relationships.to_xml().into_bytes();
+        if self.package.contains(&rels_path) {
+            self.set_part_bytes(&rels_path, bytes)?;
+        } else {
+            self.backup_part(owner)?;
+            self.package.parts[owner_index].set_relationships(relationships);
+            self.add_part(&rels_path, bytes)?;
+        }
+        Ok(id)
+    }
+
+    /// Ensure a part resolves to `content_type`, adding a Default when safe
+    /// and otherwise a part-specific Override.
+    pub fn register_content_type(
+        &mut self,
+        part_name: &str,
+        content_type: &str,
+    ) -> Result<(), OpcError> {
+        let uri = PartUri::new(part_name)?;
+        if self.package.content_types.content_type_of(&uri) == Some(content_type) {
+            return Ok(());
+        }
+        let extension = uri
+            .file_name()
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+            .unwrap_or("");
+        let mut types = self.package.content_types.clone();
+        if !extension.is_empty() && !types.has_default(extension) {
+            types.add_default(extension, content_type);
+        } else {
+            types.add_override(part_name, content_type);
+        }
+        self.set_part_bytes("[Content_Types].xml", types.to_xml().into_bytes())
+    }
+
+    /// Validate the package's current transactional state.
+    pub fn validate(&self) -> Result<(), OpcError> {
+        self.package.validate()
+    }
+
+    /// Commit all changes and discard the undo log.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Roll back all changes made through this transaction.
+    pub fn rollback(mut self) {
+        self.restore();
+        self.committed = true;
+    }
+
+    fn restore(&mut self) {
+        self.package.parts.truncate(self.original_part_count);
+        for (name, part) in self.backups.drain() {
+            if let Some(&index) = self.package.index.get(&name) {
+                self.package.parts[index] = part;
+            }
+        }
+        self.package.index.clear();
+        for (index, part) in self.package.parts.iter().enumerate() {
+            self.package.index.insert(part.name().to_string(), index);
+        }
+        if let Some(content_types) = self.original_content_types.take() {
+            self.package.content_types = content_types;
+        }
+        if let Some(root_rels) = self.original_root_rels.take() {
+            self.package.root_rels = root_rels;
+        }
+    }
+}
+
+impl Drop for PackageTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.restore();
+        }
+    }
+}
+
 impl std::fmt::Debug for Package {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Package")
@@ -989,6 +1428,10 @@ impl<W> CountingWriter<W> {
 
     fn attempted(&self) -> u64 {
         self.attempted
+    }
+
+    fn position(&self) -> u64 {
+        self.pos
     }
 }
 
@@ -1048,7 +1491,7 @@ fn write_zip<W: Write + Seek>(
     source: Option<&LazyArchive>,
     out: &mut CountingWriter<W>,
     options: &WriteOptions,
-) -> Result<(), OpcError> {
+) -> Result<PackageWriteReport, OpcError> {
     if let Some(source) = source {
         let mut source_file = source.lock()?;
         if let Some(file) = source_file.as_mut() {
@@ -1064,7 +1507,15 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
     mut source: Option<&mut ZipArchive<R>>,
     out: &mut CountingWriter<W>,
     write_options: &WriteOptions,
-) -> Result<(), OpcError> {
+) -> Result<PackageWriteReport, OpcError> {
+    let mut report = PackageWriteReport {
+        total_parts: parts.len(),
+        file_backed_parts: parts.iter().filter(|part| part.is_file_backed()).count(),
+        loaded_parts: parts.iter().filter(|part| part.is_loaded()).count(),
+        resident_bytes: parts.iter().map(Part::resident_len).sum(),
+        modified_parts: parts.iter().filter(|part| part.is_modified()).count(),
+        ..PackageWriteReport::default()
+    };
     let mut zip = ZipWriter::new(out);
     for part in parts {
         if !part.is_modified() {
@@ -1079,6 +1530,13 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
                         ),
                     });
                 }
+                report.raw_copied_parts += 1;
+                report.raw_copied_compressed_bytes = report
+                    .raw_copied_compressed_bytes
+                    .saturating_add(entry.compressed_size());
+                report.raw_copied_uncompressed_bytes = report
+                    .raw_copied_uncompressed_bytes
+                    .saturating_add(entry.size());
                 zip.raw_copy_file(entry)
                     .map_err(|error| OpcError::ZipWrite {
                         detail: error.to_string(),
@@ -1086,6 +1544,15 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
                 continue;
             }
         }
+        report.rewritten_parts += 1;
+        report.rewritten_source_bytes =
+            report
+                .rewritten_source_bytes
+                .saturating_add(if part.is_dir() {
+                    0
+                } else {
+                    part.content_len()?
+                });
         let media = is_media_part(part.name());
         let (method, level) = if part.is_dir() {
             (CompressionMethod::Stored, None)
@@ -1124,7 +1591,7 @@ fn write_zip_entries<W: Write + Seek, R: Read + Seek>(
     zip.finish().map_err(|error| OpcError::ZipWrite {
         detail: error.to_string(),
     })?;
-    Ok(())
+    Ok(report)
 }
 
 fn is_media_part(name: &str) -> bool {

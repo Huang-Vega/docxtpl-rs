@@ -92,7 +92,7 @@ see ADR-001 for how to obtain it).
 | RichText external hyperlinks (`tpl.build_url_id` pre-registers an external rel → `w:hyperlink r:id`) | compatible target | p4_rt_url |
 | RichTextParagraph (with/without parastyle; rich text in a paragraph; `with_text("")` is an empty fragment, explicit `add("")` produces an empty `<w:p>`) | compatible target | p4_rtp_basic + rich-crate empty-value regression |
 | Listing (`\n \t \a \f` expanded via resolve_listing; mixed with RichText) | compatible target | p4_listing_basic / p4_listing_after_rt / p4_combo_rich |
-| InlineImage native size (png/jpg/bmp/gif/tiff header parsing, EMU conversion; for JPEG, choose the APP0/APP1 DPI path based on the JFIF/Exif signature at offset 6) | compatible target | p4_img_png / p4_img_wh / p4_img_formats + image-header regression |
+| InlineImage native size (png/jpg/bmp/gif/tiff header parsing, EMU conversion; for JPEG, preserve the APP0/APP1 DPI path selected by the JFIF/Exif signature at offset 6, with a forward-compatible safe SOI/SOF fallback at 72 dpi when neither signature exists) | compatible target + forward extension for marker-valid camera JPEGs | p4_img_png / p4_img_wh / p4_img_formats + JFIF/Exif/generic marker regressions |
 | InlineImage single-side scaling (aspect-ratio banker's rounding) | compatible target | p4_img_scale_w |
 | Image sha1 deduplication (identical bytes reuse the part and rId) | compatible target | p4_img_dup / p4_img_in_table / p4_combo_rich |
 | Multiple distinct images (imageN numbering / rId hole backfill) | compatible target | p4_img_two / p4_img_formats |

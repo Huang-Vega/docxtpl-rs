@@ -649,7 +649,7 @@ pub(crate) fn relative_to_owner(owner_part: &str, target_abs: &str) -> String {
 
 /// Upstream PackURI.idx regex `^([a-zA-Z]+)([1-9][0-9]*)?`: the numeric suffix
 /// after the filename's alphabetic prefix (first digit cannot be 0), or None.
-fn image_number(abs_name: &str) -> Option<u64> {
+pub(crate) fn image_number(abs_name: &str) -> Option<u64> {
     let file_name = abs_name.rsplit('/').next().unwrap_or(abs_name);
     let stem = file_name
         .rsplit_once('.')

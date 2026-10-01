@@ -1,5 +1,7 @@
 //! Package-level regressions for missing core-properties parts and encoding errors in P5.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -63,7 +65,7 @@ fn zip_part(bytes: &[u8], name: &str) -> Vec<u8> {
 fn missing_core_properties_part_is_recreated_like_python_docx() {
     let dir = tempfile::Builder::new()
         .prefix("p5-core-missing-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -121,7 +123,7 @@ fn missing_core_properties_part_is_recreated_like_python_docx() {
 fn non_utf8_core_properties_reports_part_name() {
     let dir = tempfile::Builder::new()
         .prefix("p5-core-encoding-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");
@@ -150,7 +152,7 @@ fn non_utf8_core_properties_reports_part_name() {
 fn rust_environment_configuration_reaches_document_and_core_for_both_entry_points() {
     let dir = tempfile::Builder::new()
         .prefix("p5-custom-environment-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let src = root().join("tests/fixtures/templates/p5_hf_basic.docx");
     let variant = dir.path().join("template.docx");

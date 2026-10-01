@@ -92,8 +92,9 @@ fn main() -> ExitCode {
     let invocation = match parse_invocation_from(std::env::args_os()) {
         Ok(invocation) => invocation,
         Err(error) => {
+            let exit_code = clap_exit_code(&error);
             let _ = error.print();
-            return ExitCode::from(2);
+            return ExitCode::from(exit_code);
         }
     };
     let output = invocation.output.clone();
@@ -115,6 +116,10 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn clap_exit_code(error: &clap::Error) -> u8 {
+    u8::try_from(error.exit_code()).unwrap_or(2)
 }
 
 fn success_message(
@@ -407,6 +412,16 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+        assert_eq!(clap_exit_code(&error), 2);
+    }
+
+    #[test]
+    fn help_and_version_use_success_exit_codes() {
+        for flag in ["--help", "--version"] {
+            let error = parse_invocation_from(["docxtpl", flag])
+                .expect_err("clap displays help and version through its error type");
+            assert_eq!(clap_exit_code(&error), 0, "{flag}");
+        }
     }
 
     #[test]

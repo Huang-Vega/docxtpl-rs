@@ -1,5 +1,7 @@
 //! DEV-0010 dynamic DOCX integration regression for the numbering-merge compatibility path.
 
+mod test_support;
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -103,7 +105,7 @@ fn remove_main_numbering(src: &Path, dst: &Path) {
 fn accepts_numbered_subdoc_when_main_has_no_numbering_part() {
     let dir = tempfile::Builder::new()
         .prefix("p6-dev0010-missing-numbering-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let main = dir.path().join("main-without-numbering.docx");
     let sub = dir.path().join("numbered-sub.docx");
@@ -132,7 +134,7 @@ fn accepts_numbered_subdoc_when_main_has_no_numbering_part() {
 fn restarts_first_numbering_modification_block() {
     let dir = tempfile::Builder::new()
         .prefix("p6-dev0010-restart-numbering-")
-        .tempdir_in(root().join("target"))
+        .tempdir_in(test_support::target_dir())
         .expect("create a tempdir in the project target");
     let sub = dir.path().join("list-number-sub.docx");
     inject_body_child(
