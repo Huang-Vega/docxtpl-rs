@@ -40,6 +40,9 @@ try {
     $word = New-Object -ComObject Word.Application
     $word.Visible = $false
     $word.DisplayAlerts = 0
+    # msoAutomationSecurityForceDisable: candidate validation must never run
+    # document macros while Word opens unattended fixtures.
+    $word.AutomationSecurity = 3
     foreach ($case in $cases) {
         $input = Join-Path $renderedRoot ($case.Name + '.docx')
         $output = Join-Path $resavedRoot ($case.Name + '.docx')

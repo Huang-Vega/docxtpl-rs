@@ -78,13 +78,21 @@ use docxtpl_template::{
 // Serves both as internal types and public re-exports (the pub use list at the bottom does not repeat them).
 pub use docxtpl_template::{JsonContextError, RenderContext};
 
+mod async_render;
 mod images;
+mod persistent_cache;
 mod replacements;
 mod subdoc;
 mod text_index;
 
+pub use async_render::{
+    AsyncDispatchError, AsyncRenderDispatcher, BlockingExecutor, BlockingTask, RenderTask,
+};
+pub use persistent_cache::{PreparedCachePolicy, PreparedCacheStats, PreparedTemplateCache};
+
 pub use text_index::{
-    FormattingPolicy, RunTextIndex, RunTextLimits, TextFragment, TextIndexError, TextMatch,
+    FormattingPolicy, RunFormatOverrides, RunTextEditError, RunTextIndex, RunTextLimits,
+    TextFragment, TextIndexError, TextMatch,
 };
 
 use images::ImageInjections;
@@ -125,17 +133,6 @@ impl CancellationToken {
     }
 }
 
-fn check_cancellation(token: Option<&CancellationToken>) -> Result<(), Error> {
-    if token.is_some_and(CancellationToken::is_cancelled) {
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "operation cancelled",
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 /// Error returned by opt-in operations that carry a [`CancellationToken`].
 #[derive(Debug, thiserror::Error)]
 pub enum CancellationError {
@@ -157,6 +154,135 @@ impl CancellationError {
     }
 }
 
+/// Resource-budget name used by the unified 1.3 execution-control API.
+///
+/// This alias deliberately preserves the complete 1.2 [`ResourceLimits`]
+/// builder and constructor compatibility.
+pub type RenderLimits = ResourceLimits;
+
+/// Why a controlled operation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderStopReason {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+/// Cloneable cooperative execution control for rendering, editing, and ZIP
+/// output. It creates no worker threads or timers; callers and library
+/// checkpoints observe the token and deadline.
+#[derive(Debug, Clone, Default)]
+pub struct RenderControl {
+    cancellation: CancellationToken,
+    deadline: Option<Instant>,
+}
+
+impl RenderControl {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.deadline = Instant::now().checked_add(timeout);
+        self
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<RenderStopReason> {
+        if self.cancellation.is_cancelled() {
+            Some(RenderStopReason::Cancelled)
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Some(RenderStopReason::DeadlineExceeded)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stop_reason().is_some()
+    }
+
+    pub fn check(&self) -> Result<(), RenderControlError> {
+        match self.stop_reason() {
+            Some(RenderStopReason::Cancelled) => Err(RenderControlError::Cancelled),
+            Some(RenderStopReason::DeadlineExceeded) => Err(RenderControlError::DeadlineExceeded),
+            None => Ok(()),
+        }
+    }
+
+    fn from_cancellation(cancellation: &CancellationToken) -> Self {
+        Self::new().with_cancellation(cancellation.clone())
+    }
+}
+
+/// Error returned by operations using [`RenderControl`].
+#[derive(Debug, thiserror::Error)]
+pub enum RenderControlError {
+    #[error("operation cancelled")]
+    Cancelled,
+    #[error("render deadline exceeded")]
+    DeadlineExceeded,
+    #[error(transparent)]
+    Operation(#[from] Error),
+}
+
+impl RenderControlError {
+    fn from_operation(error: Error, control: &RenderControl) -> Self {
+        match control.stop_reason() {
+            Some(RenderStopReason::Cancelled) => Self::Cancelled,
+            Some(RenderStopReason::DeadlineExceeded) => Self::DeadlineExceeded,
+            None => Self::Operation(error),
+        }
+    }
+}
+
+fn check_render_control(control: Option<&RenderControl>) -> Result<(), Error> {
+    if let Some(control) = control {
+        if let Some(reason) = control.stop_reason() {
+            let message = match reason {
+                RenderStopReason::Cancelled => "operation cancelled",
+                RenderStopReason::DeadlineExceeded => "render deadline exceeded",
+            };
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                message,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Content type of the footnotes part (upstream render_footnotes filters
 /// package.parts by it; this CT is not registered in the python-docx PartFactory, so it is handled as a generic
 /// binary part whose rendered output is written back as-is without re-serialization, ADR-006).
@@ -166,6 +292,8 @@ const CT_FOOTNOTES: &str =
 /// string rendering path as footnotes.
 const CT_ENDNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
+const CT_COMMENTS: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 const IMAGE_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const HYPERLINK_REL_TYPE: &str =
@@ -288,6 +416,7 @@ enum TemplateSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 enum CachedPartKind {
     Document,
     Story,
@@ -302,30 +431,79 @@ struct CachedPartTemplate {
 
 #[derive(Debug, Default)]
 struct TemplateRenderCache {
-    parts: Mutex<HashMap<(String, CachedPartKind), CachedPartTemplate>>,
+    parts: Mutex<HashMap<(String, CachedPartKind, usize), CachedPartTemplate>>,
+    persistent: Option<PreparedTemplateCache>,
 }
 
 impl TemplateRenderCache {
+    fn new(persistent: Option<PreparedTemplateCache>) -> Self {
+        Self {
+            parts: Mutex::new(HashMap::new()),
+            persistent,
+        }
+    }
+
+    fn uses_persistent_storage(&self) -> bool {
+        self.persistent.is_some()
+    }
+
     fn get_or_prepare(
         &self,
+        template_digest: &[u8; 32],
         part_name: &str,
         kind: CachedPartKind,
         source: &str,
+        max_rendered_xml_bytes: usize,
         prepare: impl FnOnce() -> Result<PreparedXmlTemplate, RenderError>,
     ) -> Result<Arc<PreparedXmlTemplate>, Error> {
+        let key = (part_name.to_string(), kind, max_rendered_xml_bytes);
         {
             let parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(cached) = parts.get(&(part_name.to_string(), kind)) {
+            if let Some(cached) = parts.get(&key) {
                 if cached.source == source {
                     return Ok(Arc::clone(&cached.template));
                 }
             }
         }
 
-        let template = Arc::new(prepare()?);
+        let options_fingerprint = persistent_cache::digest(
+            &u64::try_from(max_rendered_xml_bytes)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        let template = if let Some(cache) = &self.persistent {
+            cache
+                .load(
+                    template_digest,
+                    &options_fingerprint,
+                    kind as u8,
+                    part_name,
+                    source,
+                )
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let template = match template {
+            Some(template) => template,
+            None => {
+                let template = Arc::new(prepare()?);
+                if let Some(cache) = &self.persistent {
+                    cache.store(
+                        template_digest,
+                        &options_fingerprint,
+                        kind as u8,
+                        part_name,
+                        source,
+                        &template,
+                    );
+                }
+                template
+            }
+        };
         let mut parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
         parts.insert(
-            (part_name.to_string(), kind),
+            key,
             CachedPartTemplate {
                 source: source.to_string(),
                 template: Arc::clone(&template),
@@ -368,7 +546,7 @@ impl DocxTemplate {
         Ok(Self {
             source: TemplateSource::Path(path),
             limits,
-            render_cache: Arc::new(TemplateRenderCache::default()),
+            render_cache: Arc::new(TemplateRenderCache::new(None)),
         })
     }
 
@@ -405,8 +583,16 @@ impl DocxTemplate {
         Ok(Self {
             source: TemplateSource::Bytes(data),
             limits,
-            render_cache: Arc::new(TemplateRenderCache::default()),
+            render_cache: Arc::new(TemplateRenderCache::new(None)),
         })
+    }
+
+    /// Attach an explicit persistent preprocessing cache. Existing in-memory
+    /// entries are discarded so subsequent renders use the selected policy.
+    #[must_use]
+    pub fn with_prepared_cache(mut self, cache: PreparedTemplateCache) -> Self {
+        self.render_cache = Arc::new(TemplateRenderCache::new(Some(cache)));
+        self
     }
 
     /// Render with a plain JSON context, returning an independent [`RenderedDocument`].
@@ -430,22 +616,39 @@ impl DocxTemplate {
         options: &RenderOptions,
         cancellation: &CancellationToken,
     ) -> Result<RenderedDocument, CancellationError> {
-        self.render_checked(context, options, Some(cancellation))
+        let control = RenderControl::from_cancellation(cancellation);
+        self.render_checked(context, options, Some(&control))
             .map_err(|error| CancellationError::from_operation(error, cancellation))
+    }
+
+    /// Render with unified cancellation and deadline control.
+    pub fn render_with_control(
+        &self,
+        context: &serde_json::Value,
+        options: &RenderOptions,
+        control: &RenderControl,
+    ) -> Result<RenderedDocument, RenderControlError> {
+        self.render_checked(context, options, Some(control))
+            .map_err(|error| RenderControlError::from_operation(error, control))
     }
 
     fn render_checked(
         &self,
         context: &serde_json::Value,
         options: &RenderOptions,
-        cancellation: Option<&CancellationToken>,
+        control: Option<&RenderControl>,
     ) -> Result<RenderedDocument, Error> {
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         let options = self.effective_render_options(options);
         // Open a fresh package per render: DocxTemplate is reusable and state does not leak across renders (spec §2.2).
         let package_open_started = Instant::now();
+        let template_digest = if self.render_cache.uses_persistent_storage() {
+            self.template_digest()?
+        } else {
+            [0; 32]
+        };
         let mut pkg = self.open_package()?;
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         let package_open_elapsed = package_open_started.elapsed();
         let render_started = Instant::now();
         let main_name = pkg.main_document_uri()?.as_str().to_string();
@@ -465,17 +668,18 @@ impl DocxTemplate {
             &options,
             &mut injections,
             &self.render_cache,
-            cancellation,
+            &template_digest,
+            control,
         )?;
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         // A JSON context contains no images/external links, so apply is effectively a no-op (no dirty scopes).
         injections.apply(&mut pkg)?;
         canonicalize_content_types(&mut pkg, false)?;
 
         // Validate the package once more before writing out: no dangling relationships or missing parts allowed.
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         pkg.validate()?;
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
 
         Ok(RenderedDocument {
             pkg,
@@ -514,11 +718,27 @@ impl DocxTemplate {
             .finish_with_cancellation(context, cancellation)
     }
 
+    /// Render a rich context with unified cancellation and deadline control.
+    pub fn render_ctx_with_control(
+        &self,
+        context: &RenderContext,
+        options: &RenderOptions,
+        control: &RenderControl,
+    ) -> Result<RenderedDocument, RenderControlError> {
+        self.render_session_with_control(options, control)?
+            .finish_with_control(context, control)
+    }
+
     /// Open a one-shot rich-content render session: inside the session one may first call [`RenderSession::build_url_id`]
     /// to pre-register external hyperlink relationships (mirroring the upstream `tpl.build_url_id` call before rendering),
     /// then call [`RenderSession::finish`] to complete the render.
     pub fn render_session(&self, options: &RenderOptions) -> Result<RenderSession, Error> {
         let package_open_started = Instant::now();
+        let template_digest = if self.render_cache.uses_persistent_storage() {
+            self.template_digest()?
+        } else {
+            [0; 32]
+        };
         let pkg = self.open_package()?;
         let package_open_elapsed = package_open_started.elapsed();
         let options = self.effective_render_options(options);
@@ -526,8 +746,23 @@ impl DocxTemplate {
             pkg,
             &options,
             Arc::clone(&self.render_cache),
+            template_digest,
             package_open_elapsed,
         )
+    }
+
+    /// Open a rich render session after checking unified execution control.
+    pub fn render_session_with_control(
+        &self,
+        options: &RenderOptions,
+        control: &RenderControl,
+    ) -> Result<RenderSession, RenderControlError> {
+        control.check()?;
+        let mut session = self
+            .render_session(options)
+            .map_err(|error| RenderControlError::from_operation(error, control))?;
+        session.control = Some(control.clone());
+        Ok(session)
     }
 
     /// Upstream `DocxTemplate.get_undeclared_template_variables()` (P7):
@@ -612,6 +847,13 @@ impl DocxTemplate {
         Ok(pkg)
     }
 
+    fn template_digest(&self) -> Result<[u8; 32], Error> {
+        match &self.source {
+            TemplateSource::Path(path) => Ok(persistent_cache::digest_path(path)?),
+            TemplateSource::Bytes(data) => Ok(persistent_cache::digest(data)),
+        }
+    }
+
     fn effective_render_options(&self, options: &RenderOptions) -> RenderOptions {
         options
             .clone()
@@ -633,8 +875,9 @@ pub struct RenderSession {
     /// P7 media/embedded replacement registry (the replace_* family, committed at finish).
     replacements: Replacements,
     render_cache: Arc<TemplateRenderCache>,
+    template_digest: [u8; 32],
     package_open_elapsed: Duration,
-    cancellation: Option<CancellationToken>,
+    control: Option<RenderControl>,
 }
 
 impl RenderSession {
@@ -643,6 +886,7 @@ impl RenderSession {
         pkg: Package,
         options: &RenderOptions,
         render_cache: Arc<TemplateRenderCache>,
+        template_digest: [u8; 32],
         package_open_elapsed: Duration,
     ) -> Result<Self, Error> {
         let main_name = pkg.main_document_uri()?.as_str().to_string();
@@ -653,8 +897,9 @@ impl RenderSession {
             injections,
             replacements: Replacements::new(),
             render_cache,
+            template_digest,
             package_open_elapsed,
-            cancellation: None,
+            control: None,
         })
     }
 
@@ -783,7 +1028,7 @@ impl RenderSession {
     /// Renders every part (body -> headers -> footers -> core properties -> footnotes, P5),
     /// commits the media part / per-scope rels / Content Types changes, and performs final package validation.
     pub fn finish(mut self, context: &RenderContext) -> Result<RenderedDocument, Error> {
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         let render_started = Instant::now();
         render_all_parts(
             &mut self.pkg,
@@ -791,11 +1036,12 @@ impl RenderSession {
             &self.options,
             &mut self.injections,
             &self.render_cache,
-            self.cancellation.as_ref(),
+            &self.template_digest,
+            self.control.as_ref(),
         )?;
 
         // Write media parts first, then write back each owner's rels/CT, guaranteeing the final validation finds no dangling relationships/types.
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         self.injections.apply(&mut self.pkg)?;
         self.finish_replacements(false, render_started.elapsed())
     }
@@ -808,9 +1054,20 @@ impl RenderSession {
         context: &RenderContext,
         cancellation: &CancellationToken,
     ) -> Result<RenderedDocument, CancellationError> {
-        self.cancellation = Some(cancellation.clone());
+        self.control = Some(RenderControl::from_cancellation(cancellation));
         self.finish(context)
             .map_err(|error| CancellationError::from_operation(error, cancellation))
+    }
+
+    /// Finish this session with unified cancellation and deadline control.
+    pub fn finish_with_control(
+        mut self,
+        context: &RenderContext,
+        control: &RenderControl,
+    ) -> Result<RenderedDocument, RenderControlError> {
+        self.control = Some(control.clone());
+        self.finish(context)
+            .map_err(|error| RenderControlError::from_operation(error, control))
     }
 
     /// Upstream "save without render" path (P7, save() L887-889): the
@@ -826,6 +1083,17 @@ impl RenderSession {
         self.finish_replacements(true, render_started.elapsed())
     }
 
+    /// Finish the replacement-only path with unified execution control.
+    pub fn finish_without_render_with_control(
+        mut self,
+        control: &RenderControl,
+    ) -> Result<RenderedDocument, RenderControlError> {
+        self.control = Some(control.clone());
+        let render_started = Instant::now();
+        self.finish_replacements(true, render_started.elapsed())
+            .map_err(|error| RenderControlError::from_operation(error, control))
+    }
+
     /// pre_processing (replace_pic) -> CT normalization (python-docx rebuilds the CT on every save)
     /// -> post_processing (CRC/zipname byte replacement) -> final validation.
     fn finish_replacements(
@@ -833,20 +1101,20 @@ impl RenderSession {
         normalize_all_known_xml_parts: bool,
         prior_render_elapsed: Duration,
     ) -> Result<RenderedDocument, Error> {
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         let replacements_started = Instant::now();
         let main_name = self.pkg.main_document_uri()?.as_str().to_string();
         // pre_processing: swap image part blobs on the final XML (before docx.save).
         self.replacements
             .apply_pic_replacements(&mut self.pkg, &main_name)?;
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         canonicalize_content_types(&mut self.pkg, normalize_all_known_xml_parts)?;
         // post_processing: CRC/zipname byte replacement over the final part set.
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         self.replacements.apply_byte_replacements(&mut self.pkg)?;
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         self.pkg.validate()?;
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
 
         let max_rendered_xml_bytes = self.options.max_rendered_xml_bytes();
         Ok(RenderedDocument {
@@ -874,20 +1142,25 @@ fn render_all_parts(
     options: &RenderOptions,
     injections: &mut ImageInjections,
     render_cache: &TemplateRenderCache,
-    cancellation: Option<&CancellationToken>,
+    template_digest: &[u8; 32],
+    control: Option<&RenderControl>,
 ) -> Result<(), Error> {
-    check_cancellation(cancellation)?;
+    check_render_control(control)?;
     let main_name = pkg.main_document_uri()?.as_str().to_string();
     let prepared_context = prepare_render_context(context, &main_name)?;
 
     // 1. Body: fix_tables + fix_docpr_ids; image relationships belong to the main document.
-    check_cancellation(cancellation)?;
+    check_render_control(control)?;
     injections.begin_owner(pkg, &main_name)?;
     let body_src = read_xml_part(pkg, &main_name)?;
-    let body_template =
-        render_cache.get_or_prepare(&main_name, CachedPartKind::Document, &body_src, || {
-            prepare_document_xml_template(&body_src, options)
-        })?;
+    let body_template = render_cache.get_or_prepare(
+        template_digest,
+        &main_name,
+        CachedPartKind::Document,
+        &body_src,
+        options.max_rendered_xml_bytes(),
+        || prepare_document_xml_template(&body_src, options),
+    )?;
     let body =
         render_document_xml_from_template(&body_template, &prepared_context, options, injections)?;
     pkg.set_part_bytes(&main_name, body.xml.into_bytes())?;
@@ -897,12 +1170,17 @@ fn render_all_parts(
     // resolve_listing still run, but without fix_tables / fix_docpr_ids.
     let stories = story_parts(pkg, &main_name)?;
     for name in stories {
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         injections.begin_owner(pkg, &name)?;
         let src = read_xml_part(pkg, &name)?;
-        let template = render_cache.get_or_prepare(&name, CachedPartKind::Story, &src, || {
-            prepare_story_xml_template(&src, options, &name)
-        })?;
+        let template = render_cache.get_or_prepare(
+            template_digest,
+            &name,
+            CachedPartKind::Story,
+            &src,
+            options.max_rendered_xml_bytes(),
+            || prepare_story_xml_template(&src, options, &name),
+        )?;
         let outcome = render_story_xml_from_template(
             &template,
             &prepared_context,
@@ -915,7 +1193,7 @@ fn render_all_parts(
 
     // 4. Core properties: upstream render() unconditionally runs render_properties. The target resolves via the root
     // rels core-properties relationship; when missing, python-docx creates the default part.
-    check_cancellation(cancellation)?;
+    check_render_control(control)?;
     let core_name = ensure_core_properties_part(pkg)?;
     let core_src = read_xml_part(pkg, &core_name)?;
     let rendered =
@@ -925,7 +1203,7 @@ fn render_all_parts(
     // 5. Notes: generic binary parts; the rendered strings are written back
     // as-is (preserving their XML declarations).
     for name in note_parts(pkg) {
-        check_cancellation(cancellation)?;
+        check_render_control(control)?;
         // Note parts are generic python-docx Parts. Their blobs are decoded as
         // UTF-8 and written back verbatim, so unlike the XmlPart paths above
         // they intentionally remain UTF-8-only.
@@ -938,15 +1216,20 @@ fn render_all_parts(
         {
             continue;
         }
-        let template = render_cache.get_or_prepare(&name, CachedPartKind::Notes, &src, || {
-            prepare_footnotes_xml_template(&src, options, &name)
-        })?;
+        let template = render_cache.get_or_prepare(
+            template_digest,
+            &name,
+            CachedPartKind::Notes,
+            &src,
+            options.max_rendered_xml_bytes(),
+            || prepare_footnotes_xml_template(&src, options, &name),
+        )?;
         let rendered =
             render_footnotes_xml_from_template(&template, &prepared_context, options, &name)?;
         pkg.set_part_bytes(&name, rendered.into_bytes())?;
     }
 
-    check_cancellation(cancellation)?;
+    check_render_control(control)?;
     Ok(())
 }
 
@@ -1104,6 +1387,76 @@ fn editable_story_parts(
                 continue;
             }
             stories.push((name.to_string(), kind));
+        }
+    }
+    Ok(stories)
+}
+
+/// Enumerate every selected editable Word story in a deterministic order.
+fn unified_editable_story_parts(
+    pkg: &Package,
+    selection: EditableStorySelection,
+) -> Result<Vec<(String, EditableStoryKind)>, Error> {
+    let main_name = pkg.main_document_uri()?.as_str().to_string();
+    let mut stories = Vec::new();
+    if selection.contains(EditableStoryKind::Body) {
+        stories.push((main_name.clone(), EditableStoryKind::Body));
+    }
+
+    let main_uri = PartUri::new(&main_name)?;
+    let base_dir = main_uri.parent();
+    if let Some(rels) = pkg.relationships_of(&main_name) {
+        for (rel_type, kind) in [
+            (REL_TYPE_HEADER, EditableStoryKind::Header),
+            (REL_TYPE_FOOTER, EditableStoryKind::Footer),
+        ] {
+            if !selection.contains(kind) {
+                continue;
+            }
+            for rel in rels.iter() {
+                if rel.target_mode != TargetMode::Internal || rel.rel_type != rel_type {
+                    continue;
+                }
+                let Some(target) = resolve_part_target(base_dir.as_ref(), &rel.target) else {
+                    continue;
+                };
+                let name = target.as_str();
+                let Some(part) = pkg.part(name) else {
+                    continue;
+                };
+                if part.bytes()?.is_empty()
+                    || stories
+                        .iter()
+                        .any(|(existing, _)| existing.as_str() == name)
+                {
+                    continue;
+                }
+                stories.push((name.to_string(), kind));
+            }
+        }
+    }
+
+    for (content_type, kind) in [
+        (CT_FOOTNOTES, EditableStoryKind::Footnote),
+        (CT_ENDNOTES, EditableStoryKind::Endnote),
+        (CT_COMMENTS, EditableStoryKind::Comment),
+    ] {
+        if !selection.contains(kind) {
+            continue;
+        }
+        let mut names: Vec<_> = pkg
+            .parts()
+            .filter(|part| pkg.content_types().content_type_of(part.uri()) == Some(content_type))
+            .map(|part| part.name().to_string())
+            .collect();
+        names.sort();
+        for name in names {
+            let part = pkg
+                .part(&name)
+                .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?;
+            if !part.bytes()?.is_empty() {
+                stories.push((name, kind));
+            }
         }
     }
     Ok(stories)
@@ -1550,6 +1903,94 @@ pub enum StoryKind {
     Footer,
 }
 
+/// Kind of editable Word story exposed by the unified 1.3 editing API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EditableStoryKind {
+    /// Main document body.
+    Body,
+    /// Header part referenced by the main document.
+    Header,
+    /// Footer part referenced by the main document.
+    Footer,
+    /// Footnotes part selected by its registered content type.
+    Footnote,
+    /// Endnotes part selected by its registered content type.
+    Endnote,
+    /// Word comments part selected by its registered content type.
+    Comment,
+}
+
+/// Bit-set selecting story kinds for the unified 1.3 editing API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EditableStorySelection(u8);
+
+impl EditableStorySelection {
+    /// No stories.
+    pub const NONE: Self = Self(0);
+    /// Main document body.
+    pub const BODY: Self = Self(1 << 0);
+    /// Header parts.
+    pub const HEADERS: Self = Self(1 << 1);
+    /// Footer parts.
+    pub const FOOTERS: Self = Self(1 << 2);
+    /// Footnotes parts.
+    pub const FOOTNOTES: Self = Self(1 << 3);
+    /// Endnotes parts.
+    pub const ENDNOTES: Self = Self(1 << 4);
+    /// Word comments parts.
+    pub const COMMENTS: Self = Self(1 << 5);
+    /// Body, headers, and footers (equivalent to the legacy broad scope).
+    pub const BODY_HEADERS_FOOTERS: Self = Self(Self::BODY.0 | Self::HEADERS.0 | Self::FOOTERS.0);
+    /// Footnotes and endnotes.
+    pub const NOTES: Self = Self(Self::FOOTNOTES.0 | Self::ENDNOTES.0);
+    /// Every supported editable Word story.
+    pub const ALL: Self = Self(Self::BODY_HEADERS_FOOTERS.0 | Self::NOTES.0 | Self::COMMENTS.0);
+
+    /// Combine two selections.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether this selection contains `kind`.
+    #[must_use]
+    pub const fn contains(self, kind: EditableStoryKind) -> bool {
+        let bit = match kind {
+            EditableStoryKind::Body => Self::BODY.0,
+            EditableStoryKind::Header => Self::HEADERS.0,
+            EditableStoryKind::Footer => Self::FOOTERS.0,
+            EditableStoryKind::Footnote => Self::FOOTNOTES.0,
+            EditableStoryKind::Endnote => Self::ENDNOTES.0,
+            EditableStoryKind::Comment => Self::COMMENTS.0,
+        };
+        self.0 & bit != 0
+    }
+}
+
+impl std::ops::BitOr for EditableStorySelection {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for EditableStorySelection {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
+impl From<StoryScope> for EditableStorySelection {
+    fn from(scope: StoryScope) -> Self {
+        match scope {
+            StoryScope::Body => Self::BODY,
+            StoryScope::HeadersFooters => Self::HEADERS | Self::FOOTERS,
+            StoryScope::BodyHeadersFooters => Self::BODY_HEADERS_FOOTERS,
+        }
+    }
+}
+
 /// One parsed Word story DOM.
 pub struct StoryEditor {
     name: String,
@@ -1558,6 +1999,75 @@ pub struct StoryEditor {
     changed: bool,
     validate_internal_links: bool,
     external_hyperlink_rids: HashSet<String>,
+}
+
+/// One parsed Word story DOM from the unified 1.3 editing API.
+///
+/// This type extends story editing to footnotes, endnotes, and comments while
+/// leaving the 1.2 [`StoryEditor`] and its exhaustively matchable enums intact.
+pub struct EditableStoryEditor {
+    kind: EditableStoryKind,
+    pub(crate) inner: StoryEditor,
+}
+
+impl EditableStoryEditor {
+    /// OPC part name of this story.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// Unified story kind.
+    #[must_use]
+    pub const fn kind(&self) -> EditableStoryKind {
+        self.kind
+    }
+
+    /// Read the parsed DOM without marking it for serialization.
+    #[must_use]
+    pub const fn document(&self) -> &docxtpl_xml::XmlDocument {
+        self.inner.document()
+    }
+
+    /// Mutably access the DOM and mark this story for one final serialization.
+    pub fn document_mut(&mut self) -> &mut docxtpl_xml::XmlDocument {
+        self.inner.document_mut()
+    }
+
+    /// Whether mutable DOM access has requested serialization.
+    #[must_use]
+    pub const fn is_changed(&self) -> bool {
+        self.inner.is_changed()
+    }
+
+    /// Find a bookmark by name, or create one around `target`.
+    pub fn get_or_create_bookmark(
+        &mut self,
+        target: docxtpl_xml::NodeId,
+        preferred_name: &str,
+    ) -> Result<Bookmark, Error> {
+        self.inner.get_or_create_bookmark(target, preferred_name)
+    }
+
+    /// Attach an internal hyperlink to an existing run.
+    pub fn attach_internal_link(
+        &mut self,
+        target: docxtpl_xml::NodeId,
+        bookmark: &Bookmark,
+    ) -> Result<docxtpl_xml::NodeId, Error> {
+        self.inner.attach_internal_link(target, bookmark)
+    }
+
+    /// Attach an external hyperlink relationship id to an existing DrawingML
+    /// drawing in this story.
+    pub fn attach_drawing_external_link(
+        &mut self,
+        drawing: docxtpl_xml::NodeId,
+        relationship_id: &str,
+    ) -> Result<(), Error> {
+        self.inner
+            .attach_drawing_external_link(drawing, relationship_id)
+    }
 }
 
 /// A bookmark target created or found inside one Word story.
@@ -2033,7 +2543,7 @@ pub struct PostprocessPipeline<'a> {
     package: &'a mut Package,
     max_rendered_xml_bytes: usize,
     reports: Vec<PassReport>,
-    cancellation: Option<CancellationToken>,
+    control: Option<RenderControl>,
 }
 
 /// Transactional operations available to one post-processing pass.
@@ -2041,7 +2551,7 @@ pub struct PostprocessTransaction<'transaction, 'package> {
     transaction: &'transaction mut PackageTransaction<'package>,
     max_rendered_xml_bytes: usize,
     media_registry: Option<MediaRegistry>,
-    cancellation: Option<CancellationToken>,
+    control: Option<RenderControl>,
 }
 
 #[derive(Default)]
@@ -2060,10 +2570,17 @@ pub struct MediaRegistration {
 }
 
 impl PostprocessTransaction<'_, '_> {
+    /// Check unified cancellation and deadline control. Long-running custom
+    /// passes should call this at their own natural checkpoints.
+    pub fn check_control(&self) -> Result<(), Error> {
+        check_render_control(self.control.as_ref())
+    }
+
     /// Check the pipeline's cooperative cancellation token. Long-running
-    /// custom passes should call this at their own natural checkpoints.
+    /// custom passes should call this at their own natural checkpoints. This
+    /// compatibility method also observes a configured deadline.
     pub fn check_cancelled(&self) -> Result<(), Error> {
-        check_cancellation(self.cancellation.as_ref())
+        self.check_control()
     }
 
     /// Read a part without marking it as touched.
@@ -2267,6 +2784,105 @@ impl PostprocessTransaction<'_, '_> {
         self.check_cancelled()?;
         Ok(report)
     }
+
+    /// Parse each selected Word story once, run all caller edits on its shared
+    /// DOM, and serialize that story at most once.
+    ///
+    /// Unlike the legacy [`Self::for_each_story`] entry point, this unified
+    /// 1.3 API can also select footnotes, endnotes, and Word comments. Stories
+    /// are visited in body, header, footer, footnote, endnote, comment order;
+    /// multiple parts of one kind use deterministic package names.
+    pub fn for_each_editable_story(
+        &mut self,
+        selection: EditableStorySelection,
+        mut edit: impl FnMut(&mut EditableStoryEditor) -> Result<(), Error>,
+    ) -> Result<StoryEditReport, Error> {
+        self.check_cancelled()?;
+        let stories = unified_editable_story_parts(self.transaction.package(), selection)?;
+        let mut report = StoryEditReport::default();
+        for (name, kind) in stories {
+            self.check_cancelled()?;
+            let external_hyperlink_rids = self
+                .transaction
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == HYPERLINK_REL_TYPE
+                        && relationship.target_mode == TargetMode::External
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let bytes = self
+                .transaction
+                .part(&name)
+                .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                .bytes()?;
+            let xml = decode_xml_bytes(bytes, &name)?;
+            let document =
+                docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
+                    .map_err(|source| RenderError::Xml {
+                        part: name.clone(),
+                        source,
+                    })?;
+            report.parsed_parts += 1;
+            let legacy_kind = match kind {
+                EditableStoryKind::Header => StoryKind::Header,
+                EditableStoryKind::Footer => StoryKind::Footer,
+                EditableStoryKind::Body
+                | EditableStoryKind::Footnote
+                | EditableStoryKind::Endnote
+                | EditableStoryKind::Comment => StoryKind::Body,
+            };
+            let mut story = EditableStoryEditor {
+                kind,
+                inner: StoryEditor {
+                    name: name.clone(),
+                    kind: legacy_kind,
+                    document,
+                    changed: false,
+                    validate_internal_links: false,
+                    external_hyperlink_rids,
+                },
+            };
+            edit(&mut story)?;
+            self.check_cancelled()?;
+            if story.inner.validate_internal_links {
+                story.inner.validate_bookmarks_and_internal_links()?;
+            }
+            if !story.inner.changed {
+                continue;
+            }
+            let serialized = match kind {
+                EditableStoryKind::Body => story
+                    .inner
+                    .document
+                    .try_serialize(self.max_rendered_xml_bytes),
+                EditableStoryKind::Header
+                | EditableStoryKind::Footer
+                | EditableStoryKind::Footnote
+                | EditableStoryKind::Endnote
+                | EditableStoryKind::Comment => story
+                    .inner
+                    .document
+                    .try_serialize_story(self.max_rendered_xml_bytes),
+            }
+            .map_err(|_| RenderError::Limit {
+                part: name.clone(),
+                kind: "rendered_xml_bytes",
+                max: self.max_rendered_xml_bytes as u64,
+            })?;
+            report.serialized_parts += 1;
+            if serialized.as_bytes() != bytes {
+                self.transaction
+                    .set_part_bytes(&name, serialized.into_bytes())?;
+                report.changed_parts.push(name);
+            }
+        }
+        self.check_cancelled()?;
+        Ok(report)
+    }
 }
 
 impl PostprocessPipeline<'_> {
@@ -2277,7 +2893,7 @@ impl PostprocessPipeline<'_> {
         policy: FailurePolicy,
         pass: impl FnOnce(&mut PostprocessTransaction<'_, '_>) -> Result<(), Error>,
     ) -> Result<&mut Self, Error> {
-        check_cancellation(self.cancellation.as_ref())?;
+        check_render_control(self.control.as_ref())?;
         let name = name.into();
         let started = Instant::now();
         let mut transaction = self.package.transaction();
@@ -2286,7 +2902,7 @@ impl PostprocessPipeline<'_> {
                 transaction: &mut transaction,
                 max_rendered_xml_bytes: self.max_rendered_xml_bytes,
                 media_registry: None,
-                cancellation: self.cancellation.clone(),
+                control: self.control.clone(),
             };
             pass(&mut postprocess).and_then(|()| postprocess.check_cancelled())
         };
@@ -2308,14 +2924,10 @@ impl PostprocessPipeline<'_> {
             Err(error) => {
                 let touched_parts = transaction.touched_parts();
                 transaction.rollback();
-                if self
-                    .cancellation
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
+                if self.control.as_ref().is_some_and(RenderControl::is_stopped) {
                     return Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        "operation cancelled",
+                        "render control stopped the operation",
                     )));
                 }
                 match policy {
@@ -2375,22 +2987,36 @@ impl RenderedDocument {
         cancellation: &CancellationToken,
         configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
     ) -> Result<PostprocessReport, CancellationError> {
-        self.postprocess_checked(configure, Some(cancellation.clone()))
-            .map_err(|error| CancellationError::from_operation(error, cancellation))
+        self.postprocess_checked(
+            configure,
+            Some(RenderControl::from_cancellation(cancellation)),
+        )
+        .map_err(|error| CancellationError::from_operation(error, cancellation))
+    }
+
+    /// Run rollback-capable passes with unified cancellation and deadline
+    /// control. A stopped active pass is always rolled back.
+    pub fn postprocess_with_control(
+        &mut self,
+        control: &RenderControl,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
+    ) -> Result<PostprocessReport, RenderControlError> {
+        self.postprocess_checked(configure, Some(control.clone()))
+            .map_err(|error| RenderControlError::from_operation(error, control))
     }
 
     fn postprocess_checked(
         &mut self,
         configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
-        cancellation: Option<CancellationToken>,
+        control: Option<RenderControl>,
     ) -> Result<PostprocessReport, Error> {
-        check_cancellation(cancellation.as_ref())?;
+        check_render_control(control.as_ref())?;
         self.edited = true;
         let mut pipeline = PostprocessPipeline {
             package: &mut self.pkg,
             max_rendered_xml_bytes: self.max_rendered_xml_bytes,
             reports: Vec::new(),
-            cancellation,
+            control,
         };
         let result = configure(&mut pipeline);
         let reports = std::mem::take(&mut pipeline.reports);
@@ -2465,6 +3091,27 @@ impl RenderedDocument {
             .map(|_| ())
     }
 
+    /// Validate and atomically save with unified cancellation and deadline
+    /// control. The old destination remains untouched when output stops.
+    pub fn save_with_control(
+        &self,
+        path: impl AsRef<Path>,
+        control: &RenderControl,
+    ) -> Result<(), RenderControlError> {
+        self.save_with_options_and_control(path, &WriteOptions::compatible(), control)
+    }
+
+    /// Save with explicit ZIP options and unified execution control.
+    pub fn save_with_options_and_control(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        control: &RenderControl,
+    ) -> Result<(), RenderControlError> {
+        self.save_with_report_and_control(path, options, control)
+            .map(|_| ())
+    }
+
     /// Validate and save the document while returning structured render and
     /// ZIP serialization metrics.
     pub fn save_with_report(
@@ -2506,6 +3153,31 @@ impl RenderedDocument {
         Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
     }
 
+    /// Validate and atomically save with metrics and unified execution
+    /// control.
+    pub fn save_with_report_and_control(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        control: &RenderControl,
+    ) -> Result<RenderReport, RenderControlError> {
+        control.check()?;
+        let validation_started = Instant::now();
+        self.pkg
+            .validate()
+            .map_err(|error| RenderControlError::Operation(Error::Opc(error)))?;
+        control.check()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self
+            .pkg
+            .save_with_report_interruptible(path, options, &|| control.is_stopped())
+            .map_err(|error| map_interruptible_control_error(error, control))?;
+        let zip_write_elapsed = write_started.elapsed();
+        control.check()?;
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
     /// Validate and write to a seekable stream while returning structured metrics.
     pub fn write_to_with_report(
         &self,
@@ -2544,6 +3216,31 @@ impl RenderedDocument {
             .map_err(map_interruptible_opc_error)?;
         let zip_write_elapsed = write_started.elapsed();
         cancellation.check()?;
+        Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
+    }
+
+    /// Validate and write to a seekable stream with metrics and unified
+    /// execution control. The stream may contain a partial ZIP after stopping.
+    pub fn write_to_with_report_and_control(
+        &self,
+        writer: impl Write + std::io::Seek,
+        options: &WriteOptions,
+        control: &RenderControl,
+    ) -> Result<RenderReport, RenderControlError> {
+        control.check()?;
+        let validation_started = Instant::now();
+        self.pkg
+            .validate()
+            .map_err(|error| RenderControlError::Operation(Error::Opc(error)))?;
+        control.check()?;
+        let validation_elapsed = validation_started.elapsed();
+        let write_started = Instant::now();
+        let package_write = self
+            .pkg
+            .write_to_with_report_interruptible(writer, options, &|| control.is_stopped())
+            .map_err(|error| map_interruptible_control_error(error, control))?;
+        let zip_write_elapsed = write_started.elapsed();
+        control.check()?;
         Ok(self.render_report(validation_elapsed, zip_write_elapsed, package_write))
     }
 
@@ -2621,6 +3318,19 @@ fn map_interruptible_opc_error(error: InterruptibleWriteError) -> CancellationEr
     }
 }
 
+fn map_interruptible_control_error(
+    error: InterruptibleWriteError,
+    control: &RenderControl,
+) -> RenderControlError {
+    match error {
+        InterruptibleWriteError::Cancelled => match control.stop_reason() {
+            Some(RenderStopReason::DeadlineExceeded) => RenderControlError::DeadlineExceeded,
+            _ => RenderControlError::Cancelled,
+        },
+        InterruptibleWriteError::Opc(error) => RenderControlError::Operation(Error::Opc(error)),
+    }
+}
+
 /// Facade-level errors: OPC, template rendering or encoding problems.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -2680,6 +3390,8 @@ mod render_cache_tests {
     fn render_cache_reuses_unchanged_source_and_invalidates_changed_source() {
         let cache = TemplateRenderCache::default();
         let options = RenderOptions::compat();
+        let template_digest = persistent_cache::digest(b"template");
+        let max = options.max_rendered_xml_bytes();
         let preparations = Cell::new(0usize);
         let prepare = |source: &str| {
             preparations.set(preparations.get() + 1);
@@ -2688,17 +3400,21 @@ mod render_cache_tests {
 
         let first = cache
             .get_or_prepare(
+                &template_digest,
                 "word/document.xml",
                 CachedPartKind::Document,
                 SOURCE_ONE,
+                max,
                 || prepare(SOURCE_ONE),
             )
             .expect("prepare first source");
         let second = cache
             .get_or_prepare(
+                &template_digest,
                 "word/document.xml",
                 CachedPartKind::Document,
                 SOURCE_ONE,
+                max,
                 || prepare(SOURCE_ONE),
             )
             .expect("reuse first source");
@@ -2707,9 +3423,11 @@ mod render_cache_tests {
 
         let changed = cache
             .get_or_prepare(
+                &template_digest,
                 "word/document.xml",
                 CachedPartKind::Document,
                 SOURCE_TWO,
+                max,
                 || prepare(SOURCE_TWO),
             )
             .expect("prepare changed source");

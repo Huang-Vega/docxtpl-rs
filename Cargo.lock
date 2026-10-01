@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-cli"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "clap",
  "docxtpl-rs",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-compat"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "fancy-regex",
  "proptest",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-opc"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "proptest",
  "quick-xml",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-rich"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "sha1",
  "thiserror",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-rs"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "crc32fast",
  "docxtpl-compat",
@@ -389,7 +389,9 @@ dependencies = [
  "docxtpl-template",
  "docxtpl-xml",
  "libc",
+ "regex",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "zip",
@@ -397,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-template"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "docxtpl-compat",
  "docxtpl-rich",
@@ -412,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-xml"
-version = "1.2.1"
+version = "1.3.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -936,6 +938,17 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

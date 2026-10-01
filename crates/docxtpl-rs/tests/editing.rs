@@ -1,8 +1,10 @@
 use std::io::Cursor;
 
+use docxtpl_opc::TargetMode;
 use docxtpl_rs::{
-    Bookmark, CancellationError, CancellationToken, DocxTemplate, FailurePolicy, FormattingPolicy,
-    Package, PackageLimits, RenderOptions, RunTextLimits, StoryKind, StoryScope,
+    Bookmark, CancellationError, CancellationToken, DocxTemplate, EditableStoryKind,
+    EditableStorySelection, FailurePolicy, FormattingPolicy, Package, PackageLimits, RenderOptions,
+    RunFormatOverrides, RunTextLimits, StoryKind, StoryScope,
 };
 use serde_json::json;
 
@@ -22,6 +24,156 @@ const DRAWING_TEMPLATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/templates/r3_docpr.docx"
 );
+const NOTE_TEMPLATE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/templates/p7b_footnotes_real.docx"
+);
+
+#[test]
+fn unified_story_editor_visits_and_edits_notes() -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(NOTE_TEMPLATE)?;
+    let mut document = template.render(
+        &json!({"a_jinja_variable": "A Jinja variable!"}),
+        &RenderOptions::compat(),
+    )?;
+    let mut visited = Vec::new();
+    let mut story_report = None;
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("edit-footnote", FailurePolicy::Abort, |transaction| {
+            story_report = Some(transaction.for_each_editable_story(
+                EditableStorySelection::ALL,
+                |story| {
+                    visited.push((story.name().to_string(), story.kind()));
+                    if story.kind() != EditableStoryKind::Footnote {
+                        return Ok(());
+                    }
+                    let paragraphs: Vec<_> = story
+                        .document()
+                        .descendants(story.document().root())
+                        .into_iter()
+                        .filter(|node| {
+                            story.document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .collect();
+                    for paragraph in paragraphs {
+                        let index = story.run_text_index(paragraph, RunTextLimits::default())?;
+                        if let Some(matched) =
+                            index.find_literal("A Jinja variable!")?.into_iter().next()
+                        {
+                            story.replace_text_match(
+                                &index,
+                                &matched,
+                                "edited footnote",
+                                FormattingPolicy::InheritFirstRun,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?);
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    assert_eq!(
+        visited.first().map(|(_, kind)| *kind),
+        Some(EditableStoryKind::Body)
+    );
+    assert!(visited
+        .iter()
+        .any(|(_, kind)| *kind == EditableStoryKind::Footnote));
+    assert!(visited
+        .iter()
+        .any(|(_, kind)| *kind == EditableStoryKind::Endnote));
+    let footnote_position = visited
+        .iter()
+        .position(|(_, kind)| *kind == EditableStoryKind::Footnote)
+        .expect("footnote story");
+    let endnote_position = visited
+        .iter()
+        .position(|(_, kind)| *kind == EditableStoryKind::Endnote)
+        .expect("endnote story");
+    assert!(footnote_position < endnote_position);
+    let report = story_report.expect("unified story report");
+    assert!(report
+        .changed_parts
+        .contains(&"word/footnotes.xml".to_string()));
+
+    let bytes = document.to_bytes()?;
+    let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+    let footnotes = std::str::from_utf8(reopened.part("word/footnotes.xml").unwrap().bytes()?)?;
+    assert!(footnotes.contains("edited footnote"));
+    assert!(!footnotes.contains("A Jinja variable!"));
+    Ok(())
+}
+
+#[test]
+fn unified_story_editor_supports_word_comments() -> Result<(), Box<dyn std::error::Error>> {
+    const COMMENTS_CONTENT_TYPE: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+    const COMMENTS_REL_TYPE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    const COMMENTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="docxtpl-rs"><w:p><w:r><w:t>comment target</w:t></w:r></w:p></w:comment></w:comments>"#;
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "body"}), &RenderOptions::compat())?;
+    document.edit_package(|package| {
+        let mut transaction = package.transaction();
+        transaction.add_part("word/comments.xml", COMMENTS_XML.as_bytes().to_vec())?;
+        transaction.register_content_type("word/comments.xml", COMMENTS_CONTENT_TYPE)?;
+        transaction.get_or_add_relationship(
+            "word/document.xml",
+            COMMENTS_REL_TYPE,
+            "comments.xml",
+            TargetMode::Internal,
+        )?;
+        transaction.commit();
+        Ok(())
+    })?;
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("edit-comment", FailurePolicy::Abort, |transaction| {
+            let report =
+                transaction.for_each_editable_story(EditableStorySelection::COMMENTS, |story| {
+                    assert_eq!(story.kind(), EditableStoryKind::Comment);
+                    let paragraph = story
+                        .document()
+                        .descendants(story.document().root())
+                        .into_iter()
+                        .find(|node| {
+                            story.document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("comment paragraph");
+                    let index = story.run_text_index(paragraph, RunTextLimits::default())?;
+                    let matched = index.find_literal("comment target")?.remove(0);
+                    story.replace_text_match(
+                        &index,
+                        &matched,
+                        "comment edited",
+                        FormattingPolicy::RequireUniform,
+                    )?;
+                    Ok(())
+                })?;
+            assert_eq!(report.parsed_parts, 1);
+            assert_eq!(report.changed_parts, vec!["word/comments.xml"]);
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let bytes = document.to_bytes()?;
+    let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+    let comments = std::str::from_utf8(reopened.part("word/comments.xml").unwrap().bytes()?)?;
+    assert!(comments.contains("comment edited"));
+    assert!(!comments.contains("comment target"));
+    Ok(())
+}
 
 #[test]
 fn public_run_text_index_finds_and_replaces_literal_text() -> Result<(), Box<dyn std::error::Error>>
@@ -67,6 +219,54 @@ fn public_run_text_index_finds_and_replaces_literal_text() -> Result<(), Box<dyn
     let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
     assert!(xml.contains("replaced"));
     assert!(!xml.contains("indexed"));
+    Ok(())
+}
+
+#[test]
+fn public_run_text_index_replaces_regex_with_format_overrides(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "item-42"}), &RenderOptions::compat())?;
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("replace-regex", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story(EditableStorySelection::BODY, |story| {
+                let paragraphs: Vec<_> = story
+                    .document()
+                    .descendants(story.document().root())
+                    .into_iter()
+                    .filter(|node| {
+                        story
+                            .document()
+                            .tag(*node)
+                            .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p")
+                    })
+                    .collect();
+                let mut replacements = 0;
+                for paragraph in paragraphs {
+                    let index = story.run_text_index(paragraph, RunTextLimits::default())?;
+                    replacements += story.replace_regex_all(
+                        &index,
+                        r"item-(\d+)",
+                        "value-$1",
+                        FormattingPolicy::InheritFirstRun,
+                        &RunFormatOverrides::new().bold(true).color("336699"),
+                    )?;
+                }
+                assert_eq!(replacements, 1);
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let bytes = document.to_bytes()?;
+    let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(xml.contains("value-42"));
+    assert!(!xml.contains("item-42"));
+    assert!(xml.contains("w:color w:val=\"336699\""));
     Ok(())
 }
 

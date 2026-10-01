@@ -7,7 +7,10 @@ not affiliated with or endorsed by the Python docxtpl project. Python docxtpl
 is used only as the pinned development-time compatibility oracle; it is not a
 runtime dependency of any published Rust crate.
 The current stable version is `1.2.1`, retaining the P0–P7 compatibility
-baseline and controlled single-package post-processing pipeline. It remains
+baseline and controlled single-package post-processing pipeline. The workspace
+is developing `1.3.0`; its first additive milestone extends the editable story
+API to body, headers, footers, footnotes, endnotes, and Word comments, and adds
+bounded regex/capture replacement with composable run-format overrides. It remains
 aligned with Python docxtpl 0.20.2. The 1.0 line is the first public compatibility
 baseline; earlier development
 snapshots are not supported release or migration targets. See the
@@ -34,6 +37,60 @@ The release procedure and crate order are described in
 [RELEASING.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/RELEASING.md).
 Release evidence is tracked in
 [docs/release-readiness.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/docs/release-readiness.md).
+
+The developing 1.3 API can opt into a caller-owned persistent preprocessing
+cache. The supplied root receives an isolated `docxtpl-rs-prepared-v1`
+subdirectory; ordinary templates do not create a disk cache:
+
+```rust
+use docxtpl_rs::{DocxTemplate, PreparedCachePolicy, PreparedTemplateCache};
+
+let cache = PreparedTemplateCache::new(".cache", PreparedCachePolicy::default())?;
+let template = DocxTemplate::open("template.docx")?.with_prepared_cache(cache.clone());
+let stats = cache.stats();
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Rendering, transactional post-processing, and output can share one cooperative
+control carrying both cancellation and a monotonic deadline:
+
+```rust
+use std::time::Duration;
+use docxtpl_rs::RenderControl;
+
+let control = RenderControl::new().with_timeout(Duration::from_secs(30));
+// template.render_with_control(&context, &options, &control)?;
+```
+
+The developing 1.3 API also provides runtime-neutral async scheduling without
+making Tokio or another runtime a core dependency. Inject a blocking executor,
+set an explicit bound for running plus queued work, then await the returned
+`RenderTask` in the caller's runtime:
+
+```rust,ignore
+use std::sync::Arc;
+use docxtpl_rs::{
+    AsyncRenderDispatcher, BlockingTask, DocxTemplate, RenderControl,
+    RenderOptions,
+};
+
+let executor = |task: BlockingTask| {
+    runtime.spawn_blocking(task);
+    Ok(())
+};
+let dispatcher = AsyncRenderDispatcher::new(executor, 8)?;
+let task = dispatcher.render(
+    Arc::new(DocxTemplate::open("template.docx")?),
+    serde_json::json!({"name": "Vega"}),
+    RenderOptions::compat(),
+    RenderControl::new(),
+)?;
+let document = task.await?;
+```
+
+Submission is non-blocking. A saturated dispatcher returns
+`AsyncDispatchError::QueueFull`; cancelling the task's shared control also
+stops work that is still waiting in the executor queue when it begins.
 
 `context.json` is a JSON object, for example
 `{"name":"Vega","items":[{"name":"Apple"}]}`.

@@ -273,6 +273,22 @@ pub struct PreparedXmlTemplate {
     shape_id: i64,
 }
 
+impl PreparedXmlTemplate {
+    /// Stable cache representation used by the facade's versioned persistent
+    /// prepared-template cache. This is not a general serialization format.
+    #[doc(hidden)]
+    pub fn cache_parts(&self) -> (&str, i64) {
+        (&self.prepared, self.shape_id)
+    }
+
+    /// Reconstruct a value after the facade has validated its cache envelope,
+    /// source digest, version, options fingerprint, and payload checksum.
+    #[doc(hidden)]
+    pub fn from_cache_parts(prepared: String, shape_id: i64) -> Self {
+        Self { prepared, shape_id }
+    }
+}
+
 /// Inserts a newline before `<w:p>` (the opening move of upstream
 /// render_xml_part; solely for error line-number localization).
 fn newline_before_p() -> &'static Regex {

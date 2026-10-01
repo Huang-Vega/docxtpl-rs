@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+- Started 1.3.0 development with an additive unified editable-story API. The
+  new selection and editor types cover body, headers, footers, footnotes,
+  endnotes, and Word comments without extending the exhaustively matchable 1.2
+  enums.
+- Extended bounded run-text indexing and replacement to every story supported
+  by the unified editor. Story enumeration and write-back are deterministic,
+  transactional, cancellation-aware, and retain the existing per-part XML
+  serialization rules.
+- Completed the 1.3 bounded `RunTextIndex` stage with size-limited linear-time
+  regex search, capture expansion, validated multi-match replacement from one
+  snapshot, aggregate growth limits, and composable bold/italic/underline/color
+  run-property overrides. Structural field, drawing, hyperlink, and container
+  boundaries remain explicit non-crossing safety barriers.
+- Added an opt-in persistent prepared-template cache with a versioned binary
+  envelope, source-template and part SHA-256 identities, options fingerprint,
+  payload checksum, atomic writes, corruption fallback, TTL/capacity eviction,
+  and hit/miss/write/eviction diagnostics. Cache directories and lifetimes are
+  explicitly owned by callers; no process-global cache is created.
+- Added unified `RenderControl` and `RenderLimits` APIs. One cloneable control
+  now carries cooperative cancellation plus an optional monotonic deadline
+  through plain/rich rendering, render sessions, transactional post-processing,
+  validation, and interruptible ZIP output. Deadline and cancellation outcomes
+  are distinct, while the 1.2 cancellation and `ResourceLimits` APIs remain
+  source-compatible entry points.
+- Added a runtime-neutral `AsyncRenderDispatcher` over the synchronous core.
+  Callers inject their runtime's blocking executor; awaitable `RenderTask`
+  handles support plain/rich rendering and atomic save, propagate the same
+  cancellation/deadline control, and reject overload through an explicit bound
+  on accepted running plus queued jobs.
+
 ## [1.2.1] - 2026-10-01
 
 - Added a bounded `RunTextIndex` MVP for literal search and safe single- or

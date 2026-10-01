@@ -1,5 +1,6 @@
 use docxtpl_rs::{
-    DocxTemplate, FailurePolicy, FormattingPolicy, RenderOptions, RunTextLimits, StoryScope,
+    DocxTemplate, EditableStorySelection, FailurePolicy, FormattingPolicy, RenderOptions,
+    RunFormatOverrides, RunTextLimits,
 };
 use serde_json::json;
 
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "replace-visible-text",
             FailurePolicy::Abort,
             |transaction| {
-                transaction.for_each_story(StoryScope::BodyHeadersFooters, |story| {
+                transaction.for_each_editable_story(EditableStorySelection::ALL, |story| {
                     let paragraphs: Vec<_> = story
                         .document()
                         .descendants(story.document().root())
@@ -38,15 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     for paragraph in paragraphs {
                         let index = story.run_text_index(paragraph, RunTextLimits::default())?;
-                        let matches = index.find_literal("visible target")?;
-                        if let Some(matched) = matches.first() {
-                            story.replace_text_match(
-                                &index,
-                                matched,
-                                "replacement accepted",
-                                FormattingPolicy::InheritFirstRun,
-                            )?;
-                        }
+                        story.replace_regex_all(
+                            &index,
+                            r"visible\s+target",
+                            "replacement accepted",
+                            FormattingPolicy::InheritFirstRun,
+                            &RunFormatOverrides::new().bold(true).color("336699"),
+                        )?;
                     }
                     Ok(())
                 })?;
