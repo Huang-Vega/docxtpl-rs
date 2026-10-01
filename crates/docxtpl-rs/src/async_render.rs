@@ -276,12 +276,15 @@ impl<E: BlockingExecutor> AsyncRenderDispatcher<E> {
         let shared = Arc::new(SharedTask::pending());
         let worker_shared = Arc::clone(&shared);
         let job = Box::new(move || {
-            let _permit = permit;
             let result = catch_unwind(AssertUnwindSafe(operation)).unwrap_or_else(|_| {
                 Err(RenderControlError::Operation(Error::Io(
                     std::io::Error::other("blocking render job panicked"),
                 )))
             });
+            // Capacity is part of completion visibility: once the future is
+            // woken and can observe Ready, the accepted slot must already be
+            // reusable by the caller.
+            drop(permit);
             worker_shared.complete(result);
         });
         self.executor.execute(job)?;
