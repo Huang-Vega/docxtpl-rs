@@ -34,8 +34,6 @@ cargo install docxtpl-cli --version 1.3.0 --locked
 
 The release procedure and crate order are described in
 [RELEASING.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/RELEASING.md).
-Release evidence is tracked in
-[docs/1.3.0-release-readiness.md](https://github.com/Huang-Vega/docxtpl-rs/blob/master/docs/1.3.0-release-readiness.md).
 
 The 1.3 API can opt into a caller-owned persistent preprocessing
 cache. The supplied root receives an isolated `docxtpl-rs-prepared-v1`

@@ -7,9 +7,8 @@ skipping the gates.
 
 ## RC gates
 
-1. Confirm that `Cargo.toml`, `Cargo.lock`, README, CHANGELOG, the migration
-   guide, and [`docs/release-readiness.md`](docs/release-readiness.md) all agree
-   on the version.
+1. Confirm that `Cargo.toml`, `Cargo.lock`, README, CHANGELOG, and the migration
+   guide all agree on the version.
 2. Run formatting, Clippy, workspace tests, the oracle, MSRV, the license audit,
    and the documentation build.
 3. Run `cargo package --workspace --locked --no-verify`, then
