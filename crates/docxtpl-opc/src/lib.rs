@@ -67,7 +67,7 @@ pub use crate::error::{InterruptibleWriteError, OpcError};
 pub use crate::limits::PackageLimits;
 pub use crate::package::{
     MediaCompression, Package, PackageEvictionReport, PackageResidency, PackageTransaction,
-    PackageWriteReport, WriteOptions,
+    PackageTransactionMetrics, PackageWriteReport, WriteOptions,
 };
 pub use crate::part::{FilePartSource, Part};
 pub use crate::rels::{Relationship, Relationships, TargetMode};

@@ -127,6 +127,19 @@ pub fn probe_with_digest(blob: &[u8]) -> Result<(ImageInfo, ImageDigest), ImageE
     Ok((info, digest))
 }
 
+/// Parse image metadata and hash the payload with a cancellation checkpoint
+/// between 64 KiB chunks. `Ok(None)` means cancellation was requested.
+pub fn probe_with_digest_interruptible(
+    blob: &[u8],
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Option<(ImageInfo, ImageDigest)>, ImageError> {
+    let Some(digest) = sha1_digest_interruptible(blob, should_cancel) else {
+        return Ok(None);
+    };
+    let info = probe_with_sha1(blob, digest_hex(&digest))?;
+    Ok(Some((info, digest)))
+}
+
 fn probe_with_sha1(blob: &[u8], sha1: String) -> Result<ImageInfo, ImageError> {
     if has_signature(blob, 0, b"\x89PNG\r\n\x1a\n") {
         let (px_w, px_h, dpi_x, dpi_y) = parse_png(blob)?;
@@ -226,6 +239,25 @@ pub fn sha1_digest(blob: &[u8]) -> ImageDigest {
     Sha1::digest(blob).into()
 }
 
+/// Hash a payload with cooperative cancellation between 64 KiB chunks.
+#[must_use]
+pub fn sha1_digest_interruptible(
+    blob: &[u8],
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<ImageDigest> {
+    let mut hasher = Sha1::new();
+    for chunk in blob.chunks(64 * 1024) {
+        if should_cancel() {
+            return None;
+        }
+        hasher.update(chunk);
+    }
+    if should_cancel() {
+        return None;
+    }
+    Some(hasher.finalize().into())
+}
+
 fn digest_hex(digest: &ImageDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex = String::with_capacity(40);
@@ -234,6 +266,26 @@ fn digest_hex(digest: &ImageDigest) -> String {
         hex.push(HEX[(byte & 0x0f) as usize] as char);
     }
     hex
+}
+
+#[cfg(test)]
+mod interruptible_tests {
+    use std::cell::Cell;
+
+    use super::sha1_digest_interruptible;
+
+    #[test]
+    fn large_digest_observes_chunk_cancellation() {
+        let bytes = vec![7u8; 3 * 64 * 1024];
+        let checks = Cell::new(0usize);
+        let digest = sha1_digest_interruptible(&bytes, &|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 2
+        });
+        assert!(digest.is_none());
+        assert_eq!(checks.get(), 2);
+    }
 }
 
 // ---------- Integer read helpers that return None out of bounds (upstream StreamReader raises) ----------

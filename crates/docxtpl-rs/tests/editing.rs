@@ -1,10 +1,13 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use docxtpl_opc::TargetMode;
 use docxtpl_rs::{
     Bookmark, CancellationError, CancellationToken, DocxTemplate, EditableStoryKind,
-    EditableStorySelection, FailurePolicy, FormattingPolicy, Package, PackageLimits, RenderOptions,
-    RunFormatOverrides, RunTextLimits, StoryKind, StoryScope,
+    EditableStorySelection, FailurePolicy, FilePartSource, FormattingPolicy, FragmentImportOptions,
+    ImageLayout, InlineImageOptions, MediaSource, Package, PackageLimits, PartCachePolicy,
+    PostprocessError, PostprocessRunError, ProbedMediaFile, RenderOptions, RenderedDocument,
+    ResourceLimits, RunFormatOverrides, RunTextLimits, StoryKind, StoryScope, WordFragment,
 };
 use serde_json::json;
 
@@ -28,6 +31,42 @@ const NOTE_TEMPLATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/templates/p7b_footnotes_real.docx"
 );
+
+fn import_simple_fragment_into_selection(
+    document: &mut RenderedDocument,
+    selection: EditableStorySelection,
+    source_bytes: &[u8],
+) -> Result<Vec<EditableStoryKind>, docxtpl_rs::Error> {
+    let mut visited = Vec::new();
+    document.postprocess(|pipeline| {
+        pipeline.pass("six-story-fragment", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(selection, |context| {
+                let source =
+                    Package::from_reader(Cursor::new(source_bytes), &PackageLimits::default())?;
+                let fragment = WordFragment::from_package(source, "word/document.xml")?;
+                let paragraph =
+                    context
+                        .story()
+                        .document()
+                        .descendants(context.story().document().root())
+                        .into_iter()
+                        .find(|node| {
+                            context.story().document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("selected Story has a paragraph");
+                context.import_fragment(paragraph, fragment, FragmentImportOptions::default())?;
+                visited.push(context.story().kind());
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    Ok(visited)
+}
 
 #[test]
 fn unified_story_editor_visits_and_edits_notes() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,6 +151,708 @@ fn unified_story_editor_visits_and_edits_notes() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn story_resource_context_uses_current_owner_for_body_headers_footers_and_notes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let media_bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+    let context: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/contexts/p5_hf_basic.json"
+    )))?;
+    let template = DocxTemplate::open(STORY_TEMPLATE)?;
+    let mut document = template.render(&context, &RenderOptions::compat())?;
+    let mut visited = Vec::new();
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("story-resources", FailurePolicy::Abort, |transaction| {
+            let report = transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::BODY_HEADERS_FOOTERS,
+                |story| {
+                    let owner = story.story().name().to_string();
+                    let kind = story.story().kind();
+                    let media = story
+                        .resources()
+                        .register_media_bytes("photo.bin", Arc::clone(&media_bytes))?;
+                    let rid = story.resources().relate_image(&media)?;
+                    visited.push((owner, kind, rid));
+                    Ok(())
+                },
+            )?;
+            assert_eq!(report.parsed_parts, visited.len());
+            assert_eq!(report.serialized_parts, 0);
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    assert!(visited
+        .iter()
+        .any(|(_, kind, _)| *kind == EditableStoryKind::Body));
+    assert!(visited
+        .iter()
+        .any(|(_, kind, _)| *kind == EditableStoryKind::Header));
+    assert!(visited
+        .iter()
+        .any(|(_, kind, _)| *kind == EditableStoryKind::Footer));
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    for (owner, _, rid) in visited {
+        assert!(reopened
+            .relationships_of(&owner)
+            .is_some_and(|rels| rels.get(&rid).is_some()));
+    }
+
+    let template = DocxTemplate::open(NOTE_TEMPLATE)?;
+    let mut document = template.render(
+        &json!({"a_jinja_variable": "A Jinja variable!"}),
+        &RenderOptions::compat(),
+    )?;
+    let mut note_kinds = Vec::new();
+    document.postprocess(|pipeline| {
+        pipeline.pass("note-resources", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::NOTES,
+                |story| {
+                    let media = story
+                        .resources()
+                        .register_media_bytes("note.png", Arc::clone(&media_bytes))?;
+                    story.resources().relate_image(&media)?;
+                    note_kinds.push(story.story().kind());
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+    assert!(note_kinds.contains(&EditableStoryKind::Footnote));
+    assert!(note_kinds.contains(&EditableStoryKind::Endnote));
+    document.to_bytes()?;
+    Ok(())
+}
+
+#[test]
+fn inline_image_insertion_reuses_relationships_and_clone_renumbers_drawing_ids(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document =
+        template.render(&json!({"name": "drawing target"}), &RenderOptions::compat())?;
+    let media_bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+
+    document.postprocess(|pipeline| {
+        pipeline.pass(
+            "insert-inline-images",
+            FailurePolicy::Abort,
+            |transaction| {
+                transaction.for_each_editable_story_with_resources(
+                    EditableStorySelection::BODY,
+                    |context| {
+                        let media = context
+                            .resources()
+                            .register_media_bytes("photo.png", Arc::clone(&media_bytes))?;
+                        let target_run = context
+                            .story()
+                            .document()
+                            .descendants(context.story().document().root())
+                            .into_iter()
+                            .find(|node| {
+                                context.story().document().tag(*node).is_some_and(|tag| {
+                                    tag.ns == docxtpl_xml::ns_uri::W && tag.local == "r"
+                                })
+                            })
+                            .expect("body run");
+                        let options = InlineImageOptions {
+                            layout: ImageLayout::FitWithin {
+                                width: 100_000,
+                                height: 100_000,
+                            },
+                            title: Some("Product photo".to_string()),
+                            description: Some("Accessible description".to_string()),
+                            hyperlink: Some("https://example.test/product".to_string()),
+                        };
+                        let first = context.insert_inline_image(target_run, &media, &options)?;
+                        let second = context.insert_inline_image(target_run, &media, &options)?;
+                        assert_eq!(first.relationship_id, second.relationship_id);
+                        assert_ne!(first.doc_pr_id, second.doc_pr_id);
+                        assert_ne!(first.picture_id, second.picture_id);
+                        context.clone_drawing_to_run(first.drawing, target_run)?;
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    reopened.validate()?;
+    let relationships = reopened
+        .relationships_of("word/document.xml")
+        .expect("document relationships");
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| relationship.rel_type.ends_with("/image"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| relationship.target == "https://example.test/product")
+            .count(),
+        1
+    );
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert_eq!(xml.matches("<w:drawing").count(), 3);
+    assert_eq!(xml.matches(r#"cx="100000" cy="50000""#).count(), 6);
+    assert_eq!(xml.matches(r#"title="Product photo""#).count(), 6);
+    assert_eq!(xml.matches(r#"descr="Accessible description""#).count(), 6);
+
+    let parsed = docxtpl_xml::XmlDocument::parse_strict(xml, &docxtpl_xml::XmlLimits::default())?;
+    for (namespace, local) in [
+        (docxtpl_xml::ns_uri::WP, "docPr"),
+        (docxtpl_xml::ns_uri::PIC, "cNvPr"),
+    ] {
+        let ids: Vec<_> = parsed
+            .descendants(parsed.root())
+            .into_iter()
+            .filter(|node| {
+                parsed
+                    .tag(*node)
+                    .is_some_and(|tag| tag.ns == namespace && tag.local == local)
+            })
+            .map(|node| parsed.attr(node, "", "id").unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_managed_drawing_id_rolls_back_the_shared_transaction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document =
+        template.render(&json!({"name": "drawing target"}), &RenderOptions::compat())?;
+    let media_bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+
+    let report = document.postprocess(|pipeline| {
+        pipeline.pass(
+            "duplicate-drawing-id",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                transaction.for_each_editable_story_with_resources(
+                    EditableStorySelection::BODY,
+                    |context| {
+                        let media = context
+                            .resources()
+                            .register_media_bytes("photo.png", Arc::clone(&media_bytes))?;
+                        let target_run = context
+                            .story()
+                            .document()
+                            .descendants(context.story().document().root())
+                            .into_iter()
+                            .find(|node| {
+                                context.story().document().tag(*node).is_some_and(|tag| {
+                                    tag.ns == docxtpl_xml::ns_uri::W && tag.local == "r"
+                                })
+                            })
+                            .expect("body run");
+                        let first = context.insert_inline_image(
+                            target_run,
+                            &media,
+                            &InlineImageOptions::default(),
+                        )?;
+                        let second = context.insert_inline_image(
+                            target_run,
+                            &media,
+                            &InlineImageOptions::default(),
+                        )?;
+                        let second_doc_pr = context
+                            .story()
+                            .document()
+                            .descendants(second.drawing)
+                            .into_iter()
+                            .find(|node| {
+                                context.story().document().tag(*node).is_some_and(|tag| {
+                                    tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr"
+                                })
+                            })
+                            .expect("second docPr");
+                        context.story_mut().document_mut().set_attr(
+                            second_doc_pr,
+                            "",
+                            "id",
+                            first.doc_pr_id.to_string(),
+                        );
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+
+    assert!(report.passes[0].rolled_back);
+    assert!(report.passes[0].warnings[0]
+        .message
+        .contains("duplicate managed docPr id"));
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(!xml.contains("<w:drawing"));
+    assert!(reopened
+        .relationships_of("word/document.xml")
+        .is_none_or(|relationships| relationships
+            .iter()
+            .all(|relationship| !relationship.rel_type.ends_with("/image"))));
+    Ok(())
+}
+
+#[test]
+fn word_fragment_import_remaps_images_links_numbering_and_drawing_ids(
+) -> Result<(), Box<dyn std::error::Error>> {
+    const NUMBERING_REL: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+    const NUMBERING_CT: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
+    const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="4"><w:nsid w:val="12345678"/><w:multiLevelType w:val="singleLevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="4"/></w:num></w:numbering>"#;
+
+    let source_context: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/contexts/r3_docpr.json"
+    )))?;
+    let source_template = DocxTemplate::open(DRAWING_TEMPLATE)?;
+    let mut source = source_template.render(&source_context, &RenderOptions::compat())?;
+    source.postprocess(|pipeline| {
+        pipeline.pass("source-link", FailurePolicy::Abort, |transaction| {
+            let rid = transaction
+                .relate_external_hyperlink("word/document.xml", "https://example.test/imported")?;
+            transaction.for_each_story(StoryScope::Body, |story| {
+                let drawing = story
+                    .document()
+                    .descendants(story.document().root())
+                    .into_iter()
+                    .find(|node| {
+                        story.document().tag(*node).is_some_and(|tag| {
+                            tag.ns == docxtpl_xml::ns_uri::W && tag.local == "drawing"
+                        })
+                    })
+                    .expect("source drawing");
+                story.attach_drawing_external_link(drawing, &rid)
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+    source.edit_package(|package| {
+        let mut transaction = package.transaction();
+        if transaction.part("word/numbering.xml").is_some() {
+            transaction.set_part_bytes("word/numbering.xml", NUMBERING_XML.as_bytes().to_vec())?;
+        } else {
+            transaction.add_part("word/numbering.xml", NUMBERING_XML.as_bytes().to_vec())?;
+        }
+        transaction.register_content_type("word/numbering.xml", NUMBERING_CT)?;
+        transaction.get_or_add_relationship(
+            "word/document.xml",
+            NUMBERING_REL,
+            "numbering.xml",
+            TargetMode::Internal,
+        )?;
+        let xml = std::str::from_utf8(
+            transaction
+                .part("word/document.xml")
+                .expect("source document")
+                .bytes()?,
+        )
+        .expect("source document is UTF-8");
+        let mut tree =
+            docxtpl_xml::XmlDocument::parse_strict(xml, &docxtpl_xml::XmlLimits::default())
+                .expect("source document parses");
+        let paragraph = tree
+            .descendants(tree.root())
+            .into_iter()
+            .find(|node| {
+                tree.tag(*node)
+                    .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p")
+            })
+            .expect("source paragraph");
+        let p_pr = tree.new_w_element("pPr", vec![]).expect("pPr");
+        let num_pr = tree.new_w_element("numPr", vec![]).expect("numPr");
+        let ilvl = tree
+            .new_w_element("ilvl", vec![("val".into(), "0".into())])
+            .expect("ilvl");
+        let num_id = tree
+            .new_w_element("numId", vec![("val".into(), "7".into())])
+            .expect("numId");
+        tree.append_child(num_pr, ilvl);
+        tree.append_child(num_pr, num_id);
+        tree.append_child(p_pr, num_pr);
+        tree.insert_child_at(paragraph, 0, p_pr);
+
+        let bookmark_start = tree
+            .new_w_element(
+                "bookmarkStart",
+                vec![
+                    ("id".into(), "0".into()),
+                    ("name".into(), "Imported Bookmark".into()),
+                ],
+            )
+            .expect("bookmarkStart");
+        let hyperlink = tree
+            .new_w_element(
+                "hyperlink",
+                vec![("anchor".into(), "Imported Bookmark".into())],
+            )
+            .expect("hyperlink");
+        let link_run = tree.new_w_element("r", vec![]).expect("link run");
+        let link_text = tree.new_w_element("t", vec![]).expect("link text");
+        tree.set_element_text(link_text, "fragment jump");
+        tree.append_child(link_run, link_text);
+        tree.append_child(hyperlink, link_run);
+        let bookmark_end = tree
+            .new_w_element("bookmarkEnd", vec![("id".into(), "0".into())])
+            .expect("bookmarkEnd");
+        tree.append_child(paragraph, bookmark_start);
+        tree.append_child(paragraph, hyperlink);
+        tree.append_child(paragraph, bookmark_end);
+
+        let table = tree.new_w_element("tbl", vec![]).expect("table");
+        let row = tree.new_w_element("tr", vec![]).expect("row");
+        let cell = tree.new_w_element("tc", vec![]).expect("cell");
+        let cell_paragraph = tree.new_w_element("p", vec![]).expect("cell paragraph");
+        let cell_run = tree.new_w_element("r", vec![]).expect("cell run");
+        let cell_text = tree.new_w_element("t", vec![]).expect("cell text");
+        tree.set_element_text(cell_text, "fragment table cell");
+        tree.append_child(cell_run, cell_text);
+        tree.append_child(cell_paragraph, cell_run);
+        tree.append_child(cell, cell_paragraph);
+        tree.append_child(row, cell);
+        tree.append_child(table, row);
+        let body = tree
+            .descendants(tree.root())
+            .into_iter()
+            .find(|node| {
+                tree.tag(*node)
+                    .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "body")
+            })
+            .expect("source body");
+        let insert_position = tree
+            .children(body)
+            .iter()
+            .position(|node| {
+                tree.tag(*node)
+                    .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "sectPr")
+            })
+            .unwrap_or(tree.children(body).len());
+        tree.insert_child_at(body, insert_position, table);
+        transaction.set_part_bytes("word/document.xml", tree.serialize().into_bytes())?;
+        transaction.commit();
+        Ok(())
+    })?;
+    let source_package =
+        Package::from_reader(Cursor::new(source.to_bytes()?), &PackageLimits::default())?;
+    let mut fragment = Some(WordFragment::from_package(
+        source_package,
+        "word/document.xml",
+    )?);
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "target"}), &RenderOptions::compat())?;
+    let mut import_report = None;
+    document.postprocess(|pipeline| {
+        pipeline.pass("import-wordml", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::BODY,
+                |context| {
+                    let target = context
+                        .story()
+                        .document()
+                        .descendants(context.story().document().root())
+                        .into_iter()
+                        .find(|node| {
+                            context.story().document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("target paragraph");
+                    import_report = Some(context.import_fragment(
+                        target,
+                        fragment.take().expect("body visited once"),
+                        FragmentImportOptions::default(),
+                    )?);
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let report = import_report.expect("fragment import report");
+    assert!(report.inserted_nodes > 0);
+    assert!(report.image_relationships > 0);
+    assert_eq!(report.hyperlink_relationships, 1);
+    assert_eq!(report.numbering_instances, 1);
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    reopened.validate()?;
+    let relationships = reopened
+        .relationships_of("word/document.xml")
+        .expect("target relationships");
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| relationship.target == "https://example.test/imported")
+            .count(),
+        1
+    );
+    assert!(relationships
+        .iter()
+        .any(|relationship| relationship.rel_type == NUMBERING_REL));
+    let document_xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(document_xml.contains("<w:drawing"));
+    assert!(document_xml.contains("fragment table cell"));
+    assert!(document_xml.contains(r#"w:name="Imported_Bookmark""#));
+    assert!(document_xml.contains(r#"w:anchor="Imported_Bookmark""#));
+    assert!(!document_xml.contains(r#"w:numId w:val="7""#));
+    let numbering = std::str::from_utf8(reopened.part("word/numbering.xml").unwrap().bytes()?)?;
+    assert!(numbering.contains("<w:abstractNum"));
+    assert!(numbering.contains("<w:num"));
+    Ok(())
+}
+
+#[test]
+fn unsupported_fragment_feature_rolls_back_before_target_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_template = DocxTemplate::open(TEMPLATE)?;
+    let mut source =
+        source_template.render(&json!({"name": "chart source"}), &RenderOptions::compat())?;
+    source.edit_package(|package| {
+        let bytes = package.part("word/document.xml").unwrap().bytes()?;
+        let xml = std::str::from_utf8(bytes).expect("source document is UTF-8");
+        let changed = xml.replacen(
+            "</w:r>",
+            r#"<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/></w:r>"#,
+            1,
+        );
+        package.set_part_bytes("word/document.xml", changed.into_bytes())?;
+        Ok(())
+    })?;
+    let source_package =
+        Package::from_reader(Cursor::new(source.to_bytes()?), &PackageLimits::default())?;
+    let mut fragment = Some(WordFragment::from_package(
+        source_package,
+        "word/document.xml",
+    )?);
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut target = template.render(&json!({"name": "unchanged"}), &RenderOptions::compat())?;
+    let report = target.postprocess(|pipeline| {
+        pipeline.pass(
+            "reject-chart-fragment",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                transaction.for_each_editable_story_with_resources(
+                    EditableStorySelection::BODY,
+                    |context| {
+                        let paragraph = context
+                            .story()
+                            .document()
+                            .descendants(context.story().document().root())
+                            .into_iter()
+                            .find(|node| {
+                                context.story().document().tag(*node).is_some_and(|tag| {
+                                    tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                                })
+                            })
+                            .expect("target paragraph");
+                        context.import_fragment(
+                            paragraph,
+                            fragment.take().expect("body visited once"),
+                            FragmentImportOptions::default(),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+    assert!(report.passes[0].rolled_back);
+    assert!(report.passes[0].warnings[0]
+        .message
+        .contains("unsupported WordML fragment feature \"chart\""));
+    let reopened =
+        Package::from_reader(Cursor::new(target.to_bytes()?), &PackageLimits::default())?;
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(xml.contains("unchanged"));
+    assert!(!xml.contains("chart source"));
+    Ok(())
+}
+
+#[test]
+fn word_fragment_import_supports_all_six_editable_story_kinds(
+) -> Result<(), Box<dyn std::error::Error>> {
+    const COMMENTS_CONTENT_TYPE: &str =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+    const COMMENTS_REL_TYPE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    const COMMENTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="docxtpl-rs"><w:p><w:r><w:t>comment target</w:t></w:r></w:p></w:comment></w:comments>"#;
+
+    let source_template = DocxTemplate::open(TEMPLATE)?;
+    let source = source_template.render(
+        &json!({"name": "six story imported text"}),
+        &RenderOptions::compat(),
+    )?;
+    let source_bytes = source.to_bytes()?;
+    let mut all_kinds = Vec::new();
+
+    let context: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/contexts/p5_hf_basic.json"
+    )))?;
+    let template = DocxTemplate::open(STORY_TEMPLATE)?;
+    let mut body_headers_footers = template.render(&context, &RenderOptions::compat())?;
+    all_kinds.extend(import_simple_fragment_into_selection(
+        &mut body_headers_footers,
+        EditableStorySelection::BODY_HEADERS_FOOTERS,
+        &source_bytes,
+    )?);
+
+    let template = DocxTemplate::open(NOTE_TEMPLATE)?;
+    let mut notes = template.render(
+        &json!({"a_jinja_variable": "A Jinja variable!"}),
+        &RenderOptions::compat(),
+    )?;
+    all_kinds.extend(import_simple_fragment_into_selection(
+        &mut notes,
+        EditableStorySelection::NOTES,
+        &source_bytes,
+    )?);
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut comments = template.render(&json!({"name": "body"}), &RenderOptions::compat())?;
+    comments.edit_package(|package| {
+        let mut transaction = package.transaction();
+        transaction.add_part("word/comments.xml", COMMENTS_XML.as_bytes().to_vec())?;
+        transaction.register_content_type("word/comments.xml", COMMENTS_CONTENT_TYPE)?;
+        transaction.get_or_add_relationship(
+            "word/document.xml",
+            COMMENTS_REL_TYPE,
+            "comments.xml",
+            TargetMode::Internal,
+        )?;
+        transaction.commit();
+        Ok(())
+    })?;
+    all_kinds.extend(import_simple_fragment_into_selection(
+        &mut comments,
+        EditableStorySelection::COMMENTS,
+        &source_bytes,
+    )?);
+
+    for kind in [
+        EditableStoryKind::Body,
+        EditableStoryKind::Header,
+        EditableStoryKind::Footer,
+        EditableStoryKind::Footnote,
+        EditableStoryKind::Endnote,
+        EditableStoryKind::Comment,
+    ] {
+        assert!(all_kinds.contains(&kind), "missing {kind:?}: {all_kinds:?}");
+    }
+    for document in [&body_headers_footers, &notes, &comments] {
+        let bytes = document.to_bytes()?;
+        let package = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
+        package.validate()?;
+        assert!(
+            package
+                .parts()
+                .filter(|part| {
+                    !part.is_dir()
+                        && part.bytes().is_ok_and(|bytes| {
+                            bytes
+                                .windows(23)
+                                .any(|window| window == b"six story imported text")
+                        })
+                })
+                .count()
+                > 0
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn story_resource_context_rolls_back_dom_media_and_relationship_together(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "original"}), &RenderOptions::compat())?;
+    let media_bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+    let mut attempted_part = String::new();
+
+    let report = document.postprocess(|pipeline| {
+        pipeline.pass(
+            "story-resource-rollback",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                transaction.for_each_editable_story_with_resources(
+                    EditableStorySelection::BODY,
+                    |context| {
+                        let media = context
+                            .resources()
+                            .register_media_bytes("rollback.png", Arc::clone(&media_bytes))?;
+                        attempted_part = media.part_name.clone();
+                        context.resources().relate_image(&media)?;
+                        let text = context
+                            .story()
+                            .document()
+                            .descendants(context.story().document().root())
+                            .into_iter()
+                            .find(|node| {
+                                context.story().document().tag(*node).is_some_and(|tag| {
+                                    tag.ns == docxtpl_xml::ns_uri::W && tag.local == "t"
+                                })
+                            })
+                            .expect("body text");
+                        context
+                            .story_mut()
+                            .document_mut()
+                            .set_element_text(text, "rolled back story");
+                        Ok(())
+                    },
+                )?;
+                Err(docxtpl_rs::Error::Opc(docxtpl_opc::OpcError::Malformed {
+                    reason: "force shared rollback".to_string(),
+                }))
+            },
+        )?;
+        Ok(())
+    })?;
+
+    assert!(report.passes[0].rolled_back);
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    assert!(!reopened.contains(&attempted_part));
+    let body = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(body.contains("original"));
+    assert!(!body.contains("rolled back story"));
+    assert!(reopened
+        .relationships_of("word/document.xml")
+        .is_none_or(|rels| !rels.iter().any(|rel| rel.rel_type.ends_with("/image"))));
+    Ok(())
+}
+
+#[test]
 fn unified_story_editor_supports_word_comments() -> Result<(), Box<dyn std::error::Error>> {
     const COMMENTS_CONTENT_TYPE: &str =
         "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
@@ -134,11 +875,18 @@ fn unified_story_editor_supports_word_comments() -> Result<(), Box<dyn std::erro
         transaction.commit();
         Ok(())
     })?;
+    let media_bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
 
     document.postprocess(|pipeline| {
         pipeline.pass("edit-comment", FailurePolicy::Abort, |transaction| {
-            let report =
-                transaction.for_each_editable_story(EditableStorySelection::COMMENTS, |story| {
+            let report = transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::COMMENTS,
+                |context| {
+                    let media = context
+                        .resources()
+                        .register_media_bytes("comment.png", Arc::clone(&media_bytes))?;
+                    context.resources().relate_image(&media)?;
+                    let story = context.story_mut();
                     assert_eq!(story.kind(), EditableStoryKind::Comment);
                     let paragraph = story
                         .document()
@@ -159,7 +907,8 @@ fn unified_story_editor_supports_word_comments() -> Result<(), Box<dyn std::erro
                         FormattingPolicy::RequireUniform,
                     )?;
                     Ok(())
-                })?;
+                },
+            )?;
             assert_eq!(report.parsed_parts, 1);
             assert_eq!(report.changed_parts, vec!["word/comments.xml"]);
             Ok(())
@@ -431,7 +1180,15 @@ fn postprocess_pipeline_commits_and_warns_with_pass_local_rollback(
 
     assert_eq!(report.passes.len(), 3);
     assert!(report.passes[0].changed);
+    assert_eq!(report.passes[0].transaction.snapshotted_parts, 1);
+    assert!(report.passes[0].transaction.snapshotted_bytes > 0);
     assert!(report.passes[1].rolled_back);
+    assert_eq!(report.passes[1].transaction.snapshotted_parts, 1);
+    assert!(report.passes[1].rollback_elapsed > std::time::Duration::ZERO);
+    assert_eq!(
+        report.passes[1].residency_after,
+        report.passes[2].residency_before
+    );
     assert_eq!(report.passes[1].warnings[0].code, "pass_rolled_back");
     assert!(!report.passes[2].changed);
     let bytes = document.to_bytes()?;
@@ -510,7 +1267,11 @@ fn story_editor_shares_one_dom_and_serializes_once() -> Result<(), Box<dyn std::
 
     let story_report = story_report.expect("story report");
     assert_eq!(story_report.parsed_parts, 1);
+    assert!(story_report.parsed_bytes > 0);
+    assert!(story_report.parse_elapsed > std::time::Duration::ZERO);
     assert_eq!(story_report.serialized_parts, 1);
+    assert!(story_report.serialized_bytes > 0);
+    assert!(story_report.serialize_elapsed > std::time::Duration::ZERO);
     assert_eq!(story_report.changed_parts, vec!["word/document.xml"]);
     assert_eq!(report.passes[0].touched_parts, vec!["word/document.xml"]);
 
@@ -519,6 +1280,36 @@ fn story_editor_shares_one_dom_and_serializes_once() -> Result<(), Box<dyn std::
     let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
     assert!(xml.contains("second"));
     assert!(!xml.contains("first"));
+    Ok(())
+}
+
+#[test]
+fn story_high_water_policy_evicts_reloadable_clean_parts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "eviction"}), &RenderOptions::compat())?;
+
+    let report = document.postprocess(|pipeline| {
+        pipeline.set_part_cache_policy(PartCachePolicy::EvictAbove { resident_bytes: 0 });
+        pipeline.pass("evict", FailurePolicy::Abort, |transaction| {
+            transaction
+                .part("[Content_Types].xml")
+                .expect("content types")
+                .bytes()?;
+            transaction.for_each_story(StoryScope::Body, |_story| Ok(()))?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let pass = &report.passes[0];
+    assert!(pass.resources.eviction_runs >= 1);
+    assert!(pass.resources.evicted_parts >= 1);
+    assert!(pass.resources.evicted_bytes > 0);
+    assert!(pass.resources.peak_resident_bytes >= pass.residency_before.resident_bytes);
+    assert!(pass.resources.peak_resident_bytes >= pass.residency_after.resident_bytes);
+    assert!(pass.residency_after.resident_bytes <= pass.residency_before.resident_bytes);
+    document.to_bytes()?;
     Ok(())
 }
 
@@ -618,7 +1409,7 @@ fn media_registration_deduplicates_and_relates_multiple_owners(
     let mut registered_part = String::new();
     let mut body_rid = String::new();
 
-    document.postprocess(|pipeline| {
+    let report = document.postprocess(|pipeline| {
         pipeline.pass("media", FailurePolicy::Abort, |transaction| {
             let first = transaction.register_media_path(MEDIA)?;
             assert!(!first.reused);
@@ -639,6 +1430,11 @@ fn media_registration_deduplicates_and_relates_multiple_owners(
         Ok(())
     })?;
 
+    assert_eq!(report.passes[0].resources.media_added, 1);
+    assert_eq!(report.passes[0].resources.media_reused, 1);
+    assert_eq!(report.passes[0].resources.relationships_added, 2);
+    assert_eq!(report.passes[0].resources.relationships_reused, 1);
+
     let bytes = document.to_bytes()?;
     let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
     reopened.validate()?;
@@ -650,6 +1446,272 @@ fn media_registration_deduplicates_and_relates_multiple_owners(
     assert!(reopened
         .relationships_of("word/header1.xml")
         .is_some_and(|rels| rels.iter().any(|rel| rel.rel_type.ends_with("/image"))));
+    Ok(())
+}
+
+#[test]
+fn byte_file_and_path_media_sources_share_dedup_and_detect_content(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document =
+        template.render(&json!({"name": "media sources"}), &RenderOptions::compat())?;
+    let bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+    let original_ptr = bytes.as_ptr();
+    let mut registered_part = String::new();
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("media-sources", FailurePolicy::Abort, |transaction| {
+            let from_bytes =
+                transaction.register_media_bytes("misleading.jpeg", Arc::clone(&bytes))?;
+            assert!(!from_bytes.reused);
+            assert!(from_bytes.part_name.ends_with(".png"));
+            assert_eq!(
+                transaction
+                    .part(&from_bytes.part_name)
+                    .unwrap()
+                    .bytes()?
+                    .as_ptr(),
+                original_ptr,
+                "shared bytes must be retained without copying"
+            );
+
+            let from_path = transaction.register_media_path(MEDIA)?;
+            assert!(from_path.reused);
+            assert_eq!(from_path.part_name, from_bytes.part_name);
+
+            let snapshot = FilePartSource::snapshot(MEDIA)?;
+            let from_source =
+                transaction.register_media_source("also-wrong.gif", MediaSource::File(snapshot))?;
+            assert!(from_source.reused);
+            assert_eq!(from_source.part_name, from_bytes.part_name);
+            registered_part = from_bytes.part_name;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    reopened.validate()?;
+    assert!(reopened.contains(&registered_part));
+    Ok(())
+}
+
+#[test]
+fn media_catalog_is_shared_across_passes_and_restored_after_rollback(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "catalog"}), &RenderOptions::compat())?;
+    let first: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+    let second: Arc<[u8]> = Arc::from(std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/media/p4_wide4x1.png"
+    ))?);
+    let mut rolled_back_part = String::new();
+    let mut retried_part = String::new();
+    let mut metrics = None;
+
+    document.postprocess(|pipeline| {
+        pipeline.pass("catalog-seed", FailurePolicy::Abort, |transaction| {
+            let media = transaction.register_media_bytes("first.png", Arc::clone(&first))?;
+            assert!(!media.reused);
+            Ok(())
+        })?;
+        pipeline.pass(
+            "catalog-rollback",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                let media = transaction.register_media_bytes("second.png", Arc::clone(&second))?;
+                rolled_back_part = media.part_name;
+                Err(docxtpl_rs::Error::Opc(docxtpl_opc::OpcError::Malformed {
+                    reason: "force catalog rollback".to_string(),
+                }))
+            },
+        )?;
+        pipeline.pass("catalog-retry", FailurePolicy::Abort, |transaction| {
+            let media = transaction.register_media_bytes("second.png", Arc::clone(&second))?;
+            assert!(!media.reused, "rolled-back media must not remain cached");
+            retried_part = media.part_name;
+            let reused = transaction.register_media_bytes("first.png", Arc::clone(&first))?;
+            assert!(reused.reused);
+            Ok(())
+        })?;
+        metrics = Some(pipeline.media_catalog_metrics());
+        Ok(())
+    })?;
+
+    assert_eq!(rolled_back_part, retried_part);
+    let metrics = metrics.expect("catalog metrics");
+    assert_eq!(metrics.scanned_parts, 0);
+    assert_eq!(metrics.hashed_bytes, 0);
+    assert!(metrics.cache_hits >= 3, "metrics: {metrics:?}");
+    assert!(metrics.reused_media >= 1, "metrics: {metrics:?}");
+    document.to_bytes()?;
+    Ok(())
+}
+
+#[test]
+fn probed_media_file_reuses_probe_and_detects_late_source_changes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("photo.data");
+    std::fs::copy(MEDIA, &path)?;
+    let probed = ProbedMediaFile::open(&path, &ResourceLimits::default())?;
+    assert_eq!(probed.info().ext, "png");
+    assert_eq!(probed.len(), std::fs::metadata(&path)?.len());
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "probed"}), &RenderOptions::compat())?;
+    let mut metrics = None;
+    document.postprocess(|pipeline| {
+        pipeline.pass("probed-one", FailurePolicy::Abort, |transaction| {
+            assert!(!transaction.register_probed_media(&probed)?.reused);
+            Ok(())
+        })?;
+        pipeline.pass("probed-two", FailurePolicy::Abort, |transaction| {
+            assert!(transaction.register_probed_media(&probed)?.reused);
+            Ok(())
+        })?;
+        metrics = Some(pipeline.media_catalog_metrics());
+        Ok(())
+    })?;
+    let metrics = metrics.expect("catalog metrics");
+    assert_eq!(metrics.scanned_parts, 0);
+    assert_eq!(metrics.hashed_bytes, 0);
+    assert!(metrics.cache_hits >= 1);
+    document.to_bytes()?;
+
+    std::fs::write(&path, b"changed after registration")?;
+    assert!(document.to_bytes().is_err());
+    Ok(())
+}
+
+#[test]
+fn structured_postprocess_error_preserves_code_and_rolls_back_shared_media(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "structured"}), &RenderOptions::compat())?;
+    let bytes: Arc<[u8]> = Arc::from(std::fs::read(MEDIA)?);
+    let mut attempted_part = String::new();
+
+    let report = document.postprocess_structured(|pipeline| {
+        pipeline.pass_structured(
+            "structured-rollback",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                let media = transaction.register_media_bytes("photo.bin", Arc::clone(&bytes))?;
+                attempted_part = media.part_name;
+                Err(PostprocessError::custom(
+                    "fragment.image_placeholder_missing",
+                    "fragment image has no registered source",
+                )
+                .with_part("word/document.xml")
+                .into())
+            },
+        )?;
+        Ok(())
+    })?;
+
+    let pass = &report.passes[0];
+    assert!(pass.rolled_back);
+    assert_eq!(pass.warnings[0].code, "fragment.image_placeholder_missing");
+    assert_eq!(
+        pass.warnings[0].message,
+        "fragment image has no registered source"
+    );
+    assert!(pass.touched_parts.contains(&attempted_part));
+
+    let reopened =
+        Package::from_reader(Cursor::new(document.to_bytes()?), &PackageLimits::default())?;
+    assert!(!reopened.contains(&attempted_part));
+    Ok(())
+}
+
+#[test]
+fn structured_abort_returns_typed_custom_error() -> Result<(), Box<dyn std::error::Error>> {
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "abort"}), &RenderOptions::compat())?;
+
+    let error = document
+        .postprocess_structured(|pipeline| {
+            pipeline.pass_structured("validate", FailurePolicy::Abort, |_transaction| {
+                Err(
+                    PostprocessError::custom("input.missing", "required input is missing")
+                        .with_part("word/document.xml")
+                        .into(),
+                )
+            })?;
+            Ok(())
+        })
+        .expect_err("custom validation must abort");
+
+    let PostprocessRunError::Custom(error) = error else {
+        panic!("expected typed custom error")
+    };
+    assert_eq!(error.code(), "input.missing");
+    assert_eq!(error.message(), "required input is missing");
+    assert_eq!(error.part(), Some("word/document.xml"));
+    Ok(())
+}
+
+#[test]
+fn changed_file_media_snapshot_is_rejected_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("upload.png");
+    std::fs::copy(MEDIA, &path)?;
+    let snapshot = FilePartSource::snapshot(&path)?;
+    std::fs::write(
+        &path,
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/media/p4_wide4x1.png"
+        ))?,
+    )?;
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document = template.render(&json!({"name": "changed"}), &RenderOptions::compat())?;
+    let report = document.postprocess(|pipeline| {
+        pipeline.pass(
+            "changed-source",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                transaction.register_media_source("upload.png", MediaSource::File(snapshot))?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+
+    assert!(report.passes[0].rolled_back);
+    assert!(report.passes[0].touched_parts.is_empty());
+    Ok(())
+}
+
+#[test]
+fn invalid_byte_media_is_rejected_without_package_changes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut document =
+        template.render(&json!({"name": "invalid media"}), &RenderOptions::compat())?;
+
+    let report = document.postprocess(|pipeline| {
+        pipeline.pass(
+            "invalid-media",
+            FailurePolicy::WarnAndRollback,
+            |transaction| {
+                transaction
+                    .register_media_bytes("looks-like.png", Arc::from(&b"not an image"[..]))?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+
+    assert!(report.passes[0].rolled_back);
+    assert!(!report.passes[0].changed);
+    assert!(report.passes[0].touched_parts.is_empty());
+    assert_eq!(report.passes[0].warnings[0].code, "pass_rolled_back");
     Ok(())
 }
 
@@ -853,6 +1915,210 @@ fn existing_drawing_external_link_registers_once_and_updates_both_properties(
         2
     );
     Ok(())
+}
+
+fn exercise_fragment_remap_property(
+    source_id: u16,
+    url_suffix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_context: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/contexts/r3_docpr.json"
+    )))?;
+    let source_template = DocxTemplate::open(DRAWING_TEMPLATE)?;
+    let mut source = source_template.render(&source_context, &RenderOptions::compat())?;
+    let url = format!("https://example.test/property/{url_suffix}");
+    let bookmark_name = format!("property_{source_id}");
+    source.postprocess(|pipeline| {
+        pipeline.pass("property-source", FailurePolicy::Abort, |transaction| {
+            let rid = transaction.relate_external_hyperlink("word/document.xml", &url)?;
+            transaction.for_each_story(StoryScope::Body, |story| {
+                let drawing = story
+                    .document()
+                    .descendants(story.document().root())
+                    .into_iter()
+                    .find(|node| {
+                        story.document().tag(*node).is_some_and(|tag| {
+                            tag.ns == docxtpl_xml::ns_uri::W && tag.local == "drawing"
+                        })
+                    })
+                    .expect("property source drawing");
+                story.attach_drawing_external_link(drawing, &rid)?;
+                let run = story
+                    .document()
+                    .descendants(story.document().root())
+                    .into_iter()
+                    .find(|node| {
+                        story
+                            .document()
+                            .tag(*node)
+                            .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "r")
+                    })
+                    .expect("property source run");
+                story.get_or_create_bookmark(run, &bookmark_name)?;
+
+                let nodes = story.document().descendants(story.document().root());
+                for node in nodes {
+                    let Some(tag) = story.document().tag(node) else {
+                        continue;
+                    };
+                    let replacement = if (tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr")
+                        || (tag.ns == docxtpl_xml::ns_uri::PIC && tag.local == "cNvPr")
+                    {
+                        Some(u64::from(source_id) + 1)
+                    } else if tag.ns == docxtpl_xml::ns_uri::W
+                        && matches!(tag.local.as_str(), "bookmarkStart" | "bookmarkEnd")
+                    {
+                        Some(u64::from(source_id))
+                    } else {
+                        None
+                    };
+                    if let Some(replacement) = replacement {
+                        let namespace = if story.document().tag(node).is_some_and(|tag| {
+                            tag.ns == docxtpl_xml::ns_uri::W
+                                && matches!(tag.local.as_str(), "bookmarkStart" | "bookmarkEnd")
+                        }) {
+                            docxtpl_xml::ns_uri::W
+                        } else {
+                            ""
+                        };
+                        story.document_mut().set_attr(
+                            node,
+                            namespace,
+                            "id",
+                            replacement.to_string(),
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let source_package =
+        Package::from_reader(Cursor::new(source.to_bytes()?), &PackageLimits::default())?;
+    let mut fragment = Some(WordFragment::from_package(
+        source_package,
+        "word/document.xml",
+    )?);
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut target = template.render(
+        &json!({"name": "property target"}),
+        &RenderOptions::compat(),
+    )?;
+    target.postprocess(|pipeline| {
+        pipeline.pass("property-import", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::BODY,
+                |context| {
+                    let paragraph = context
+                        .story()
+                        .document()
+                        .descendants(context.story().document().root())
+                        .into_iter()
+                        .find(|node| {
+                            context.story().document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("property target paragraph");
+                    context.import_fragment(
+                        paragraph,
+                        fragment.take().expect("body visited once"),
+                        FragmentImportOptions::default(),
+                    )?;
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let reopened =
+        Package::from_reader(Cursor::new(target.to_bytes()?), &PackageLimits::default())?;
+    reopened.validate()?;
+    let relationships = reopened
+        .relationships_of("word/document.xml")
+        .expect("imported relationships");
+    assert_eq!(
+        relationships
+            .iter()
+            .filter(|relationship| relationship.target == url)
+            .count(),
+        1
+    );
+    let image = relationships
+        .iter()
+        .find(|relationship| relationship.rel_type.ends_with("/image"))
+        .expect("imported image relationship");
+    let owner = docxtpl_opc::PartUri::new("word/document.xml")?;
+    let image_part = docxtpl_opc::resolve_part_target(owner.parent().as_ref(), &image.target)
+        .expect("image target resolves inside package");
+    assert!(reopened.contains(image_part.as_str()));
+    assert_eq!(
+        reopened.content_types().content_type_of(&image_part),
+        Some("image/png")
+    );
+
+    let xml = std::str::from_utf8(reopened.part("word/document.xml").unwrap().bytes()?)?;
+    let tree = docxtpl_xml::XmlDocument::parse_strict(xml, &docxtpl_xml::XmlLimits::default())?;
+    for (namespace, local) in [
+        (docxtpl_xml::ns_uri::WP, "docPr"),
+        (docxtpl_xml::ns_uri::PIC, "cNvPr"),
+    ] {
+        let ids: Vec<_> = tree
+            .descendants(tree.root())
+            .into_iter()
+            .filter(|node| {
+                tree.tag(*node)
+                    .is_some_and(|tag| tag.ns == namespace && tag.local == local)
+            })
+            .map(|node| tree.attr(node, "", "id").unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+    }
+    let starts: std::collections::HashSet<_> = tree
+        .descendants(tree.root())
+        .into_iter()
+        .filter(|node| {
+            tree.tag(*node)
+                .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "bookmarkStart")
+        })
+        .filter_map(|node| tree.attr(node, docxtpl_xml::ns_uri::W, "id"))
+        .collect();
+    let ends: std::collections::HashSet<_> = tree
+        .descendants(tree.root())
+        .into_iter()
+        .filter(|node| {
+            tree.tag(*node)
+                .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "bookmarkEnd")
+        })
+        .filter_map(|node| tree.attr(node, docxtpl_xml::ns_uri::W, "id"))
+        .collect();
+    assert_eq!(starts, ends);
+    Ok(())
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config {
+        cases: 12,
+        failure_persistence: None,
+        ..proptest::test_runner::Config::default()
+    })]
+
+    #[test]
+    fn fragment_relationship_content_type_and_ids_remain_valid(
+        source_id in 0u16..4096,
+        url_suffix in "[a-z0-9]{1,12}",
+    ) {
+        exercise_fragment_remap_property(source_id, &url_suffix).unwrap();
+    }
 }
 
 #[test]

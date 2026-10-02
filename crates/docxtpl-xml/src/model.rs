@@ -578,6 +578,60 @@ impl XmlDocument {
         }
     }
 
+    /// Deep-copy an element subtree inside this document.
+    ///
+    /// The returned root is detached. Namespace declarations and lexical
+    /// prefixes are preserved because the source and destination share the
+    /// same document namespace table.
+    pub fn deepcopy_element_within(&mut self, src_id: NodeId) -> Result<NodeId, XmlError> {
+        if self.nodes.get(src_id.0 as usize).map(|n| n.kind) != Some(NodeKind::Element) {
+            return Err(XmlError::Parse {
+                line: 0,
+                col: 0,
+                offset: 0,
+                message: "deepcopy_element_within supports element nodes only".to_string(),
+            });
+        }
+
+        fn copy(document: &mut XmlDocument, source: NodeId, parent: Option<NodeId>) -> NodeId {
+            let (kind, children, qname, prefix, attrs, attr_prefix, nsdecls, value, pi_target) = {
+                let node = &document.nodes[source.0 as usize];
+                (
+                    node.kind,
+                    node.children.clone(),
+                    node.qname.clone(),
+                    node.prefix.clone(),
+                    node.attrs.clone(),
+                    node.attr_prefix.clone(),
+                    node.nsdecls.clone(),
+                    node.value.clone(),
+                    node.pi_target.clone(),
+                )
+            };
+            let copied = document.alloc(kind);
+            {
+                let node = &mut document.nodes[copied.0 as usize];
+                node.parent = parent;
+                node.qname = qname;
+                node.prefix = prefix;
+                node.attrs = attrs;
+                node.attr_prefix = attr_prefix;
+                node.nsdecls = nsdecls;
+                node.value = value;
+                node.pi_target = pi_target;
+            }
+            for child in children {
+                let copied_child = copy(document, child, Some(copied));
+                document.nodes[copied.0 as usize]
+                    .children
+                    .push(copied_child);
+            }
+            copied
+        }
+
+        Ok(copy(self, src_id, None))
+    }
+
     /// Deep-copy the element subtree rooted at `src_id` in document `src`
     /// into this document (matching the namespace self-adaptation semantics
     /// of lxml `deepcopy` + `append`).

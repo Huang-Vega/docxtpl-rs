@@ -112,6 +112,18 @@ impl FilePartSource {
         self.len == 0
     }
 
+    /// Source path captured by this snapshot.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// SHA-1 digest captured by this snapshot.
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 20] {
+        self.digest
+    }
+
     pub(crate) fn into_parts(self) -> (PathBuf, u64, Option<SystemTime>, [u8; 20]) {
         (self.path, self.len, self.modified, self.digest)
     }
@@ -156,6 +168,7 @@ impl LazyArchive {
 
 enum PartData {
     Loaded(Vec<u8>),
+    Shared(Arc<[u8]>),
     FileBacked {
         path: PathBuf,
         len: u64,
@@ -185,6 +198,7 @@ impl Clone for PartData {
 
         match self {
             Self::Loaded(data) => Self::Loaded(data.clone()),
+            Self::Shared(data) => Self::Shared(Arc::clone(data)),
             Self::FileBacked {
                 path,
                 len,
@@ -273,6 +287,19 @@ impl Part {
             relationships: None,
             compression,
             last_modified,
+        }
+    }
+
+    pub(crate) fn new_shared(uri: PartUri, data: Arc<[u8]>) -> Self {
+        Self {
+            uri,
+            data: PartData::Shared(data),
+            source_index: None,
+            modified: false,
+            dir: false,
+            relationships: None,
+            compression: CompressionMethod::Deflated,
+            last_modified: None,
         }
     }
 
@@ -374,6 +401,7 @@ impl Part {
     pub(crate) fn resident_len(&self) -> u64 {
         match &self.data {
             PartData::Loaded(data) => data.len() as u64,
+            PartData::Shared(data) => data.len() as u64,
             PartData::FileBacked { cache, .. } | PartData::Lazy { cache, .. } => cache
                 .get()
                 .and_then(|result| result.as_ref().ok())
@@ -390,7 +418,7 @@ impl Part {
                 .get()
                 .and_then(|result| result.as_ref().ok())
                 .map_or(0, |data| data.len() as u64),
-            PartData::Loaded(_) | PartData::FileBacked { .. } => 0,
+            PartData::Loaded(_) | PartData::Shared(_) | PartData::FileBacked { .. } => 0,
         }
     }
 
@@ -407,13 +435,14 @@ impl Part {
             PartData::Lazy { cache, .. } => cache
                 .take()
                 .map(|result| result.map_or(0, |data| data.len() as u64)),
-            PartData::Loaded(_) | PartData::FileBacked { .. } => None,
+            PartData::Loaded(_) | PartData::Shared(_) | PartData::FileBacked { .. } => None,
         }
     }
 
     pub(crate) fn content_len(&self) -> Result<u64, OpcError> {
         match &self.data {
             PartData::Loaded(data) => Ok(data.len() as u64),
+            PartData::Shared(data) => Ok(data.len() as u64),
             PartData::FileBacked { len, .. } => Ok(*len),
             PartData::Lazy { len, .. } => Ok(*len),
         }
@@ -467,6 +496,7 @@ impl Part {
     pub fn bytes(&self) -> Result<&[u8], OpcError> {
         match &self.data {
             PartData::Loaded(data) => Ok(data),
+            PartData::Shared(data) => Ok(data),
             PartData::FileBacked {
                 path,
                 len,
@@ -549,9 +579,19 @@ impl Part {
     /// `true`.
     pub fn is_loaded(&self) -> bool {
         match &self.data {
-            PartData::Loaded(_) => true,
+            PartData::Loaded(_) | PartData::Shared(_) => true,
             PartData::FileBacked { cache, .. } => cache.get().is_some(),
             PartData::Lazy { cache, .. } => cache.get().is_some(),
+        }
+    }
+
+    /// Return a source-verified SHA-1 digest when one is already available
+    /// without materializing or hashing the part.
+    #[must_use]
+    pub fn known_sha1_digest(&self) -> Option<[u8; 20]> {
+        match &self.data {
+            PartData::FileBacked { digest, .. } => Some(*digest),
+            PartData::Loaded(_) | PartData::Shared(_) | PartData::Lazy { .. } => None,
         }
     }
 
@@ -615,6 +655,7 @@ impl fmt::Debug for Part {
                 "loaded_len",
                 &match &self.data {
                     PartData::Loaded(data) => Some(data.len()),
+                    PartData::Shared(data) => Some(data.len()),
                     PartData::FileBacked { cache, .. } => cache
                         .get()
                         .and_then(|result| result.as_ref().ok())

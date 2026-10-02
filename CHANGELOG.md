@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-10-02
+
+- Added symmetric transactional media registration for shared byte-backed and
+  verified file-backed sources. Image format and Content Type are detected from
+  content, SHA-1 deduplication and deterministic `imageN` allocation are shared
+  with path registration, and `Arc<[u8]>` media is retained without copying.
+- Added `PostprocessError` for caller-defined stable pass error codes and safe
+  messages. Recoverable failures preserve the custom code in
+  `PostprocessWarning` while retaining the existing rollback and touched-part
+  report semantics.
+- Added low-level shared immutable OPC parts with the same entry-count and byte
+  limits as owned and file-backed parts.
+- Added `StoryEditContext` and `StoryResources` so all six editable Story kinds
+  can mutate one parsed DOM while registering media and current-owner
+  relationships inside the same rollback boundary.
+- Promoted the media digest/name index to the post-processing pipeline
+  lifetime. Committed passes share it, failed passes restore its state, direct
+  media mutations invalidate it, and callers can inspect scan/hash/hit/reuse
+  counters without recording paths or business data.
+- Added `ProbedMediaFile` for limit-checked, library-created file probes whose
+  metadata and digest can be reused during registration while final output
+  still verifies the file snapshot.
+- Added transactional inline-image insertion to resource-aware Story editing.
+  It supports native, one-sided, exact, and fit-within sizing, accessibility
+  metadata, optional external links, relationship reuse, Story-scoped
+  `docPr`/`cNvPr` id allocation, clone-time renumbering, and pre-commit
+  duplicate/dangling relationship validation.
+- Added first-stage transactional `WordFragment` import for top-level WordML
+  paragraphs and tables. It remaps embedded images, external and internal
+  hyperlinks, bookmarks, numbering, and Drawing ids for any editable Story;
+  chart, OLE, SmartArt, VML image, notes, and other unsupported relationship
+  features fail explicitly before producing dangling content.
+- Added opt-in pass-local clean-part high-water eviction through
+  `PartCachePolicy`, while retaining the existing default behavior. Story edit
+  reports now include parse/serialization bytes and timings; pass reports add
+  transaction journal sizes, relationship/media reuse counts, before/after
+  residency, automatic eviction totals, and rollback time without recording
+  paths, URLs, or business data.
+- Completed the 1.3.1 operational tail with checkpoint-observed peak part
+  residency, atomic-save temporary-file/sync/replace metrics, chunked
+  cancellable media hashing, interruptible OPC validation, and property tests
+  for fragment relationship, Content Type, bookmark, and Drawing-id remapping.
+
 ## [1.3.0] - 2026-10-01
 
 - Started 1.3.0 development with an additive unified editable-story API. The

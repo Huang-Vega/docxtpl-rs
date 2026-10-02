@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::image::{probe, probe_with_digest, py_round, ImageDigest, ImageError, ImageInfo};
+use crate::image::{probe, py_round, ImageDigest, ImageError, ImageInfo};
 use sha1::{Digest, Sha1};
 
 const MAX_INLINE_IMAGE_XML_BYTES: usize = 64 * 1024 * 1024;
@@ -120,15 +120,30 @@ impl InlineImage {
         height: Option<i64>,
         anchor: Option<String>,
     ) -> std::io::Result<Self> {
+        Self::from_path_lazy_path(path, width, height, anchor)
+    }
+
+    /// Constructs a path-backed image from an arbitrary platform path without
+    /// reading its contents.
+    pub fn from_path_lazy_path(
+        path: impl AsRef<Path>,
+        width: Option<i64>,
+        height: Option<i64>,
+        anchor: Option<String>,
+    ) -> std::io::Result<Self> {
+        let path = path.as_ref();
         let metadata = std::fs::metadata(path)?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("lazy image source is not a regular file: {path}"),
+                format!(
+                    "lazy image source is not a regular file: {}",
+                    path.display()
+                ),
             ));
         }
         Ok(Self {
-            path: path.to_owned(),
+            path: path.to_string_lossy().into_owned(),
             blob: Vec::new(),
             width,
             height,
@@ -136,7 +151,7 @@ impl InlineImage {
             title: None,
             descr: None,
             lazy_file: Some(LazyImageFile {
-                path: PathBuf::from(path),
+                path: path.to_path_buf(),
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
             }),
@@ -196,8 +211,23 @@ impl InlineImage {
 
     /// Loads, probes, and hashes this image without retaining lazy file bytes.
     pub fn probe_with_digest(&self) -> Result<(ImageInfo, ImageDigest), InlineImageLoadError> {
+        match self.probe_with_digest_interruptible(&|| false)? {
+            Some(result) => Ok(result),
+            None => unreachable!("non-interruptible image probe cannot be cancelled"),
+        }
+    }
+
+    /// Loads, probes, and hashes this image with a cancellation checkpoint
+    /// between file or in-memory chunks. `Ok(None)` means cancellation.
+    pub fn probe_with_digest_interruptible(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<(ImageInfo, ImageDigest)>, InlineImageLoadError> {
         let Some(source) = &self.lazy_file else {
-            return Ok(probe_with_digest(&self.blob)?);
+            return Ok(crate::image::probe_with_digest_interruptible(
+                &self.blob,
+                should_cancel,
+            )?);
         };
         let before = std::fs::metadata(&source.path)?;
         source.validate_metadata(&before)?;
@@ -208,6 +238,9 @@ impl InlineImage {
         let mut total = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         loop {
+            if should_cancel() {
+                return Ok(None);
+            }
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
@@ -230,7 +263,10 @@ impl InlineImage {
         let digest: ImageDigest = hasher.finalize().into();
         let mut info = info.ok_or(ImageError::Unrecognized)?;
         info.sha1 = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        Ok((info, digest))
+        if should_cancel() {
+            return Ok(None);
+        }
+        Ok(Some((info, digest)))
     }
 
     /// Sets image accessibility metadata.
@@ -455,6 +491,71 @@ pub fn render_inline_image_with_info(
         "</w:t></w:r><w:r><w:drawing><wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n  <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\n{doc_pr}\n  <wp:cNvGraphicFramePr>\n    <a:graphicFrameLocks noChangeAspect=\"1\"/>\n  </wp:cNvGraphicFramePr>\n  <a:graphic>\n    <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\n      <pic:pic>\n        <pic:nvPicPr>\n{c_nv_pr}\n          <pic:cNvPicPr/>\n        </pic:nvPicPr>\n        <pic:blipFill>\n          <a:blip r:embed=\"{blip_rid}\"/>\n          <a:stretch>\n            <a:fillRect/>\n          </a:stretch>\n        </pic:blipFill>\n        <pic:spPr>\n          <a:xfrm>\n            <a:off x=\"0\" y=\"0\"/>\n            <a:ext cx=\"{cx}\" cy=\"{cy}\"/>\n          </a:xfrm>\n          <a:prstGeom prst=\"rect\"/>\n        </pic:spPr>\n      </pic:pic>\n    </a:graphicData>\n  </a:graphic>\n</wp:inline>\n</w:drawing></w:r><w:r><w:t xml:space=\"preserve\">"
     );
     Ok(xml)
+}
+
+/// Generate a standalone `w:drawing` element for direct Story DOM insertion.
+///
+/// Unlike [`render_inline_image_with_info`], this does not contain split-run
+/// sentinels. Both DrawingML non-visual property ids are caller supplied so a
+/// Story-scoped allocator can keep inserted and cloned drawings unique.
+pub fn render_inline_drawing_with_info(
+    img: &InlineImage,
+    info: &ImageInfo,
+    doc_pr_id: u64,
+    picture_id: u64,
+    blip_rid: &str,
+    hyperlink_rid: Option<&str>,
+) -> Result<String, ImageError> {
+    let (cx, cy) = scaled_dimensions(info, img.width, img.height)?;
+    let raw_filename = img.filename();
+    let mut metadata_xml_bytes = escaped_xml_attr_len(&raw_filename)?;
+    for value in [img.title.as_deref(), img.descr.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let escaped_len = escaped_xml_attr_len(value)?;
+        metadata_xml_bytes = metadata_xml_bytes
+            .checked_add(escaped_len.saturating_mul(2))
+            .ok_or(ImageError::MetadataTooLarge {
+                max: MAX_INLINE_IMAGE_XML_BYTES,
+            })?;
+    }
+    if metadata_xml_bytes > MAX_INLINE_IMAGE_XML_BYTES {
+        return Err(ImageError::MetadataTooLarge {
+            max: MAX_INLINE_IMAGE_XML_BYTES,
+        });
+    }
+
+    let filename = escape_xml_attr(&raw_filename);
+    let mut doc_pr_attrs = format!("id=\"{doc_pr_id}\" name=\"Picture {doc_pr_id}\"");
+    let mut c_nv_pr_attrs = format!("id=\"{picture_id}\" name=\"{filename}\"");
+    for (name, value) in [
+        ("title", img.title.as_deref()),
+        ("descr", img.descr.as_deref()),
+    ] {
+        if let Some(value) = value {
+            let value = escape_xml_attr(value);
+            doc_pr_attrs.push_str(&format!(" {name}=\"{value}\""));
+            c_nv_pr_attrs.push_str(&format!(" {name}=\"{value}\""));
+        }
+    }
+
+    let doc_pr = match hyperlink_rid {
+        Some(rid) => format!(
+            "  <wp:docPr {doc_pr_attrs}>\n    <a:hlinkClick r:id=\"{rid}\"/>\n  </wp:docPr>"
+        ),
+        None => format!("  <wp:docPr {doc_pr_attrs}/>"),
+    };
+    let c_nv_pr = match hyperlink_rid {
+        Some(rid) => format!(
+            "          <pic:cNvPr {c_nv_pr_attrs}>\n            <a:hlinkClick r:id=\"{rid}\"/>\n          </pic:cNvPr>"
+        ),
+        None => format!("          <pic:cNvPr {c_nv_pr_attrs}/>"),
+    };
+
+    Ok(format!(
+        "<w:drawing xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><wp:inline xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\n  <wp:extent cx=\"{cx}\" cy=\"{cy}\"/>\n{doc_pr}\n  <wp:cNvGraphicFramePr>\n    <a:graphicFrameLocks noChangeAspect=\"1\"/>\n  </wp:cNvGraphicFramePr>\n  <a:graphic>\n    <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\n      <pic:pic>\n        <pic:nvPicPr>\n{c_nv_pr}\n          <pic:cNvPicPr/>\n        </pic:nvPicPr>\n        <pic:blipFill>\n          <a:blip r:embed=\"{blip_rid}\"/>\n          <a:stretch>\n            <a:fillRect/>\n          </a:stretch>\n        </pic:blipFill>\n        <pic:spPr>\n          <a:xfrm>\n            <a:off x=\"0\" y=\"0\"/>\n            <a:ext cx=\"{cx}\" cy=\"{cy}\"/>\n          </a:xfrm>\n          <a:prstGeom prst=\"rect\"/>\n        </pic:spPr>\n      </pic:pic>\n    </a:graphicData>\n  </a:graphic>\n</wp:inline></w:drawing>"
+    ))
 }
 
 #[cfg(test)]

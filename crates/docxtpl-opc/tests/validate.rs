@@ -6,7 +6,7 @@ mod common;
 use std::io::Cursor;
 
 use common::*;
-use docxtpl_opc::{OpcError, Package, PackageLimits};
+use docxtpl_opc::{InterruptibleWriteError, OpcError, Package, PackageLimits};
 
 fn open(bytes: &[u8]) -> Package {
     Package::from_reader(Cursor::new(bytes), &PackageLimits::default()).expect("open package")
@@ -23,6 +23,21 @@ fn rels_with(id: &str, target: &str) -> String {
         id = id,
         target = target
     )
+}
+
+#[test]
+fn interruptible_validation_stops_inside_package_walk() {
+    let pkg = open(&minimal_docx());
+    let checks = std::cell::Cell::new(0usize);
+    let error = pkg
+        .validate_interruptible(&|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next >= 3
+        })
+        .expect_err("validation should observe cancellation");
+    assert!(matches!(error, InterruptibleWriteError::Cancelled));
+    assert!(checks.get() >= 3);
 }
 
 #[test]

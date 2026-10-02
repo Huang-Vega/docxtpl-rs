@@ -65,8 +65,9 @@ use std::time::{Duration, Instant};
 
 use docxtpl_opc::{resolve_part_target, OpcError, PartUri, Relationship, TargetMode};
 pub use docxtpl_opc::{
-    InterruptibleWriteError, MediaCompression, Package, PackageEvictionReport, PackageLimits,
-    PackageResidency, PackageTransaction, PackageWriteReport, WriteOptions,
+    FilePartSource, InterruptibleWriteError, MediaCompression, Package, PackageEvictionReport,
+    PackageLimits, PackageResidency, PackageTransaction, PackageTransactionMetrics,
+    PackageWriteReport, WriteOptions,
 };
 use docxtpl_template::{
     find_undeclared_variables, normalize_part_xml, prepare_document_xml_template,
@@ -79,6 +80,7 @@ use docxtpl_template::{
 pub use docxtpl_template::{JsonContextError, RenderContext};
 
 mod async_render;
+mod fragment;
 mod images;
 mod persistent_cache;
 mod replacements;
@@ -88,6 +90,7 @@ mod text_index;
 pub use async_render::{
     AsyncDispatchError, AsyncRenderDispatcher, BlockingExecutor, BlockingTask, RenderTask,
 };
+pub use fragment::{FragmentImportOptions, FragmentImportReport, FragmentPlacement, WordFragment};
 pub use persistent_cache::{PreparedCachePolicy, PreparedCacheStats, PreparedTemplateCache};
 
 pub use text_index::{
@@ -1991,6 +1994,134 @@ impl From<StoryScope> for EditableStorySelection {
     }
 }
 
+/// Size policy for an image inserted into an editable Word Story.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageLayout {
+    /// Use the image's native size derived from pixels and DPI.
+    #[default]
+    Native,
+    /// Preserve aspect ratio while setting the width in EMU.
+    Width(i64),
+    /// Preserve aspect ratio while setting the height in EMU.
+    Height(i64),
+    /// Use the exact width and height in EMU.
+    Exact { width: i64, height: i64 },
+    /// Preserve aspect ratio and fit inside the specified EMU box.
+    FitWithin { width: i64, height: i64 },
+}
+
+impl ImageLayout {
+    fn dimensions(self, info: &docxtpl_rich::ImageInfo) -> Result<(i64, i64), Error> {
+        let dimensions = match self {
+            Self::Native => docxtpl_rich::scaled_dimensions(info, None, None),
+            Self::Width(width) => docxtpl_rich::scaled_dimensions(info, Some(width), None),
+            Self::Height(height) => docxtpl_rich::scaled_dimensions(info, None, Some(height)),
+            Self::Exact { width, height } => {
+                docxtpl_rich::scaled_dimensions(info, Some(width), Some(height))
+            }
+            Self::FitWithin { width, height } => docxtpl_rich::scaled_dimensions(info, None, None)
+                .and_then(|(native_width, native_height)| {
+                    if width <= 0 || height <= 0 || native_width <= 0 || native_height <= 0 {
+                        return Err(docxtpl_rich::ImageError::Unrecognized);
+                    }
+                    let scale = (width as f64 / native_width as f64)
+                        .min(height as f64 / native_height as f64);
+                    Ok((
+                        docxtpl_rich::py_round(native_width as f64 * scale) as i64,
+                        docxtpl_rich::py_round(native_height as f64 * scale) as i64,
+                    ))
+                }),
+        }
+        .map_err(docxtpl_rich::InlineImageLoadError::Image)?;
+        if dimensions.0 <= 0 || dimensions.1 <= 0 {
+            return Err(OpcError::Malformed {
+                reason: "inline image dimensions must be positive".to_string(),
+            }
+            .into());
+        }
+        Ok(dimensions)
+    }
+}
+
+/// Metadata and layout applied when inserting an inline image.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InlineImageOptions {
+    /// Image size policy.
+    pub layout: ImageLayout,
+    /// Optional accessible title written to both non-visual properties.
+    pub title: Option<String>,
+    /// Optional alternative description written to both properties.
+    pub description: Option<String>,
+    /// Optional clickable external URL.
+    pub hyperlink: Option<String>,
+}
+
+/// Handles allocated for one inserted inline image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertedInlineImage {
+    /// Inserted `w:drawing` node.
+    pub drawing: docxtpl_xml::NodeId,
+    /// Story-owned image relationship id used by `a:blip`.
+    pub relationship_id: String,
+    /// Allocated `wp:docPr/@id`.
+    pub doc_pr_id: u64,
+    /// Allocated `pic:cNvPr/@id`.
+    pub picture_id: u64,
+}
+
+#[derive(Debug)]
+struct DrawingIdAllocator {
+    doc_pr_ids: HashSet<u64>,
+    picture_ids: HashSet<u64>,
+    managed_drawings: Vec<docxtpl_xml::NodeId>,
+}
+
+impl DrawingIdAllocator {
+    fn from_document(document: &docxtpl_xml::XmlDocument) -> Self {
+        let mut doc_pr_ids = HashSet::new();
+        let mut picture_ids = HashSet::new();
+        for node in document.descendants(document.root()) {
+            let Some(tag) = document.tag(node) else {
+                continue;
+            };
+            let target = if tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr" {
+                Some(&mut doc_pr_ids)
+            } else if tag.ns == docxtpl_xml::ns_uri::PIC && tag.local == "cNvPr" {
+                Some(&mut picture_ids)
+            } else {
+                None
+            };
+            if let (Some(target), Some(id)) = (target, document.attr(node, "", "id")) {
+                if let Ok(id) = id.parse() {
+                    target.insert(id);
+                }
+            }
+        }
+        Self {
+            doc_pr_ids,
+            picture_ids,
+            managed_drawings: Vec::new(),
+        }
+    }
+
+    fn next_doc_pr(&mut self) -> u64 {
+        allocate_positive_id(&mut self.doc_pr_ids)
+    }
+
+    fn next_picture(&mut self) -> u64 {
+        allocate_positive_id(&mut self.picture_ids)
+    }
+}
+
+fn allocate_positive_id(used: &mut HashSet<u64>) -> u64 {
+    let mut id = 1u64;
+    while used.contains(&id) {
+        id = id.saturating_add(1);
+    }
+    used.insert(id);
+    id
+}
+
 /// One parsed Word story DOM.
 pub struct StoryEditor {
     name: String,
@@ -1999,6 +2130,7 @@ pub struct StoryEditor {
     changed: bool,
     validate_internal_links: bool,
     external_hyperlink_rids: HashSet<String>,
+    image_rids: HashSet<String>,
 }
 
 /// One parsed Word story DOM from the unified 1.3 editing API.
@@ -2008,6 +2140,235 @@ pub struct StoryEditor {
 pub struct EditableStoryEditor {
     kind: EditableStoryKind,
     pub(crate) inner: StoryEditor,
+}
+
+/// One editable Story DOM paired with a resource proxy scoped to that Story's
+/// relationship owner.
+pub struct StoryEditContext<'edit, 'transaction, 'package> {
+    story: &'edit mut EditableStoryEditor,
+    transaction: &'edit mut PostprocessTransaction<'transaction, 'package>,
+    owner: String,
+    drawing_ids: DrawingIdAllocator,
+}
+
+impl<'edit, 'transaction, 'package> StoryEditContext<'edit, 'transaction, 'package> {
+    /// Read the current Story editor.
+    #[must_use]
+    pub fn story(&self) -> &EditableStoryEditor {
+        self.story
+    }
+
+    /// Mutably access the current Story editor.
+    pub fn story_mut(&mut self) -> &mut EditableStoryEditor {
+        self.story
+    }
+
+    /// Create a short-lived resource proxy whose relationship owner is the
+    /// current Story part.
+    pub fn resources<'borrow>(&'borrow mut self) -> StoryResources<'borrow, 'transaction, 'package>
+    where
+        'edit: 'borrow,
+    {
+        StoryResources {
+            owner: &self.owner,
+            transaction: &mut *self.transaction,
+            external_hyperlink_rids: &mut self.story.inner.external_hyperlink_rids,
+            image_rids: &mut self.story.inner.image_rids,
+        }
+    }
+
+    /// Insert an inline image as the last child of `target_run`.
+    ///
+    /// Media and relationships are reused when possible. Drawing ids are
+    /// allocated across the complete current Story and the inserted drawing
+    /// is validated before the Story is committed.
+    pub fn insert_inline_image(
+        &mut self,
+        target_run: docxtpl_xml::NodeId,
+        media: &MediaRegistration,
+        options: &InlineImageOptions,
+    ) -> Result<InsertedInlineImage, Error> {
+        if !is_word_element(self.story.document(), target_run, "r") {
+            return Err(OpcError::Malformed {
+                reason: "inline image target must be a w:r element".to_string(),
+            }
+            .into());
+        }
+        let info = self.transaction.media_info(media)?;
+        let (width, height) = options.layout.dimensions(&info)?;
+        let relationship_id = self.transaction.relate_image(&self.owner, media)?;
+        self.story.inner.image_rids.insert(relationship_id.clone());
+        let hyperlink_rid = options
+            .hyperlink
+            .as_deref()
+            .map(|url| self.transaction.relate_external_hyperlink(&self.owner, url))
+            .transpose()?;
+        if let Some(rid) = &hyperlink_rid {
+            self.story.inner.external_hyperlink_rids.insert(rid.clone());
+        }
+
+        let doc_pr_id = self.drawing_ids.next_doc_pr();
+        let picture_id = self.drawing_ids.next_picture();
+        let image = InlineImage::from_bytes(
+            &media.part_name,
+            Vec::new(),
+            Some(width),
+            Some(height),
+            options.hyperlink.clone(),
+        )
+        .with_accessibility(options.title.clone(), options.description.clone());
+        let xml = docxtpl_rich::render_inline_drawing_with_info(
+            &image,
+            &info,
+            doc_pr_id,
+            picture_id,
+            &relationship_id,
+            hyperlink_rid.as_deref(),
+        )
+        .map_err(docxtpl_rich::InlineImageLoadError::Image)?;
+        let fragment =
+            docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
+                .map_err(|error| OpcError::Malformed {
+                    reason: format!("generated inline drawing is invalid: {error}"),
+                })?;
+        let fragment_root = fragment.root();
+        let drawing = self
+            .story
+            .document_mut()
+            .deepcopy_element(&fragment, fragment_root)
+            .map_err(|error| OpcError::Malformed {
+                reason: format!("could not insert inline drawing: {error}"),
+            })?;
+        self.story.document_mut().append_child(target_run, drawing);
+        self.drawing_ids.managed_drawings.push(drawing);
+        Ok(InsertedInlineImage {
+            drawing,
+            relationship_id,
+            doc_pr_id,
+            picture_id,
+        })
+    }
+
+    /// Clone a `w:drawing` into `target_run` and allocate fresh non-visual ids.
+    /// Image and hyperlink relationship ids are intentionally retained.
+    pub fn clone_drawing_to_run(
+        &mut self,
+        drawing: docxtpl_xml::NodeId,
+        target_run: docxtpl_xml::NodeId,
+    ) -> Result<docxtpl_xml::NodeId, Error> {
+        if !is_word_element(self.story.document(), drawing, "drawing")
+            || !is_word_element(self.story.document(), target_run, "r")
+        {
+            return Err(OpcError::Malformed {
+                reason: "drawing clone requires a w:drawing source and w:r target".to_string(),
+            }
+            .into());
+        }
+        let cloned = self
+            .story
+            .document_mut()
+            .deepcopy_element_within(drawing)
+            .map_err(|error| OpcError::Malformed {
+                reason: format!("could not clone drawing: {error}"),
+            })?;
+        let properties = self.story.document().descendants(cloned);
+        for property in properties {
+            let Some(tag) = self.story.document().tag(property) else {
+                continue;
+            };
+            let id = if tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr" {
+                Some(self.drawing_ids.next_doc_pr())
+            } else if tag.ns == docxtpl_xml::ns_uri::PIC && tag.local == "cNvPr" {
+                Some(self.drawing_ids.next_picture())
+            } else {
+                None
+            };
+            if let Some(id) = id {
+                self.story
+                    .document_mut()
+                    .set_attr(property, "", "id", id.to_string());
+            }
+        }
+        self.story.document_mut().append_child(target_run, cloned);
+        self.drawing_ids.managed_drawings.push(cloned);
+        Ok(cloned)
+    }
+
+    fn validate_drawings(&self) -> Result<(), Error> {
+        for drawing in &self.drawing_ids.managed_drawings {
+            validate_managed_drawing(
+                self.story.document(),
+                *drawing,
+                &self.story.inner.image_rids,
+                &self.story.inner.external_hyperlink_rids,
+                &self.owner,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Resource operations available while editing one Story.
+pub struct StoryResources<'edit, 'transaction, 'package> {
+    owner: &'edit str,
+    transaction: &'edit mut PostprocessTransaction<'transaction, 'package>,
+    external_hyperlink_rids: &'edit mut HashSet<String>,
+    image_rids: &'edit mut HashSet<String>,
+}
+
+impl StoryResources<'_, '_, '_> {
+    /// OPC part that owns relationships created through this proxy.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        self.owner
+    }
+
+    /// Register path-backed image media.
+    pub fn register_media_path(&mut self, path: &str) -> Result<MediaRegistration, Error> {
+        self.transaction.register_media_path(path)
+    }
+
+    /// Register shared byte-backed image media.
+    pub fn register_media_bytes(
+        &mut self,
+        name_hint: &str,
+        bytes: Arc<[u8]>,
+    ) -> Result<MediaRegistration, Error> {
+        self.transaction.register_media_bytes(name_hint, bytes)
+    }
+
+    /// Register media from a unified source.
+    pub fn register_media_source(
+        &mut self,
+        name_hint: &str,
+        source: MediaSource,
+    ) -> Result<MediaRegistration, Error> {
+        self.transaction.register_media_source(name_hint, source)
+    }
+
+    /// Register a reusable pre-probed image file.
+    pub fn register_probed_media(
+        &mut self,
+        media: &ProbedMediaFile,
+    ) -> Result<MediaRegistration, Error> {
+        self.transaction.register_probed_media(media)
+    }
+
+    /// Relate the current Story owner to registered image media.
+    pub fn relate_image(&mut self, media: &MediaRegistration) -> Result<String, Error> {
+        let rid = self.transaction.relate_image(self.owner, media)?;
+        self.image_rids.insert(rid.clone());
+        Ok(rid)
+    }
+
+    /// Register or reuse an external hyperlink for the current Story owner.
+    pub fn relate_external_hyperlink(&mut self, url: &str) -> Result<String, Error> {
+        let rid = self
+            .transaction
+            .relate_external_hyperlink(self.owner, url)?;
+        self.external_hyperlink_rids.insert(rid.clone());
+        Ok(rid)
+    }
 }
 
 impl EditableStoryEditor {
@@ -2420,6 +2781,88 @@ fn is_word_element(
         .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == local)
 }
 
+fn validate_managed_drawing(
+    document: &docxtpl_xml::XmlDocument,
+    drawing: docxtpl_xml::NodeId,
+    image_rids: &HashSet<String>,
+    external_hyperlink_rids: &HashSet<String>,
+    story_name: &str,
+) -> Result<(), Error> {
+    if !is_word_element(document, drawing, "drawing") {
+        return Err(OpcError::Malformed {
+            reason: format!("story {story_name:?} has a detached or invalid managed drawing"),
+        }
+        .into());
+    }
+    for node in document.descendants(drawing) {
+        let Some(tag) = document.tag(node) else {
+            continue;
+        };
+        if (tag.ns == docxtpl_xml::ns_uri::WP && tag.local == "docPr")
+            || (tag.ns == docxtpl_xml::ns_uri::PIC && tag.local == "cNvPr")
+        {
+            let id = document
+                .attr(node, "", "id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .ok_or_else(|| OpcError::Malformed {
+                    reason: format!(
+                        "story {story_name:?} has a managed drawing property without numeric id"
+                    ),
+                })?;
+            let id_text = id.to_string();
+            let duplicate_count = document
+                .descendants(document.root())
+                .into_iter()
+                .filter(|candidate| {
+                    document.tag(*candidate).is_some_and(|candidate_tag| {
+                        candidate_tag.ns == tag.ns && candidate_tag.local == tag.local
+                    }) && document.attr(*candidate, "", "id") == Some(id_text.as_str())
+                })
+                .count();
+            if duplicate_count != 1 {
+                return Err(OpcError::Malformed {
+                    reason: format!(
+                        "story {story_name:?} has duplicate managed {} id {id}",
+                        tag.local
+                    ),
+                }
+                .into());
+            }
+        }
+        if tag.ns == docxtpl_xml::ns_uri::A && tag.local == "blip" {
+            let rid = document
+                .attr(node, docxtpl_xml::ns_uri::R, "embed")
+                .ok_or_else(|| OpcError::Malformed {
+                    reason: format!("story {story_name:?} has a managed image without r:embed"),
+                })?;
+            if !image_rids.contains(rid) {
+                return Err(OpcError::Malformed {
+                    reason: format!(
+                        "story {story_name:?} has a managed image with dangling relationship {rid:?}"
+                    ),
+                }
+                .into());
+            }
+        }
+        if tag.ns == docxtpl_xml::ns_uri::A && tag.local == "hlinkClick" {
+            let rid = document
+                .attr(node, docxtpl_xml::ns_uri::R, "id")
+                .ok_or_else(|| OpcError::Malformed {
+                    reason: format!("story {story_name:?} has a drawing link without r:id"),
+                })?;
+            if !external_hyperlink_rids.contains(rid) {
+                return Err(OpcError::Malformed {
+                    reason: format!(
+                        "story {story_name:?} has a drawing link with dangling relationship {rid:?}"
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bookmark_starts(
     document: &docxtpl_xml::XmlDocument,
 ) -> Vec<(docxtpl_xml::NodeId, String, String)> {
@@ -2488,8 +2931,16 @@ fn unique_bookmark_name(base: &str, used: &HashSet<&str>) -> String {
 pub struct StoryEditReport {
     /// Parts parsed into a DOM.
     pub parsed_parts: usize,
+    /// Source XML bytes decoded and parsed.
+    pub parsed_bytes: u64,
+    /// Wall-clock time spent decoding and parsing selected stories.
+    pub parse_elapsed: Duration,
     /// Parts serialized after mutable access.
     pub serialized_parts: usize,
+    /// XML bytes produced by serialization before change comparison.
+    pub serialized_bytes: u64,
+    /// Wall-clock time spent serializing changed stories.
+    pub serialize_elapsed: Duration,
     /// Parts whose serialized bytes differed and were written to the transaction.
     pub changed_parts: Vec<String>,
 }
@@ -2514,6 +2965,70 @@ pub struct PostprocessWarning {
     pub message: String,
 }
 
+/// Caller-defined, stable failure classification for a custom post-processing
+/// pass.
+///
+/// The code should be a namespaced, non-sensitive static identifier such as
+/// `"fragment.image_placeholder_missing"`. The optional part name can be used
+/// by aborting callers for diagnostics; recoverable pass reports also retain
+/// all transaction-touched parts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{code}: {message}")]
+pub struct PostprocessError {
+    code: &'static str,
+    message: String,
+    part: Option<String>,
+}
+
+impl PostprocessError {
+    /// Create a structured custom pass error.
+    #[must_use]
+    pub fn custom(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            part: None,
+        }
+    }
+
+    /// Associate the error with a package part without exposing file-system
+    /// paths or other request metadata.
+    #[must_use]
+    pub fn with_part(mut self, part: impl Into<String>) -> Self {
+        self.part = Some(part.into());
+        self
+    }
+
+    /// Stable caller-defined error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// Safe human-readable detail supplied by the caller.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Related OPC part, when supplied.
+    #[must_use]
+    pub fn part(&self) -> Option<&str> {
+        self.part.as_deref()
+    }
+}
+
+/// Error returned by the structured post-processing entry points.
+#[derive(Debug, thiserror::Error)]
+pub enum PostprocessRunError {
+    /// A package, rendering, image, or I/O operation failed.
+    #[error(transparent)]
+    Operation(#[from] Error),
+    /// A caller-defined pass validation failed.
+    #[error(transparent)]
+    Custom(#[from] PostprocessError),
+}
+
 /// Result of one successfully committed or recoverably rolled-back pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassReport {
@@ -2525,6 +3040,16 @@ pub struct PassReport {
     pub rolled_back: bool,
     /// Existing or newly-added parts touched by the pass.
     pub touched_parts: Vec<String>,
+    /// Transaction undo-journal and final touched-content sizes.
+    pub transaction: PackageTransactionMetrics,
+    /// Relationship, media, and automatic cache-reclamation activity.
+    pub resources: PassResourceMetrics,
+    /// Package residency immediately before the pass.
+    pub residency_before: PackageResidency,
+    /// Package residency after commit or rollback.
+    pub residency_after: PackageResidency,
+    /// Time spent restoring the transaction after a recoverable failure.
+    pub rollback_elapsed: Duration,
     /// Recoverable warnings emitted by this pass.
     pub warnings: Vec<PostprocessWarning>,
     /// Wall-clock duration of the pass, including rollback when applicable.
@@ -2544,20 +3069,128 @@ pub struct PostprocessPipeline<'a> {
     max_rendered_xml_bytes: usize,
     reports: Vec<PassReport>,
     control: Option<RenderControl>,
+    media_catalog: MediaCatalog,
+    part_cache_policy: PartCachePolicy,
 }
 
 /// Transactional operations available to one post-processing pass.
 pub struct PostprocessTransaction<'transaction, 'package> {
     transaction: &'transaction mut PackageTransaction<'package>,
     max_rendered_xml_bytes: usize,
-    media_registry: Option<MediaRegistry>,
+    media_catalog: &'transaction mut MediaCatalog,
     control: Option<RenderControl>,
+    part_cache_policy: PartCachePolicy,
+    resource_metrics: PassResourceMetrics,
 }
 
-#[derive(Default)]
-struct MediaRegistry {
+/// Policy for reclaiming reloadable clean package-part buffers during passes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PartCachePolicy {
+    /// Retain loaded clean parts until explicit eviction or document drop.
+    #[default]
+    Retain,
+    /// Evict all currently reloadable clean part buffers whenever total
+    /// residency exceeds the supplied byte high-water mark.
+    EvictAbove { resident_bytes: u64 },
+}
+
+/// Resource activity performed by one post-processing pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassResourceMetrics {
+    /// Relationships appended by the pass.
+    pub relationships_added: u64,
+    /// Existing relationships reused by the pass.
+    pub relationships_reused: u64,
+    /// New media parts registered by the pass.
+    pub media_added: u64,
+    /// Existing media parts reused by the pass.
+    pub media_reused: u64,
+    /// Automatic high-water cache-eviction runs.
+    pub eviction_runs: u64,
+    /// Clean lazy part buffers evicted by automatic policy.
+    pub evicted_parts: u64,
+    /// Bytes released by automatic policy.
+    pub evicted_bytes: u64,
+    /// Highest package part-buffer residency observed at pass checkpoints.
+    pub peak_resident_bytes: u64,
+}
+
+/// Cumulative media-catalog work performed by one post-processing pipeline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaCatalogMetrics {
+    /// Media parts examined while building or rebuilding the catalog.
+    pub scanned_parts: u64,
+    /// Bytes actually read and hashed because no trusted digest was available.
+    pub hashed_bytes: u64,
+    /// Registration operations that reused an already-built catalog.
+    pub cache_hits: u64,
+    /// Registrations that reused an existing media part by digest.
+    pub reused_media: u64,
+}
+
+#[derive(Clone, Default)]
+struct MediaCatalog {
+    initialized: bool,
     by_digest: HashMap<docxtpl_rich::ImageDigest, String>,
+    info_by_part: HashMap<String, docxtpl_rich::ImageInfo>,
     used_numbers: BTreeSet<u64>,
+    metrics: MediaCatalogMetrics,
+}
+
+impl MediaCatalog {
+    fn ensure(&mut self, package: &Package, control: Option<&RenderControl>) -> Result<(), Error> {
+        if self.initialized {
+            self.metrics.cache_hits = self.metrics.cache_hits.saturating_add(1);
+            return Ok(());
+        }
+        self.by_digest.clear();
+        self.info_by_part.clear();
+        self.used_numbers.clear();
+        for part in package.parts() {
+            check_render_control(control)?;
+            if !part.name().starts_with("word/media/") {
+                continue;
+            }
+            self.metrics.scanned_parts = self.metrics.scanned_parts.saturating_add(1);
+            let digest = if let Some(digest) = part.known_sha1_digest() {
+                digest
+            } else {
+                let bytes = part.bytes()?;
+                self.metrics.hashed_bytes =
+                    self.metrics.hashed_bytes.saturating_add(bytes.len() as u64);
+                match docxtpl_rich::sha1_digest_interruptible(bytes, &|| {
+                    control.is_some_and(RenderControl::is_stopped)
+                }) {
+                    Some(digest) => digest,
+                    None => {
+                        check_render_control(control)?;
+                        unreachable!("digest only stops when render control is stopped")
+                    }
+                }
+            };
+            self.by_digest
+                .entry(digest)
+                .or_insert_with(|| part.name().to_string());
+            if let Some(number) = images::image_number(part.name()) {
+                self.used_numbers.insert(number);
+            }
+        }
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn invalidate(&mut self) {
+        self.initialized = false;
+        self.by_digest.clear();
+        self.info_by_part.clear();
+        self.used_numbers.clear();
+    }
+
+    fn restore_state(&mut self, snapshot: Self) {
+        let metrics = self.metrics;
+        *self = snapshot;
+        self.metrics = metrics;
+    }
 }
 
 /// Result of registering an image in `word/media`.
@@ -2569,7 +3202,105 @@ pub struct MediaRegistration {
     pub reused: bool,
 }
 
+/// Immutable image source accepted by [`PostprocessTransaction::register_media_source`].
+///
+/// Shared bytes are retained by `Arc` without an unconditional copy. File
+/// sources remain file-backed in the package and are streamed during final ZIP
+/// output; registration probes them incrementally without retaining their
+/// complete contents.
+#[derive(Debug, Clone)]
+pub enum MediaSource {
+    /// Caller-owned immutable image bytes.
+    Bytes(Arc<[u8]>),
+    /// A verified snapshot of a file-backed image.
+    File(FilePartSource),
+}
+
+/// Library-created reusable probe result for one immutable image file.
+///
+/// Construction streams the file once to validate its image metadata and
+/// digest. Registration reuses that information, while final package output
+/// still verifies the source snapshot before writing any bytes.
+#[derive(Debug, Clone)]
+pub struct ProbedMediaFile {
+    source: FilePartSource,
+    info: docxtpl_rich::ImageInfo,
+    digest: docxtpl_rich::ImageDigest,
+}
+
+impl ProbedMediaFile {
+    /// Open, limit-check, probe, and snapshot a regular image file.
+    pub fn open(path: impl AsRef<Path>, limits: &ResourceLimits) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let image = InlineImage::from_path_lazy_path(path, None, None, None)?;
+        let len = image.source_len();
+        let max = limits.package_limits().max_entry_uncompressed;
+        if len > max {
+            return Err(OpcError::LimitExceeded {
+                kind: "entry_uncompressed",
+                value: len,
+                max,
+            }
+            .into());
+        }
+        let (info, digest) = image.probe_with_digest()?;
+        let source = FilePartSource::snapshot_with_digest(path, digest)?;
+        Ok(Self {
+            source,
+            info,
+            digest,
+        })
+    }
+
+    /// Captured image metadata.
+    #[must_use]
+    pub const fn info(&self) -> &docxtpl_rich::ImageInfo {
+        &self.info
+    }
+
+    /// Captured file size in bytes.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    /// Whether the captured source is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.source.is_empty()
+    }
+}
+
 impl PostprocessTransaction<'_, '_> {
+    fn observe_residency(&mut self) -> PackageResidency {
+        let residency = self.transaction.residency();
+        self.resource_metrics.peak_resident_bytes = self
+            .resource_metrics
+            .peak_resident_bytes
+            .max(residency.resident_bytes);
+        residency
+    }
+
+    fn maybe_evict_clean_part_caches(&mut self) {
+        let residency = self.observe_residency();
+        let PartCachePolicy::EvictAbove { resident_bytes } = self.part_cache_policy else {
+            return;
+        };
+        if residency.resident_bytes <= resident_bytes {
+            return;
+        }
+        let eviction = self.transaction.evict_clean_part_caches();
+        self.resource_metrics.eviction_runs = self.resource_metrics.eviction_runs.saturating_add(1);
+        self.resource_metrics.evicted_parts = self
+            .resource_metrics
+            .evicted_parts
+            .saturating_add(eviction.evicted_parts as u64);
+        self.resource_metrics.evicted_bytes = self
+            .resource_metrics
+            .evicted_bytes
+            .saturating_add(eviction.evicted_bytes);
+    }
+
     /// Check unified cancellation and deadline control. Long-running custom
     /// passes should call this at their own natural checkpoints.
     pub fn check_control(&self) -> Result<(), Error> {
@@ -2591,6 +3322,10 @@ impl PostprocessTransaction<'_, '_> {
     /// Replace an existing part with in-memory bytes.
     pub fn set_part_bytes(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), Error> {
         self.transaction.set_part_bytes(name, bytes)?;
+        if name.starts_with("word/media/") {
+            self.media_catalog.invalidate();
+        }
+        self.observe_residency();
         Ok(())
     }
 
@@ -2601,12 +3336,20 @@ impl PostprocessTransaction<'_, '_> {
         source: docxtpl_opc::FilePartSource,
     ) -> Result<(), Error> {
         self.transaction.set_file_backed_part(name, source)?;
+        if name.starts_with("word/media/") {
+            self.media_catalog.invalidate();
+        }
+        self.observe_residency();
         Ok(())
     }
 
     /// Append a byte-backed part.
     pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), Error> {
         self.transaction.add_part(name, bytes)?;
+        if name.starts_with("word/media/") {
+            self.media_catalog.invalidate();
+        }
+        self.observe_residency();
         Ok(())
     }
 
@@ -2617,6 +3360,10 @@ impl PostprocessTransaction<'_, '_> {
         source: docxtpl_opc::FilePartSource,
     ) -> Result<(), Error> {
         self.transaction.add_file_backed_part(name, source)?;
+        if name.starts_with("word/media/") {
+            self.media_catalog.invalidate();
+        }
+        self.observe_residency();
         Ok(())
     }
 
@@ -2628,9 +3375,27 @@ impl PostprocessTransaction<'_, '_> {
         target: &str,
         target_mode: TargetMode,
     ) -> Result<String, Error> {
-        Ok(self
+        let reused = self
             .transaction
-            .get_or_add_relationship(owner, rel_type, target, target_mode)?)
+            .package()
+            .relationships_of(owner)
+            .is_some_and(|relationships| {
+                relationships
+                    .find_matching(rel_type, target, target_mode)
+                    .is_some()
+            });
+        let id = self
+            .transaction
+            .get_or_add_relationship(owner, rel_type, target, target_mode)?;
+        if reused {
+            self.resource_metrics.relationships_reused =
+                self.resource_metrics.relationships_reused.saturating_add(1);
+        } else {
+            self.resource_metrics.relationships_added =
+                self.resource_metrics.relationships_added.saturating_add(1);
+        }
+        self.observe_residency();
+        Ok(id)
     }
 
     /// Register or reuse an external hyperlink relationship for one story.
@@ -2651,42 +3416,135 @@ impl PostprocessTransaction<'_, '_> {
     /// the same transaction.
     pub fn register_media_path(&mut self, path: &str) -> Result<MediaRegistration, Error> {
         let image = InlineImage::from_path_lazy(path, None, None, None)?;
-        let (info, digest) = image.probe_with_digest()?;
-        if self.media_registry.is_none() {
-            let mut registry = MediaRegistry::default();
-            for part in self.transaction.package().parts() {
-                if !part.name().starts_with("word/media/") {
-                    continue;
-                }
-                registry
-                    .by_digest
-                    .entry(docxtpl_rich::sha1_digest(part.bytes()?))
-                    .or_insert_with(|| part.name().to_string());
-                if let Some(number) = images::image_number(part.name()) {
-                    registry.used_numbers.insert(number);
-                }
+        let control = self.control.clone();
+        let result = image.probe_with_digest_interruptible(&|| {
+            control.as_ref().is_some_and(RenderControl::is_stopped)
+        })?;
+        let Some((info, digest)) = result else {
+            self.check_control()?;
+            unreachable!("image probe only stops when render control is stopped")
+        };
+        let source = FilePartSource::snapshot_with_digest(path, digest)?;
+        self.register_probed_media_source(&info, digest, MediaSource::File(source))
+    }
+
+    /// Register or reuse an image from shared in-memory bytes.
+    ///
+    /// The image format and content type are detected from the bytes rather
+    /// than trusted from `name_hint`. The package retains the supplied `Arc`
+    /// allocation without copying it.
+    pub fn register_media_bytes(
+        &mut self,
+        name_hint: &str,
+        bytes: Arc<[u8]>,
+    ) -> Result<MediaRegistration, Error> {
+        self.register_media_source(name_hint, MediaSource::Bytes(bytes))
+    }
+
+    /// Register or reuse an image from a unified byte-backed or file-backed
+    /// source.
+    ///
+    /// Both source kinds use the same SHA-1 deduplication, deterministic
+    /// `imageN` allocation, package resource limits, and transactional Content
+    /// Types update. `name_hint` is diagnostic only; the detected image format
+    /// determines the stored extension and content type.
+    pub fn register_media_source(
+        &mut self,
+        _name_hint: &str,
+        source: MediaSource,
+    ) -> Result<MediaRegistration, Error> {
+        match source {
+            MediaSource::Bytes(bytes) => {
+                let control = self.control.clone();
+                let result = docxtpl_rich::probe_with_digest_interruptible(bytes.as_ref(), &|| {
+                    control.as_ref().is_some_and(RenderControl::is_stopped)
+                })
+                .map_err(docxtpl_rich::InlineImageLoadError::Image)?;
+                let Some((info, digest)) = result else {
+                    self.check_control()?;
+                    unreachable!("image probe only stops when render control is stopped")
+                };
+                self.register_probed_media_source(&info, digest, MediaSource::Bytes(bytes))
             }
-            self.media_registry = Some(registry);
+            MediaSource::File(source) => {
+                let image = InlineImage::from_path_lazy_path(source.path(), None, None, None)?;
+                let control = self.control.clone();
+                let result = image.probe_with_digest_interruptible(&|| {
+                    control.as_ref().is_some_and(RenderControl::is_stopped)
+                })?;
+                let Some((info, digest)) = result else {
+                    self.check_control()?;
+                    unreachable!("image probe only stops when render control is stopped")
+                };
+                if digest != source.digest() {
+                    return Err(OpcError::Malformed {
+                        reason: "file-backed media source changed after snapshot".to_string(),
+                    }
+                    .into());
+                }
+                self.register_probed_media_source(&info, digest, MediaSource::File(source))
+            }
         }
-        let registry = self.media_registry.as_mut().expect("initialized above");
-        if let Some(part_name) = registry.by_digest.get(&digest) {
+    }
+
+    /// Register a library-created pre-probed file without hashing it again.
+    pub fn register_probed_media(
+        &mut self,
+        media: &ProbedMediaFile,
+    ) -> Result<MediaRegistration, Error> {
+        self.register_probed_media_source(
+            &media.info,
+            media.digest,
+            MediaSource::File(media.source.clone()),
+        )
+    }
+
+    fn register_probed_media_source(
+        &mut self,
+        info: &docxtpl_rich::ImageInfo,
+        digest: docxtpl_rich::ImageDigest,
+        source: MediaSource,
+    ) -> Result<MediaRegistration, Error> {
+        let control = self.control.clone();
+        self.media_catalog
+            .ensure(self.transaction.package(), control.as_ref())?;
+        self.maybe_evict_clean_part_caches();
+        if let Some(part_name) = self.media_catalog.by_digest.get(&digest).cloned() {
+            self.media_catalog
+                .info_by_part
+                .entry(part_name.clone())
+                .or_insert_with(|| info.clone());
+            self.media_catalog.metrics.reused_media =
+                self.media_catalog.metrics.reused_media.saturating_add(1);
+            self.resource_metrics.media_reused =
+                self.resource_metrics.media_reused.saturating_add(1);
             return Ok(MediaRegistration {
-                part_name: part_name.clone(),
+                part_name,
                 reused: true,
             });
         }
 
         let mut number = 1u64;
-        while registry.used_numbers.contains(&number) {
+        while self.media_catalog.used_numbers.contains(&number) {
             number = number.saturating_add(1);
         }
         let part_name = format!("word/media/image{number}.{}", info.ext);
-        let source = docxtpl_opc::FilePartSource::snapshot_with_digest(path, digest)?;
-        self.transaction.add_file_backed_part(&part_name, source)?;
+        match source {
+            MediaSource::Bytes(bytes) => self.transaction.add_shared_part(&part_name, bytes)?,
+            MediaSource::File(source) => {
+                self.transaction.add_file_backed_part(&part_name, source)?
+            }
+        }
         self.transaction
             .register_content_type(&part_name, info.content_type)?;
-        registry.used_numbers.insert(number);
-        registry.by_digest.insert(digest, part_name.clone());
+        self.media_catalog.used_numbers.insert(number);
+        self.media_catalog
+            .by_digest
+            .insert(digest, part_name.clone());
+        self.media_catalog
+            .info_by_part
+            .insert(part_name.clone(), info.clone());
+        self.resource_metrics.media_added = self.resource_metrics.media_added.saturating_add(1);
         Ok(MediaRegistration {
             part_name,
             reused: false,
@@ -2702,6 +3560,24 @@ impl PostprocessTransaction<'_, '_> {
     ) -> Result<String, Error> {
         let target = images::relative_to_owner(owner, &media.part_name);
         self.relate(owner, IMAGE_REL_TYPE, &target, TargetMode::Internal)
+    }
+
+    fn media_info(&mut self, media: &MediaRegistration) -> Result<docxtpl_rich::ImageInfo, Error> {
+        if let Some(info) = self.media_catalog.info_by_part.get(&media.part_name) {
+            return Ok(info.clone());
+        }
+        let bytes = self
+            .transaction
+            .part(&media.part_name)
+            .ok_or_else(|| OpcError::MissingPart {
+                uri: media.part_name.clone(),
+            })?
+            .bytes()?;
+        let info = docxtpl_rich::probe(bytes).map_err(docxtpl_rich::InlineImageLoadError::Image)?;
+        self.media_catalog
+            .info_by_part
+            .insert(media.part_name.clone(), info.clone());
+        Ok(info)
     }
 
     /// Validate the current pass state before it is committed.
@@ -2734,12 +3610,27 @@ impl PostprocessTransaction<'_, '_> {
                 })
                 .map(|relationship| relationship.id.clone())
                 .collect();
-            let bytes = self
+            let image_rids = self
                 .transaction
-                .part(&name)
-                .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
-                .bytes()?;
-            let xml = decode_xml_bytes(bytes, &name)?;
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == IMAGE_REL_TYPE
+                        && relationship.target_mode == TargetMode::Internal
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let parse_started = Instant::now();
+            let (xml, source_bytes) = {
+                let bytes = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                (decode_xml_bytes(bytes, &name)?, bytes.len() as u64)
+            };
             let document =
                 docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
                     .map_err(|source| RenderError::Xml {
@@ -2747,6 +3638,8 @@ impl PostprocessTransaction<'_, '_> {
                         source,
                     })?;
             report.parsed_parts += 1;
+            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
+            report.parse_elapsed += parse_started.elapsed();
             let mut story = StoryEditor {
                 name: name.clone(),
                 kind,
@@ -2754,6 +3647,7 @@ impl PostprocessTransaction<'_, '_> {
                 changed: false,
                 validate_internal_links: false,
                 external_hyperlink_rids,
+                image_rids,
             };
             edit(&mut story)?;
             self.check_cancelled()?;
@@ -2761,8 +3655,10 @@ impl PostprocessTransaction<'_, '_> {
                 story.validate_bookmarks_and_internal_links()?;
             }
             if !story.changed {
+                self.maybe_evict_clean_part_caches();
                 continue;
             }
+            let serialize_started = Instant::now();
             let serialized = match kind {
                 StoryKind::Body => story.document.try_serialize(self.max_rendered_xml_bytes),
                 StoryKind::Header | StoryKind::Footer => story
@@ -2775,11 +3671,24 @@ impl PostprocessTransaction<'_, '_> {
                 max: self.max_rendered_xml_bytes as u64,
             })?;
             report.serialized_parts += 1;
-            if serialized.as_bytes() != bytes {
+            report.serialized_bytes = report
+                .serialized_bytes
+                .saturating_add(serialized.len() as u64);
+            report.serialize_elapsed += serialize_started.elapsed();
+            let changed = {
+                let current = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                serialized.as_bytes() != current
+            };
+            if changed {
                 self.transaction
                     .set_part_bytes(&name, serialized.into_bytes())?;
                 report.changed_parts.push(name);
             }
+            self.maybe_evict_clean_part_caches();
         }
         self.check_cancelled()?;
         Ok(report)
@@ -2814,12 +3723,27 @@ impl PostprocessTransaction<'_, '_> {
                 })
                 .map(|relationship| relationship.id.clone())
                 .collect();
-            let bytes = self
+            let image_rids = self
                 .transaction
-                .part(&name)
-                .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
-                .bytes()?;
-            let xml = decode_xml_bytes(bytes, &name)?;
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == IMAGE_REL_TYPE
+                        && relationship.target_mode == TargetMode::Internal
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let parse_started = Instant::now();
+            let (xml, source_bytes) = {
+                let bytes = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                (decode_xml_bytes(bytes, &name)?, bytes.len() as u64)
+            };
             let document =
                 docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
                     .map_err(|source| RenderError::Xml {
@@ -2827,6 +3751,8 @@ impl PostprocessTransaction<'_, '_> {
                         source,
                     })?;
             report.parsed_parts += 1;
+            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
+            report.parse_elapsed += parse_started.elapsed();
             let legacy_kind = match kind {
                 EditableStoryKind::Header => StoryKind::Header,
                 EditableStoryKind::Footer => StoryKind::Footer,
@@ -2844,6 +3770,7 @@ impl PostprocessTransaction<'_, '_> {
                     changed: false,
                     validate_internal_links: false,
                     external_hyperlink_rids,
+                    image_rids,
                 },
             };
             edit(&mut story)?;
@@ -2852,8 +3779,10 @@ impl PostprocessTransaction<'_, '_> {
                 story.inner.validate_bookmarks_and_internal_links()?;
             }
             if !story.inner.changed {
+                self.maybe_evict_clean_part_caches();
                 continue;
             }
+            let serialize_started = Instant::now();
             let serialized = match kind {
                 EditableStoryKind::Body => story
                     .inner
@@ -2874,11 +3803,164 @@ impl PostprocessTransaction<'_, '_> {
                 max: self.max_rendered_xml_bytes as u64,
             })?;
             report.serialized_parts += 1;
-            if serialized.as_bytes() != bytes {
+            report.serialized_bytes = report
+                .serialized_bytes
+                .saturating_add(serialized.len() as u64);
+            report.serialize_elapsed += serialize_started.elapsed();
+            let changed = {
+                let current = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                serialized.as_bytes() != current
+            };
+            if changed {
                 self.transaction
                     .set_part_bytes(&name, serialized.into_bytes())?;
                 report.changed_parts.push(name);
             }
+            self.maybe_evict_clean_part_caches();
+        }
+        self.check_cancelled()?;
+        Ok(report)
+    }
+
+    /// Parse each selected Story once and expose both its DOM and a resource
+    /// proxy bound to that Story's relationship owner.
+    ///
+    /// Media, relationships, and Story XML are mutated through the same package
+    /// transaction and therefore share one pass rollback boundary.
+    pub fn for_each_editable_story_with_resources(
+        &mut self,
+        selection: EditableStorySelection,
+        mut edit: impl FnMut(&mut StoryEditContext<'_, '_, '_>) -> Result<(), Error>,
+    ) -> Result<StoryEditReport, Error> {
+        self.check_cancelled()?;
+        let stories = unified_editable_story_parts(self.transaction.package(), selection)?;
+        let mut report = StoryEditReport::default();
+        for (name, kind) in stories {
+            self.check_cancelled()?;
+            let external_hyperlink_rids = self
+                .transaction
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == HYPERLINK_REL_TYPE
+                        && relationship.target_mode == TargetMode::External
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let image_rids = self
+                .transaction
+                .package()
+                .relationships_of(&name)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .filter(|relationship| {
+                    relationship.rel_type == IMAGE_REL_TYPE
+                        && relationship.target_mode == TargetMode::Internal
+                })
+                .map(|relationship| relationship.id.clone())
+                .collect();
+            let parse_started = Instant::now();
+            let (xml, source_bytes) = {
+                let bytes = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                (decode_xml_bytes(bytes, &name)?, bytes.len() as u64)
+            };
+            let document =
+                docxtpl_xml::XmlDocument::parse_strict(&xml, &docxtpl_xml::XmlLimits::default())
+                    .map_err(|source| RenderError::Xml {
+                        part: name.clone(),
+                        source,
+                    })?;
+            let drawing_ids = DrawingIdAllocator::from_document(&document);
+            report.parsed_parts += 1;
+            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
+            report.parse_elapsed += parse_started.elapsed();
+            let legacy_kind = match kind {
+                EditableStoryKind::Header => StoryKind::Header,
+                EditableStoryKind::Footer => StoryKind::Footer,
+                EditableStoryKind::Body
+                | EditableStoryKind::Footnote
+                | EditableStoryKind::Endnote
+                | EditableStoryKind::Comment => StoryKind::Body,
+            };
+            let mut story = EditableStoryEditor {
+                kind,
+                inner: StoryEditor {
+                    name: name.clone(),
+                    kind: legacy_kind,
+                    document,
+                    changed: false,
+                    validate_internal_links: false,
+                    external_hyperlink_rids,
+                    image_rids,
+                },
+            };
+            {
+                let mut context = StoryEditContext {
+                    story: &mut story,
+                    transaction: self,
+                    owner: name.clone(),
+                    drawing_ids,
+                };
+                edit(&mut context)?;
+                context.validate_drawings()?;
+            }
+            self.check_cancelled()?;
+            if story.inner.validate_internal_links {
+                story.inner.validate_bookmarks_and_internal_links()?;
+            }
+            if !story.inner.changed {
+                self.maybe_evict_clean_part_caches();
+                continue;
+            }
+            let serialize_started = Instant::now();
+            let serialized = match kind {
+                EditableStoryKind::Body => story
+                    .inner
+                    .document
+                    .try_serialize(self.max_rendered_xml_bytes),
+                EditableStoryKind::Header
+                | EditableStoryKind::Footer
+                | EditableStoryKind::Footnote
+                | EditableStoryKind::Endnote
+                | EditableStoryKind::Comment => story
+                    .inner
+                    .document
+                    .try_serialize_story(self.max_rendered_xml_bytes),
+            }
+            .map_err(|_| RenderError::Limit {
+                part: name.clone(),
+                kind: "rendered_xml_bytes",
+                max: self.max_rendered_xml_bytes as u64,
+            })?;
+            report.serialized_parts += 1;
+            report.serialized_bytes = report
+                .serialized_bytes
+                .saturating_add(serialized.len() as u64);
+            report.serialize_elapsed += serialize_started.elapsed();
+            let changed = {
+                let current = self
+                    .transaction
+                    .part(&name)
+                    .ok_or_else(|| OpcError::MissingPart { uri: name.clone() })?
+                    .bytes()?;
+                serialized.as_bytes() != current
+            };
+            if changed {
+                self.transaction
+                    .set_part_bytes(&name, serialized.into_bytes())?;
+                report.changed_parts.push(name);
+            }
+            self.maybe_evict_clean_part_caches();
         }
         self.check_cancelled()?;
         Ok(report)
@@ -2886,6 +3968,19 @@ impl PostprocessTransaction<'_, '_> {
 }
 
 impl PostprocessPipeline<'_> {
+    /// Current document-local media catalog metrics.
+    #[must_use]
+    pub const fn media_catalog_metrics(&self) -> MediaCatalogMetrics {
+        self.media_catalog.metrics
+    }
+
+    /// Configure automatic reclamation of reloadable clean part buffers for
+    /// subsequent passes. The default is [`PartCachePolicy::Retain`].
+    pub fn set_part_cache_policy(&mut self, policy: PartCachePolicy) -> &mut Self {
+        self.part_cache_policy = policy;
+        self
+    }
+
     /// Execute one pass in an isolated package transaction.
     pub fn pass(
         &mut self,
@@ -2896,26 +3991,41 @@ impl PostprocessPipeline<'_> {
         check_render_control(self.control.as_ref())?;
         let name = name.into();
         let started = Instant::now();
+        let residency_before = self.package.residency();
+        let media_snapshot = self.media_catalog.clone();
         let mut transaction = self.package.transaction();
-        let result = {
+        let (result, resources) = {
             let mut postprocess = PostprocessTransaction {
                 transaction: &mut transaction,
                 max_rendered_xml_bytes: self.max_rendered_xml_bytes,
-                media_registry: None,
+                media_catalog: &mut self.media_catalog,
                 control: self.control.clone(),
+                part_cache_policy: self.part_cache_policy,
+                resource_metrics: PassResourceMetrics {
+                    peak_resident_bytes: residency_before.resident_bytes,
+                    ..PassResourceMetrics::default()
+                },
             };
-            pass(&mut postprocess).and_then(|()| postprocess.check_cancelled())
+            let result = pass(&mut postprocess).and_then(|()| postprocess.check_cancelled());
+            (result, postprocess.resource_metrics)
         };
         match result {
             Ok(_) => {
                 let changed = transaction.changed();
                 let touched_parts = transaction.touched_parts();
+                let transaction_metrics = transaction.metrics();
                 transaction.commit();
+                let residency_after = self.package.residency();
                 self.reports.push(PassReport {
                     name,
                     changed,
                     rolled_back: false,
                     touched_parts,
+                    transaction: transaction_metrics,
+                    resources,
+                    residency_before,
+                    residency_after,
+                    rollback_elapsed: Duration::ZERO,
                     warnings: Vec::new(),
                     elapsed: started.elapsed(),
                 });
@@ -2923,7 +4033,12 @@ impl PostprocessPipeline<'_> {
             }
             Err(error) => {
                 let touched_parts = transaction.touched_parts();
+                let transaction_metrics = transaction.metrics();
+                let rollback_started = Instant::now();
                 transaction.rollback();
+                let rollback_elapsed = rollback_started.elapsed();
+                let residency_after = self.package.residency();
+                self.media_catalog.restore_state(media_snapshot);
                 if self.control.as_ref().is_some_and(RenderControl::is_stopped) {
                     return Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
@@ -2943,7 +4058,117 @@ impl PostprocessPipeline<'_> {
                             changed: false,
                             rolled_back: true,
                             touched_parts,
+                            transaction: transaction_metrics,
+                            resources,
+                            residency_before,
+                            residency_after,
+                            rollback_elapsed,
                             warnings: vec![warning],
+                            elapsed: started.elapsed(),
+                        });
+                        Ok(self)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute a pass that can return either operational failures or a stable
+    /// caller-defined [`PostprocessError`].
+    pub fn pass_structured(
+        &mut self,
+        name: impl Into<String>,
+        policy: FailurePolicy,
+        pass: impl FnOnce(&mut PostprocessTransaction<'_, '_>) -> Result<(), PostprocessRunError>,
+    ) -> Result<&mut Self, PostprocessRunError> {
+        check_render_control(self.control.as_ref())?;
+        let name = name.into();
+        let started = Instant::now();
+        let residency_before = self.package.residency();
+        let media_snapshot = self.media_catalog.clone();
+        let mut transaction = self.package.transaction();
+        let (result, resources) = {
+            let mut postprocess = PostprocessTransaction {
+                transaction: &mut transaction,
+                max_rendered_xml_bytes: self.max_rendered_xml_bytes,
+                media_catalog: &mut self.media_catalog,
+                control: self.control.clone(),
+                part_cache_policy: self.part_cache_policy,
+                resource_metrics: PassResourceMetrics {
+                    peak_resident_bytes: residency_before.resident_bytes,
+                    ..PassResourceMetrics::default()
+                },
+            };
+            let result = pass(&mut postprocess).and_then(|()| {
+                postprocess
+                    .check_cancelled()
+                    .map_err(PostprocessRunError::from)
+            });
+            (result, postprocess.resource_metrics)
+        };
+        match result {
+            Ok(()) => {
+                let changed = transaction.changed();
+                let touched_parts = transaction.touched_parts();
+                let transaction_metrics = transaction.metrics();
+                transaction.commit();
+                let residency_after = self.package.residency();
+                self.reports.push(PassReport {
+                    name,
+                    changed,
+                    rolled_back: false,
+                    touched_parts,
+                    transaction: transaction_metrics,
+                    resources,
+                    residency_before,
+                    residency_after,
+                    rollback_elapsed: Duration::ZERO,
+                    warnings: Vec::new(),
+                    elapsed: started.elapsed(),
+                });
+                Ok(self)
+            }
+            Err(error) => {
+                let touched_parts = transaction.touched_parts();
+                let transaction_metrics = transaction.metrics();
+                let rollback_started = Instant::now();
+                transaction.rollback();
+                let rollback_elapsed = rollback_started.elapsed();
+                let residency_after = self.package.residency();
+                self.media_catalog.restore_state(media_snapshot);
+                if self.control.as_ref().is_some_and(RenderControl::is_stopped) {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "render control stopped the operation",
+                    ))
+                    .into());
+                }
+                match policy {
+                    FailurePolicy::Abort => Err(error),
+                    FailurePolicy::WarnAndRollback => {
+                        let (code, message) = match &error {
+                            PostprocessRunError::Custom(error) => {
+                                (error.code(), error.message().to_string())
+                            }
+                            PostprocessRunError::Operation(error) => {
+                                ("pass_rolled_back", error.to_string())
+                            }
+                        };
+                        self.reports.push(PassReport {
+                            name: name.clone(),
+                            changed: false,
+                            rolled_back: true,
+                            touched_parts,
+                            transaction: transaction_metrics,
+                            resources,
+                            residency_before,
+                            residency_after,
+                            rollback_elapsed,
+                            warnings: vec![PostprocessWarning {
+                                pass: name,
+                                code,
+                                message,
+                            }],
                             elapsed: started.elapsed(),
                         });
                         Ok(self)
@@ -2978,6 +4203,30 @@ impl RenderedDocument {
         configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
     ) -> Result<PostprocessReport, Error> {
         self.postprocess_checked(configure, None)
+    }
+
+    /// Run rollback-capable passes that may return caller-defined structured
+    /// validation errors without converting them to facade I/O errors.
+    pub fn postprocess_structured(
+        &mut self,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), PostprocessRunError>,
+    ) -> Result<PostprocessReport, PostprocessRunError> {
+        check_render_control(None)?;
+        self.edited = true;
+        let mut pipeline = PostprocessPipeline {
+            package: &mut self.pkg,
+            max_rendered_xml_bytes: self.max_rendered_xml_bytes,
+            reports: Vec::new(),
+            control: None,
+            media_catalog: MediaCatalog::default(),
+            part_cache_policy: PartCachePolicy::default(),
+        };
+        let result = configure(&mut pipeline);
+        let reports = std::mem::take(&mut pipeline.reports);
+        drop(pipeline);
+        self.postprocess_passes.extend(reports.clone());
+        result?;
+        Ok(PostprocessReport { passes: reports })
     }
 
     /// Run rollback-capable passes with cooperative cancellation. A cancelled
@@ -3017,6 +4266,8 @@ impl RenderedDocument {
             max_rendered_xml_bytes: self.max_rendered_xml_bytes,
             reports: Vec::new(),
             control,
+            media_catalog: MediaCatalog::default(),
+            part_cache_policy: PartCachePolicy::default(),
         };
         let result = configure(&mut pipeline);
         let reports = std::mem::take(&mut pipeline.reports);
@@ -3139,8 +4390,8 @@ impl RenderedDocument {
         cancellation.check()?;
         let validation_started = Instant::now();
         self.pkg
-            .validate()
-            .map_err(|error| CancellationError::Operation(Error::Opc(error)))?;
+            .validate_interruptible(&|| cancellation.is_cancelled())
+            .map_err(map_interruptible_opc_error)?;
         cancellation.check()?;
         let validation_elapsed = validation_started.elapsed();
         let write_started = Instant::now();
@@ -3164,8 +4415,8 @@ impl RenderedDocument {
         control.check()?;
         let validation_started = Instant::now();
         self.pkg
-            .validate()
-            .map_err(|error| RenderControlError::Operation(Error::Opc(error)))?;
+            .validate_interruptible(&|| control.is_stopped())
+            .map_err(|error| map_interruptible_control_error(error, control))?;
         control.check()?;
         let validation_elapsed = validation_started.elapsed();
         let write_started = Instant::now();
@@ -3205,8 +4456,8 @@ impl RenderedDocument {
         cancellation.check()?;
         let validation_started = Instant::now();
         self.pkg
-            .validate()
-            .map_err(|error| CancellationError::Operation(Error::Opc(error)))?;
+            .validate_interruptible(&|| cancellation.is_cancelled())
+            .map_err(map_interruptible_opc_error)?;
         cancellation.check()?;
         let validation_elapsed = validation_started.elapsed();
         let write_started = Instant::now();
@@ -3230,8 +4481,8 @@ impl RenderedDocument {
         control.check()?;
         let validation_started = Instant::now();
         self.pkg
-            .validate()
-            .map_err(|error| RenderControlError::Operation(Error::Opc(error)))?;
+            .validate_interruptible(&|| control.is_stopped())
+            .map_err(|error| map_interruptible_control_error(error, control))?;
         control.check()?;
         let validation_elapsed = validation_started.elapsed();
         let write_started = Instant::now();
@@ -3334,6 +4585,14 @@ fn map_interruptible_control_error(
 /// Facade-level errors: OPC, template rendering or encoding problems.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A relationship-bearing or package-level feature is outside the first
+    /// safe WordML fragment import boundary.
+    #[error("unsupported WordML fragment feature {feature:?}")]
+    UnsupportedFragmentFeature {
+        /// Stable feature name suitable for diagnostics.
+        feature: String,
+    },
+
     /// The compressed input file exceeds the default read limit.
     #[error("input DOCX exceeds the {max} byte limit")]
     InputTooLarge { max: u64 },

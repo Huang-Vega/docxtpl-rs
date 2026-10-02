@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use zip::read::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter};
@@ -71,6 +72,13 @@ pub struct PackageWriteReport {
     pub modified_parts: usize,
     /// Final ZIP stream length.
     pub output_bytes: u64,
+    /// Size of the completed same-directory temporary file for atomic saves.
+    /// Stream writes report zero.
+    pub temporary_file_bytes: u64,
+    /// Time spent flushing the atomic-save temporary file to storage.
+    pub temporary_sync_elapsed: Duration,
+    /// Time spent atomically replacing the destination directory entry.
+    pub atomic_replace_elapsed: Duration,
 }
 
 /// Point-in-time memory residency of package part contents.
@@ -97,6 +105,19 @@ pub struct PackageEvictionReport {
     pub evicted_parts: usize,
     /// Bytes released from lazy part caches.
     pub evicted_bytes: u64,
+}
+
+/// Point-in-time size of a package transaction's undo journal and writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackageTransactionMetrics {
+    /// Existing parts snapshotted for rollback.
+    pub snapshotted_parts: usize,
+    /// Parts appended after the transaction began.
+    pub added_parts: usize,
+    /// Original content bytes retained by rollback snapshots.
+    pub snapshotted_bytes: u64,
+    /// Current content bytes of replaced and newly-added parts.
+    pub current_touched_bytes: u64,
 }
 
 impl WriteOptions {
@@ -747,6 +768,26 @@ impl Package {
         Ok(())
     }
 
+    /// Append a new part backed by shared immutable bytes without copying the
+    /// caller's allocation.
+    pub fn add_shared_part(
+        &mut self,
+        name: &str,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> Result<(), OpcError> {
+        self.check_mutation_limits(None, bytes.len() as u64)?;
+        let uri = PartUri::new(name)?;
+        if self.index.contains_key(name) {
+            return Err(OpcError::DuplicateEntry {
+                uri: name.to_string(),
+                scope: "exact",
+            });
+        }
+        self.index.insert(name.to_string(), self.parts.len());
+        self.parts.push(Part::new_shared(uri, bytes));
+        Ok(())
+    }
+
     /// Appends a file-backed part whose content is streamed during ZIP writing.
     ///
     /// The source metadata and SHA-1 digest are verified during serialization;
@@ -946,44 +987,74 @@ impl Package {
     /// # Ok::<(), docxtpl_opc::OpcError>(())
     /// ```
     pub fn validate(&self) -> Result<(), OpcError> {
+        match self.validate_interruptible(&|| false) {
+            Ok(()) => Ok(()),
+            Err(InterruptibleWriteError::Opc(error)) => Err(error),
+            Err(InterruptibleWriteError::Cancelled) => {
+                unreachable!("non-interruptible validation cannot be cancelled")
+            }
+        }
+    }
+
+    /// Validate package integrity with cancellation checkpoints between
+    /// relationship sets and content-type entries.
+    pub fn validate_interruptible(
+        &self,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(), InterruptibleWriteError> {
+        if should_cancel() {
+            return Err(InterruptibleWriteError::Cancelled);
+        }
         for required in ["[Content_Types].xml", "_rels/.rels"] {
             if !self.contains(required) {
                 return Err(OpcError::MissingPart {
                     uri: required.to_string(),
-                });
+                }
+                .into());
             }
         }
         let main = self.main_document_uri()?;
         if !self.contains(main.as_str()) {
             return Err(OpcError::MissingPart {
                 uri: main.as_str().to_string(),
-            });
+            }
+            .into());
         }
-        self.check_rels_targets(None, &self.root_rels, "_rels/.rels")?;
+        self.check_rels_targets(None, &self.root_rels, "_rels/.rels", should_cancel)?;
         for part in &self.parts {
+            if should_cancel() {
+                return Err(InterruptibleWriteError::Cancelled);
+            }
             if let Some(rels) = part.relationships() {
                 let rels_path = rels_path_for(part.uri());
                 // Same as Relationships::resolve: resolve the target relative
                 // to the part's directory
                 let base = part.uri().parent();
-                self.check_rels_targets(base.as_ref(), rels, &rels_path)?;
+                self.check_rels_targets(base.as_ref(), rels, &rels_path, should_cancel)?;
             }
         }
-        self.check_rels_ids(&self.root_rels, "_rels/.rels")?;
+        self.check_rels_ids(&self.root_rels, "_rels/.rels", should_cancel)?;
         for part in &self.parts {
+            if should_cancel() {
+                return Err(InterruptibleWriteError::Cancelled);
+            }
             if let Some(rels) = part.relationships() {
                 let rels_path = rels_path_for(part.uri());
-                self.check_rels_ids(rels, &rels_path)?;
+                self.check_rels_ids(rels, &rels_path, should_cancel)?;
             }
         }
         for part in &self.parts {
+            if should_cancel() {
+                return Err(InterruptibleWriteError::Cancelled);
+            }
             if part.is_dir() || part.name() == "[Content_Types].xml" || is_rels_path(part.uri()) {
                 continue;
             }
             if self.content_types.content_type_of(part.uri()).is_none() {
                 return Err(OpcError::InvalidContentTypes {
                     reason: format!("part {:?} has no matching content type", part.name()),
-                });
+                }
+                .into());
             }
         }
         Ok(())
@@ -1040,13 +1111,17 @@ impl Package {
             Some(parent) => tempfile::NamedTempFile::new_in(parent)?,
             None => tempfile::NamedTempFile::new_in(".")?,
         };
-        let report = self.write_to_with_report(temporary.as_file_mut(), options)?;
+        let mut report = self.write_to_with_report(temporary.as_file_mut(), options)?;
+        report.temporary_file_bytes = temporary.as_file().metadata()?.len();
+        let sync_started = Instant::now();
         temporary.as_file_mut().sync_all()?;
+        report.temporary_sync_elapsed = sync_started.elapsed();
         if overwrites_source {
             if let Some(source) = &self.source {
                 source.close()?;
             }
         }
+        let persist_started = Instant::now();
         if let Err(error) = temporary.persist(path) {
             if overwrites_source {
                 if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
@@ -1055,6 +1130,7 @@ impl Package {
             }
             return Err(OpcError::Io(error.error));
         }
+        report.atomic_replace_elapsed = persist_started.elapsed();
         if overwrites_source {
             if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
                 source.reopen(source_path)?;
@@ -1075,7 +1151,7 @@ impl Package {
             return Err(InterruptibleWriteError::Cancelled);
         }
         let path = path.as_ref();
-        self.validate()?;
+        self.validate_interruptible(should_cancel)?;
         let overwrites_source = self
             .source_path
             .as_ref()
@@ -1090,7 +1166,7 @@ impl Package {
         // in-memory copy of `max_output_size` scale. The temporary file lives
         // in the same directory and is persisted only on success, so a write
         // failure never leaves a truncated target document.
-        let report = self.write_to_with_report_interruptible(
+        let mut report = self.write_to_with_report_interruptible(
             temporary.as_file_mut(),
             options,
             should_cancel,
@@ -1098,7 +1174,10 @@ impl Package {
         if should_cancel() {
             return Err(InterruptibleWriteError::Cancelled);
         }
+        report.temporary_file_bytes = temporary.as_file().metadata().map_err(OpcError::Io)?.len();
+        let sync_started = Instant::now();
         temporary.as_file_mut().sync_all().map_err(OpcError::Io)?;
+        report.temporary_sync_elapsed = sync_started.elapsed();
         if should_cancel() {
             return Err(InterruptibleWriteError::Cancelled);
         }
@@ -1107,6 +1186,7 @@ impl Package {
                 source.close()?;
             }
         }
+        let persist_started = Instant::now();
         if let Err(error) = temporary.persist(path) {
             if overwrites_source {
                 if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
@@ -1115,6 +1195,7 @@ impl Package {
             }
             return Err(OpcError::Io(error.error).into());
         }
+        report.atomic_replace_elapsed = persist_started.elapsed();
         if overwrites_source {
             if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
                 source.reopen(source_path)?;
@@ -1253,8 +1334,12 @@ impl Package {
         base: Option<&PartUri>,
         rels: &Relationships,
         source: &str,
-    ) -> Result<(), OpcError> {
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(), InterruptibleWriteError> {
         for rel in rels.iter() {
+            if should_cancel() {
+                return Err(InterruptibleWriteError::Cancelled);
+            }
             if rel.target_mode != TargetMode::Internal {
                 continue;
             }
@@ -1266,20 +1351,30 @@ impl Package {
                         "{source}: relationship {} target {:?} does not match any part in the package",
                         rel.id, rel.target
                     ),
-                });
+                }
+                .into());
             }
         }
         Ok(())
     }
 
     /// Validate that Ids are unique within a set of relationships.
-    fn check_rels_ids(&self, rels: &Relationships, source: &str) -> Result<(), OpcError> {
+    fn check_rels_ids(
+        &self,
+        rels: &Relationships,
+        source: &str,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(), InterruptibleWriteError> {
         let mut seen: HashSet<&str> = HashSet::new();
         for rel in rels.iter() {
+            if should_cancel() {
+                return Err(InterruptibleWriteError::Cancelled);
+            }
             if !seen.insert(rel.id.as_str()) {
                 return Err(OpcError::InvalidRelationships {
                     reason: format!("{source}: duplicate relationship Id {}", rel.id),
-                });
+                }
+                .into());
             }
         }
         Ok(())
@@ -1369,6 +1464,55 @@ impl PackageTransaction<'_> {
         names
     }
 
+    /// Return exact transaction journal and touched-content sizes without
+    /// materializing lazy or file-backed parts.
+    #[must_use]
+    pub fn metrics(&self) -> PackageTransactionMetrics {
+        let snapshotted_bytes = self
+            .backups
+            .values()
+            .map(|part| {
+                part.content_len()
+                    .expect("part content length is metadata-only")
+            })
+            .sum();
+        let added_parts = self.package.parts.len() - self.original_part_count;
+        let replaced_bytes: u64 = self
+            .backups
+            .keys()
+            .filter_map(|name| self.package.part(name))
+            .map(|part| {
+                part.content_len()
+                    .expect("part content length is metadata-only")
+            })
+            .sum();
+        let added_bytes: u64 = self.package.parts[self.original_part_count..]
+            .iter()
+            .map(|part| {
+                part.content_len()
+                    .expect("part content length is metadata-only")
+            })
+            .sum();
+        PackageTransactionMetrics {
+            snapshotted_parts: self.backups.len(),
+            added_parts,
+            snapshotted_bytes,
+            current_touched_bytes: replaced_bytes.saturating_add(added_bytes),
+        }
+    }
+
+    /// Return current package residency without materializing any part.
+    #[must_use]
+    pub fn residency(&self) -> PackageResidency {
+        self.package.residency()
+    }
+
+    /// Release buffers of untouched clean lazy parts during a transaction.
+    /// Modified parts and rollback snapshots are retained.
+    pub fn evict_clean_part_caches(&mut self) -> PackageEvictionReport {
+        self.package.evict_clean_part_caches()
+    }
+
     fn backup_part(&mut self, name: &str) -> Result<(), OpcError> {
         let Some(&index) = self.package.index.get(name) else {
             return Err(OpcError::PartNotFound {
@@ -1418,6 +1562,15 @@ impl PackageTransaction<'_> {
     /// Append a byte-backed part inside this transaction.
     pub fn add_part(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), OpcError> {
         self.package.add_part(name, bytes)
+    }
+
+    /// Append a shared byte-backed part inside this transaction.
+    pub fn add_shared_part(
+        &mut self,
+        name: &str,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> Result<(), OpcError> {
+        self.package.add_shared_part(name, bytes)
     }
 
     /// Append a file-backed part inside this transaction.

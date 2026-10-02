@@ -1045,6 +1045,7 @@ mod tests {
             changed: false,
             validate_internal_links: false,
             external_hyperlink_rids: Default::default(),
+            image_rids: Default::default(),
         };
         let index = story
             .run_text_index(paragraph, RunTextLimits::default())
@@ -1088,6 +1089,7 @@ mod tests {
             changed: false,
             validate_internal_links: false,
             external_hyperlink_rids: Default::default(),
+            image_rids: Default::default(),
         };
         let index = story
             .run_text_index(paragraph, RunTextLimits::default())
@@ -1131,6 +1133,7 @@ mod tests {
             changed: false,
             validate_internal_links: false,
             external_hyperlink_rids: Default::default(),
+            image_rids: Default::default(),
         };
         let index = story
             .run_text_index(paragraph, RunTextLimits::default())
@@ -1164,6 +1167,7 @@ mod tests {
             changed: false,
             validate_internal_links: false,
             external_hyperlink_rids: Default::default(),
+            image_rids: Default::default(),
         };
         let index = story
             .run_text_index(paragraph, RunTextLimits::default())
@@ -1196,6 +1200,7 @@ mod tests {
             changed: false,
             validate_internal_links: false,
             external_hyperlink_rids: Default::default(),
+            image_rids: Default::default(),
         };
         let index = story
             .run_text_index(

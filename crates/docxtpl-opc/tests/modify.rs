@@ -5,6 +5,7 @@ mod common;
 
 use std::cell::Cell;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use common::*;
 use docxtpl_opc::{FilePartSource, InterruptibleWriteError, OpcError, Package, PackageLimits};
@@ -68,6 +69,40 @@ fn set_part_bytes_missing_part() {
         matches!(err, OpcError::PartNotFound { ref uri } if uri == "word/missing.xml"),
         "got: {err:?}"
     );
+}
+
+#[test]
+fn add_shared_part_retains_arc_allocation_and_honors_limits() {
+    let package_bytes = minimal_docx();
+    let baseline = open(&package_bytes);
+    let baseline_len: u64 = baseline
+        .parts()
+        .map(|part| part.bytes().unwrap().len() as u64)
+        .sum();
+    let shared: Arc<[u8]> = Arc::from(&b"shared image bytes"[..]);
+    let shared_ptr = shared.as_ptr();
+    let limits = PackageLimits {
+        max_total_uncompressed: baseline_len + shared.len() as u64,
+        ..PackageLimits::default()
+    };
+    let mut pkg = Package::from_reader(Cursor::new(&package_bytes), &limits).expect("open package");
+
+    pkg.add_shared_part("word/media/image1.bin", Arc::clone(&shared))
+        .expect("add shared part");
+    let part = pkg.part("word/media/image1.bin").unwrap();
+    assert_eq!(part.bytes().unwrap().as_ptr(), shared_ptr);
+    assert!(part.is_loaded());
+
+    let tight_limits = PackageLimits {
+        max_total_uncompressed: baseline_len + shared.len() as u64 - 1,
+        ..PackageLimits::default()
+    };
+    let mut tight =
+        Package::from_reader(Cursor::new(&package_bytes), &tight_limits).expect("open package");
+    let error = tight
+        .add_shared_part("word/media/image1.bin", shared)
+        .expect_err("shared part must obey total size limit");
+    assert!(matches!(error, OpcError::LimitExceeded { .. }));
 }
 
 #[test]
@@ -210,6 +245,9 @@ fn write_report_counts_modified_file_backed_replacement() {
     assert_eq!(report.file_backed_parts, 1);
     assert_eq!(report.modified_parts, 1);
     assert_eq!(report.output_bytes, out.len() as u64);
+    assert_eq!(report.temporary_file_bytes, 0);
+    assert_eq!(report.temporary_sync_elapsed, std::time::Duration::ZERO);
+    assert_eq!(report.atomic_replace_elapsed, std::time::Duration::ZERO);
     assert!(report.rewritten_source_bytes >= replacement.len() as u64);
     assert!(!pkg.part("word/document.xml").unwrap().is_loaded());
 }
@@ -332,6 +370,34 @@ fn package_transaction_commit_keeps_changes() {
         pkg.part("word/document.xml").unwrap().bytes().unwrap(),
         changed
     );
+}
+
+#[test]
+fn package_transaction_reports_journal_sizes_without_loading_untouched_parts() {
+    let mut pkg = open(&minimal_docx());
+    let original_len = pkg
+        .part("word/document.xml")
+        .expect("document part")
+        .bytes()
+        .expect("document bytes")
+        .len() as u64;
+    let mut transaction = pkg.transaction();
+    transaction
+        .set_part_bytes("word/document.xml", b"replacement".to_vec())
+        .expect("replace part");
+    transaction
+        .add_part("word/added.bin", vec![1, 2, 3, 4])
+        .expect("add part");
+
+    let metrics = transaction.metrics();
+    assert_eq!(metrics.snapshotted_parts, 1);
+    assert_eq!(metrics.added_parts, 1);
+    assert_eq!(metrics.snapshotted_bytes, original_len);
+    assert_eq!(metrics.current_touched_bytes, 15);
+    assert_eq!(transaction.residency(), transaction.package().residency());
+
+    transaction.rollback();
+    assert!(pkg.part("word/added.bin").is_none());
 }
 
 #[test]

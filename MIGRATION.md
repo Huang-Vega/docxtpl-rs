@@ -17,10 +17,109 @@ independently:
   deadline, and resource-budget terminology;
 - inject a blocking executor into `AsyncRenderDispatcher` when async scheduling
   and bounded in-flight backpressure are required.
+- use `for_each_editable_story_with_resources` with `insert_inline_image` when
+  Story XML, media, and relationships must share one rollback boundary.
 
 The old `StoryScope`, `StoryKind`, `CancellationToken`, `CancellationError`, and
 `ResourceLimits` types remain available. In particular, 1.3 does not add
 variants to the exhaustively matchable 1.2 story enums.
+
+### Resource-aware inline images
+
+The resource-aware Story context can insert a registered image directly into
+an existing `w:r`. The image relationship is owned by the current Story, exact
+media and relationships are reused, and all changes roll back together:
+
+```rust
+use std::sync::Arc;
+use docxtpl_rs::{
+    EditableStorySelection, FailurePolicy, ImageLayout, InlineImageOptions,
+};
+
+rendered.postprocess(|pipeline| {
+    pipeline.pass("insert-photo", FailurePolicy::Abort, |transaction| {
+        transaction.for_each_editable_story_with_resources(
+            EditableStorySelection::BODY,
+            |context| {
+                let media = context.resources().register_media_bytes(
+                    "photo.png",
+                    Arc::clone(&photo_bytes),
+                )?;
+                let run = context.story().document()
+                    .descendants(context.story().document().root())
+                    .into_iter()
+                    .find(|node| context.story().document().tag(*node).is_some_and(|tag| {
+                        tag.ns == docxtpl_xml::ns_uri::W && tag.local == "r"
+                    }))
+                    .expect("target run");
+                let inserted = context.insert_inline_image(
+                    run,
+                    &media,
+                    &InlineImageOptions {
+                        layout: ImageLayout::FitWithin {
+                            width: 2_000_000,
+                            height: 1_000_000,
+                        },
+                        description: Some("Product photo".into()),
+                        ..InlineImageOptions::default()
+                    },
+                )?;
+                context.clone_drawing_to_run(inserted.drawing, run)?;
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })?;
+    Ok(())
+})?;
+# Ok::<(), docxtpl_rs::Error>(())
+```
+
+`clone_drawing_to_run` retains the source image/link relationship ids but
+allocates fresh `wp:docPr` and `pic:cNvPr` ids. Before serialization, newly
+inserted or cloned drawings are checked for duplicate ids and dangling image or
+hyperlink relationships.
+
+### WordML fragment import
+
+`WordFragment` imports selected top-level paragraphs and tables from another
+DOCX package without requiring callers to copy relationships manually:
+
+```rust
+use docxtpl_rs::{FragmentImportOptions, Package, PackageLimits, WordFragment};
+use std::io::Cursor;
+
+let source = Package::from_reader(Cursor::new(source_docx), &PackageLimits::default())?;
+let mut fragment = Some(WordFragment::from_package(source, "word/document.xml")?);
+
+transaction.for_each_editable_story_with_resources(
+    EditableStorySelection::BODY,
+    |context| {
+        let target = context.story().document().root();
+        context.import_fragment(
+            target,
+            fragment.take().expect("body is visited once"),
+            FragmentImportOptions {
+                placement: docxtpl_rs::FragmentPlacement::Append,
+            },
+        )?;
+        Ok(())
+    },
+)?;
+# Ok::<(), docxtpl_rs::Error>(())
+```
+
+The import owns its source package and is consumed by one import operation.
+Embedded image bytes are registered through the same media catalog, external
+hyperlinks are recreated for the destination Story owner, internal anchors and
+bookmarks are renamed together, numbering definitions are copied with fresh
+ids, and Drawing ids are allocated from the destination Story. All target
+changes share the surrounding pass rollback boundary.
+
+The first-stage importer deliberately rejects chart, OLE, SmartArt, VML image,
+note/comment references, picture numbering, and unrecognized relationship
+attributes. These cases return `Error::UnsupportedFragmentFeature` instead of
+silently leaving a dangling relationship.
 
 ## 1.2 editing API
 
@@ -138,6 +237,82 @@ Registration deduplicates media by SHA-1 across the package and the current
 pass. Exact relationships are idempotent, and all added parts, relationships,
 and Content Types declarations are removed if the pass rolls back.
 
+For in-memory uploads, use the symmetric byte-backed entry point. The name is
+only a hint: the actual bytes determine the extension and Content Type. The
+supplied immutable allocation is shared with the package rather than copied:
+
+```rust
+use std::sync::Arc;
+
+let upload: Arc<[u8]> = Arc::from(image_bytes);
+let media = transaction.register_media_bytes("upload.bin", upload)?;
+let rid = transaction.relate_image("word/document.xml", &media)?;
+```
+
+Code that already owns a verified file snapshot can instead call
+`register_media_source(name, MediaSource::File(source))`. File media remains
+file-backed and is streamed during ZIP output. Registration verifies and probes
+the snapshot incrementally without retaining the complete file, and final
+output verifies it again.
+
+Custom passes can return stable operational classifications through the
+structured pipeline without wrapping business validation failures as I/O
+errors:
+
+```rust
+rendered.postprocess_structured(|pipeline| {
+    pipeline.pass_structured("fragment", FailurePolicy::Abort, |_transaction| {
+        Err(PostprocessError::custom(
+    "fragment.image_placeholder_missing",
+    "fragment image has no registered source",
+)
+.with_part("word/document.xml")
+.into())
+    })?;
+    Ok(())
+})?;
+```
+
+With `FailurePolicy::WarnAndRollback`, the code and safe message are copied to
+the pass warning; `rolled_back` and `touched_parts` continue to describe the
+transaction outcome.
+
+When Story editing also needs media or relationships, use the resource-aware
+single-pass editor. Relationship ownership is derived from the current Story,
+so the same closure works for body, headers, footers, notes, and comments:
+
+```rust
+transaction.for_each_editable_story_with_resources(
+    EditableStorySelection::ALL,
+    |context| {
+        let media = context.resources().register_media_path("photo.png")?;
+        let rid = context.resources().relate_image(&media)?;
+        let story = context.story_mut();
+        // Insert or update DrawingML in story.document_mut() using rid.
+        let _ = rid;
+        Ok(())
+    },
+)?;
+```
+
+The Story is parsed and serialized at most once. Its XML, registered media,
+Content Types, and owner relationships roll back together if the pass fails.
+Media registration in later passes reuses the same document-local catalog;
+`pipeline.media_catalog_metrics()` reports scanned parts, actually hashed
+bytes, catalog hits, and reused media.
+
+If upload normalization already needs image metadata, probe a file once and
+reuse the library-created handle:
+
+```rust
+let probed = ProbedMediaFile::open("photo.png", &ResourceLimits::default())?;
+let media = transaction.register_probed_media(&probed)?;
+```
+
+The handle cannot accept a caller-supplied digest. It enforces the configured
+single-entry limit, keeps the registered package part file-backed, and final
+ZIP output rejects replacement, truncation, or modification of the source.
+
 Long-lived rendered documents can inspect and release clean lazy part buffers
 before the final write:
 
@@ -151,6 +326,37 @@ Eviction never discards modified data, in-memory-created parts, or file-backed
 media. Evicted source-ZIP parts are transparently reloaded if read again. The
 reported residency covers part-content buffers, not allocator overhead or the
 template preprocessing cache, and therefore is not a process RSS measurement.
+
+For long multi-Story passes, automatic eviction can be enabled explicitly:
+
+```rust
+pipeline.set_part_cache_policy(PartCachePolicy::EvictAbove {
+    resident_bytes: 128 * 1024 * 1024,
+});
+```
+
+`Retain` remains the default. A high-water check runs after media-catalog
+construction and after each visited Story, releasing only clean lazy buffers
+backed by the reopenable source ZIP.
+Dirty/new parts, file-backed media, and transaction rollback snapshots are
+never evicted. `PassReport::resources` reports eviction runs and released
+bytes, while `residency_before` and `residency_after` expose the pass boundary.
+
+`StoryEditReport` now includes parsed/serialized byte totals and their elapsed
+times. `PassReport::transaction` exposes snapshot/add counts and byte sizes;
+`PassReport::resources` also distinguishes added/reused media and
+relationships and records `peak_resident_bytes` at mutation, media-catalog,
+and Story checkpoints. Recoverably rolled-back passes report
+`rollback_elapsed`. Atomic file-save `PackageWriteReport` values additionally
+include `temporary_file_bytes`, `temporary_sync_elapsed`, and
+`atomic_replace_elapsed`; stream writes leave those fields at zero. These
+metrics are counters only and do not retain part names beyond the existing
+`touched_parts`, URLs, source paths, or application data.
+
+Controlled media probing hashes byte and file inputs in 64 KiB chunks, and OPC
+validation checks cancellation between parts and relationships. Controlled
+atomic saves therefore stop before destination replacement when cancellation
+or a deadline is observed during either phase.
 
 File-path saves are now atomic for both new and existing destinations. The
 package is validated and written under `PackageLimits` into a synchronized

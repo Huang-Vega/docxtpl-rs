@@ -26,11 +26,12 @@ mod listing;
 mod richtext;
 
 pub use image::{
-    probe, probe_with_digest, py_round, sha1_digest, ImageDigest, ImageError, ImageInfo,
+    probe, probe_with_digest, probe_with_digest_interruptible, py_round, sha1_digest,
+    sha1_digest_interruptible, ImageDigest, ImageError, ImageInfo,
 };
 pub use inline_image::{
-    render_inline_image, render_inline_image_with_info, scaled_dimensions, InlineImage,
-    InlineImageLoadError, LazyImageFile,
+    render_inline_drawing_with_info, render_inline_image, render_inline_image_with_info,
+    scaled_dimensions, InlineImage, InlineImageLoadError, LazyImageFile,
 };
 pub use listing::Listing;
 pub use richtext::{RichText, RichTextParagraph, RichTextProps};
