@@ -90,7 +90,14 @@ mod text_index;
 pub use async_render::{
     AsyncDispatchError, AsyncRenderDispatcher, BlockingExecutor, BlockingTask, RenderTask,
 };
-pub use fragment::{FragmentImportOptions, FragmentImportReport, FragmentPlacement, WordFragment};
+pub use fragment::{
+    DefaultFragmentResourceResolver, DetailedFragmentImportReport, ExternalLinkPolicy,
+    FragmentDocument, FragmentImportLimits, FragmentImportOptions, FragmentImportReport,
+    FragmentImportSettings, FragmentImportWarning, FragmentInsertion, FragmentNodeId,
+    FragmentPlacement, FragmentRelationshipView, FragmentResourceDecision,
+    FragmentResourceResolver, FragmentResourceSource, FragmentStory, RelationshipIdMapping,
+    RelationshipRegistration, UnsupportedRelationshipPolicy, WordFragment,
+};
 pub use persistent_cache::{PreparedCachePolicy, PreparedCacheStats, PreparedTemplateCache};
 
 pub use text_index::{
@@ -613,6 +620,10 @@ impl DocxTemplate {
 
     /// Render with cooperative cancellation checkpoints between package open,
     /// each story phase, canonicalization, and final validation.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use render_with_control with RenderControl::with_cancellation"
+    )]
     pub fn render_with_cancellation(
         &self,
         context: &serde_json::Value,
@@ -710,6 +721,11 @@ impl DocxTemplate {
     }
 
     /// Render a rich context with cooperative cancellation.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use render_ctx_with_control with RenderControl::with_cancellation"
+    )]
+    #[allow(deprecated)]
     pub fn render_ctx_with_cancellation(
         &self,
         context: &RenderContext,
@@ -1052,6 +1068,10 @@ impl RenderSession {
     /// Finish a rich-content session with cooperative cancellation. This is
     /// the cancellable counterpart for sessions that pre-register hyperlinks,
     /// subdocuments, or replacement operations before rendering.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use finish_with_control with RenderControl::with_cancellation"
+    )]
     pub fn finish_with_cancellation(
         mut self,
         context: &RenderContext,
@@ -3619,6 +3639,11 @@ impl PostprocessTransaction<'_, '_> {
 
     /// Parse each selected story once, run all caller edits on its shared DOM,
     /// and serialize that story at most once.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use for_each_editable_story with EditableStorySelection"
+    )]
+    #[allow(deprecated)]
     pub fn for_each_story(
         &mut self,
         scope: StoryScope,
@@ -3629,6 +3654,10 @@ impl PostprocessTransaction<'_, '_> {
     }
 
     /// Parse and edit selected stories while also returning byte and timing metrics.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use for_each_editable_story_with_metrics with EditableStorySelection"
+    )]
     pub fn for_each_story_with_metrics(
         &mut self,
         scope: StoryScope,
@@ -4349,6 +4378,10 @@ impl RenderedDocument {
 
     /// Run rollback-capable passes with cooperative cancellation. A cancelled
     /// active pass is always rolled back, regardless of its failure policy.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use postprocess_with_control with RenderControl::with_cancellation"
+    )]
     pub fn postprocess_with_cancellation(
         &mut self,
         cancellation: &CancellationToken,
@@ -4442,6 +4475,11 @@ impl RenderedDocument {
 
     /// Validate and atomically save with cooperative cancellation. The old
     /// destination remains untouched when cancellation interrupts ZIP output.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use save_with_control with RenderControl::with_cancellation"
+    )]
+    #[allow(deprecated)]
     pub fn save_with_cancellation(
         &self,
         path: impl AsRef<Path>,
@@ -4451,6 +4489,11 @@ impl RenderedDocument {
     }
 
     /// Save with explicit ZIP options and cooperative cancellation.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use save_with_options_and_control with RenderControl::with_cancellation"
+    )]
+    #[allow(deprecated)]
     pub fn save_with_options_and_cancellation(
         &self,
         path: impl AsRef<Path>,
@@ -4500,6 +4543,10 @@ impl RenderedDocument {
 
     /// Validate and atomically save with structured metrics and cooperative
     /// cancellation checkpoints through ZIP serialization.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use save_with_report_and_control with RenderControl::with_cancellation"
+    )]
     pub fn save_with_report_and_cancellation(
         &self,
         path: impl AsRef<Path>,
@@ -4566,6 +4613,10 @@ impl RenderedDocument {
     /// Validate and write to a stream with metrics and cooperative
     /// cancellation. Unlike file saving, a caller-provided stream can contain
     /// a partial ZIP after cancellation.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use write_to_with_report_and_control with RenderControl::with_cancellation"
+    )]
     pub fn write_to_with_report_and_cancellation(
         &self,
         writer: impl Write + std::io::Seek,

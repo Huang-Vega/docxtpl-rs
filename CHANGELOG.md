@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-10-02
+
+- Added a limits-bound `FragmentDocument`/Story selection entry point for
+  shared DOCX bytes and already-opened packages, while retaining source
+  compatibility with the 1.3.1 `WordFragment` API.
+- Added resolver-capable fragment import with explicit Append/Before/After/
+  Replace insertion, HTTP(S)-by-default external-link policy, bounded source
+  relationships/media/report mappings, caller-selected file- or byte-backed
+  media replacement, and detailed non-sensitive import metrics.
+- Added repository-level tests for compressed-source limits, deterministic
+  Story node selection, Replace insertion, detailed reporting, and file-backed
+  placeholder-image replacement.
+- Deprecated superseded compatibility entry points for 1.2 Story traversal,
+  cancellation-only execution, and the 1.3.1 fragment import path. They remain
+  callable in 1.3.2; diagnostics point to the unified replacement APIs.
+
 ## [1.3.1] - 2026-10-02
 
 - Added symmetric transactional media registration for shared byte-backed and

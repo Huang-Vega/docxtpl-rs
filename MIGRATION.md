@@ -22,7 +22,10 @@ independently:
 
 The old `StoryScope`, `StoryKind`, `CancellationToken`, `CancellationError`, and
 `ResourceLimits` types remain available. In particular, 1.3 does not add
-variants to the exhaustively matchable 1.2 story enums.
+variants to the exhaustively matchable 1.2 story enums. Starting with 1.3.2,
+the superseded Story traversal and cancellation-only methods emit deprecation
+warnings with their unified replacements; the supporting types remain usable
+so compatibility code can migrate incrementally.
 
 ### Resource-aware inline images
 
@@ -86,22 +89,27 @@ hyperlink relationships.
 DOCX package without requiring callers to copy relationships manually:
 
 ```rust
-use docxtpl_rs::{FragmentImportOptions, Package, PackageLimits, WordFragment};
+use docxtpl_rs::{
+    DefaultFragmentResourceResolver, FragmentDocument, FragmentImportLimits,
+    FragmentImportSettings, FragmentInsertion, Package, PackageLimits,
+};
 use std::io::Cursor;
 
 let source = Package::from_reader(Cursor::new(source_docx), &PackageLimits::default())?;
-let mut fragment = Some(WordFragment::from_package(source, "word/document.xml")?);
+let source = FragmentDocument::from_package(source, &FragmentImportLimits::default())?;
+let mut fragment = Some(source.story("word/document.xml")?);
+let settings = FragmentImportSettings::default();
+let mut resolver = DefaultFragmentResourceResolver;
 
 transaction.for_each_editable_story_with_resources(
     EditableStorySelection::BODY,
     |context| {
         let target = context.story().document().root();
-        context.import_fragment(
-            target,
+        context.import_fragment_with_resolver(
             fragment.take().expect("body is visited once"),
-            FragmentImportOptions {
-                placement: docxtpl_rs::FragmentPlacement::Append,
-            },
+            FragmentInsertion::AppendTo { parent: target },
+            &settings,
+            &mut resolver,
         )?;
         Ok(())
     },
@@ -118,8 +126,47 @@ changes share the surrounding pass rollback boundary.
 
 The first-stage importer deliberately rejects chart, OLE, SmartArt, VML image,
 note/comment references, picture numbering, and unrecognized relationship
-attributes. These cases return `Error::UnsupportedFragmentFeature` instead of
-silently leaving a dangling relationship.
+attributes with an explicit malformed-package diagnostic instead of silently
+leaving a dangling relationship.
+
+The 1.3.1 `WordFragment::from_package` and
+`StoryEditContext::import_fragment` compatibility entry points are deprecated
+in 1.3.2. They continue to work, but new code should use the limits-bound
+`FragmentDocument` source and resolver-capable import shown above.
+
+In 1.3.2, `FragmentDocument` adds a limits-bound entry point for shared DOCX
+bytes and reusable source packages. The resolver-capable API supports explicit
+Replace insertion and lets callers substitute file-backed media without
+manually editing relationships or Content Types:
+
+```rust
+use std::sync::Arc;
+use docxtpl_rs::{
+    DefaultFragmentResourceResolver, FragmentDocument, FragmentImportLimits,
+    FragmentImportSettings, FragmentInsertion,
+};
+
+let source = FragmentDocument::from_docx_bytes(
+    Arc::from(source_docx),
+    &FragmentImportLimits::default(),
+)?;
+let fragment = source.story("word/document.xml")?;
+let report = context.import_fragment_with_resolver(
+    fragment,
+    FragmentInsertion::Before { anchor },
+    &FragmentImportSettings::default(),
+    &mut DefaultFragmentResourceResolver,
+)?;
+assert!(report.summary.inserted_nodes > 0);
+# Ok::<(), docxtpl_rs::Error>(())
+```
+
+`FragmentResourceResolver` receives each distinct source relationship once and
+can return a `MediaRegistration` created through `StoryResources`. Default
+external links are limited to HTTP(S); broader schemes and relationship
+skipping require explicit settings. Mapping arrays and source/media work are
+bounded by `FragmentImportLimits`, and detailed reports never retain image
+bytes, absolute paths, or target URLs.
 
 ## 1.2 editing API
 

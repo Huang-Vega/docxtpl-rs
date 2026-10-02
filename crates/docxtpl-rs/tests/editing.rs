@@ -1,13 +1,20 @@
+// This suite intentionally keeps coverage for the deprecated compatibility
+// entry points alongside their replacements.
+#![allow(deprecated)]
+
 use std::io::Cursor;
 use std::sync::Arc;
 
 use docxtpl_opc::TargetMode;
 use docxtpl_rs::{
-    Bookmark, CancellationError, CancellationToken, DocxTemplate, EditableStoryKind,
-    EditableStorySelection, FailurePolicy, FilePartSource, FormattingPolicy, FragmentImportOptions,
-    ImageLayout, InlineImageOptions, MediaSource, Package, PackageLimits, PartCachePolicy,
-    PostprocessError, PostprocessRunError, ProbedMediaFile, RenderOptions, RenderedDocument,
-    ResourceLimits, RunFormatOverrides, RunTextLimits, StoryKind, StoryScope, WordFragment,
+    Bookmark, CancellationError, CancellationToken, DefaultFragmentResourceResolver, DocxTemplate,
+    EditableStoryKind, EditableStorySelection, FailurePolicy, FilePartSource, FormattingPolicy,
+    FragmentDocument, FragmentImportLimits, FragmentImportOptions, FragmentImportSettings,
+    FragmentInsertion, FragmentRelationshipView, FragmentResourceDecision,
+    FragmentResourceResolver, FragmentResourceSource, ImageLayout, InlineImageOptions, MediaSource,
+    Package, PackageLimits, PartCachePolicy, PostprocessError, PostprocessRunError,
+    ProbedMediaFile, RenderOptions, RenderedDocument, ResourceLimits, RunFormatOverrides,
+    RunTextLimits, StoryKind, StoryResources, StoryScope, WordFragment,
 };
 use serde_json::json;
 
@@ -31,6 +38,28 @@ const NOTE_TEMPLATE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/templates/p7b_footnotes_real.docx"
 );
+
+#[derive(Default)]
+struct FileBackedImageResolver {
+    image_calls: usize,
+}
+
+impl FragmentResourceResolver for FileBackedImageResolver {
+    fn resolve(
+        &mut self,
+        relationship: &FragmentRelationshipView,
+        _source: &FragmentResourceSource<'_>,
+        resources: &mut StoryResources<'_, '_, '_>,
+    ) -> Result<FragmentResourceDecision, docxtpl_rs::Error> {
+        if relationship.relationship_type.ends_with("/image") {
+            self.image_calls += 1;
+            return Ok(FragmentResourceDecision::UseMedia(
+                resources.register_media_path(MEDIA)?,
+            ));
+        }
+        Ok(FragmentResourceDecision::ImportDefault)
+    }
+}
 
 fn import_simple_fragment_into_selection(
     document: &mut RenderedDocument,
@@ -66,6 +95,150 @@ fn import_simple_fragment_into_selection(
     })?;
 
     Ok(visited)
+}
+
+#[test]
+fn fragment_document_bytes_api_replaces_a_target_and_reports_nodes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_template = DocxTemplate::open(TEMPLATE)?;
+    let source = source_template.render(
+        &json!({"name": "fragment document source"}),
+        &RenderOptions::compat(),
+    )?;
+    let source_bytes: Arc<[u8]> = Arc::from(source.to_bytes()?);
+    let fragment_document =
+        FragmentDocument::from_docx_bytes(source_bytes, &FragmentImportLimits::default())?;
+    let mut fragment = fragment_document.story("word/document.xml")?;
+    let roots = fragment.body_children();
+    assert!(!roots.is_empty());
+    assert!(fragment.tag(roots[0]).is_some_and(|tag| {
+        tag.ns == docxtpl_xml::ns_uri::W && matches!(tag.local.as_str(), "p" | "tbl")
+    }));
+    fragment.select_roots([roots[0]])?;
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut target = template.render(
+        &json!({"name": "fragment target removed"}),
+        &RenderOptions::compat(),
+    )?;
+    let mut fragment = Some(fragment);
+    let mut detailed = None;
+    target.postprocess(|pipeline| {
+        pipeline.pass("fragment-replace", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::BODY,
+                |context| {
+                    let target_node = context
+                        .story()
+                        .document()
+                        .descendants(context.story().document().root())
+                        .into_iter()
+                        .find(|node| {
+                            context.story().document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("target paragraph");
+                    detailed = Some(context.import_fragment_with_resolver(
+                        fragment.take().expect("body visited once"),
+                        FragmentInsertion::Replace {
+                            target: target_node,
+                        },
+                        &FragmentImportSettings::default(),
+                        &mut DefaultFragmentResourceResolver,
+                    )?);
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let detailed = detailed.expect("detailed fragment report");
+    assert_eq!(detailed.summary.inserted_nodes, 1);
+    assert!(detailed.imported_total_nodes >= 1);
+    assert!(detailed.relationship_map.is_empty());
+    let package = Package::from_reader(Cursor::new(target.to_bytes()?), &PackageLimits::default())?;
+    package.validate()?;
+    let xml = std::str::from_utf8(package.part("word/document.xml").unwrap().bytes()?)?;
+    assert!(xml.contains("fragment document source"));
+    assert!(!xml.contains("fragment target removed"));
+    Ok(())
+}
+
+#[test]
+fn fragment_document_rejects_compressed_source_over_limit() -> Result<(), Box<dyn std::error::Error>>
+{
+    let source_template = DocxTemplate::open(TEMPLATE)?;
+    let source = source_template.render(&json!({"name": "limit"}), &RenderOptions::compat())?;
+    let source_bytes: Arc<[u8]> = Arc::from(source.to_bytes()?);
+    let mut limits = FragmentImportLimits::default();
+    limits.max_source_docx_bytes = source_bytes.len() as u64 - 1;
+    let error = FragmentDocument::from_docx_bytes(source_bytes, &limits)
+        .err()
+        .expect("oversized source must fail");
+    assert!(error.to_string().contains("fragment_source_docx"));
+    Ok(())
+}
+
+#[test]
+fn fragment_resolver_replaces_source_image_with_file_backed_media(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_bytes: Arc<[u8]> = Arc::from(std::fs::read(DRAWING_TEMPLATE)?);
+    let fragment_document =
+        FragmentDocument::from_docx_bytes(source_bytes, &FragmentImportLimits::default())?;
+    let fragment = fragment_document.story("word/document.xml")?;
+
+    let template = DocxTemplate::open(TEMPLATE)?;
+    let mut target = template.render(
+        &json!({"name": "resolver target"}),
+        &RenderOptions::compat(),
+    )?;
+    let mut fragment = Some(fragment);
+    let mut resolver = FileBackedImageResolver::default();
+    let mut detailed = None;
+    target.postprocess(|pipeline| {
+        pipeline.pass("fragment-resolver", FailurePolicy::Abort, |transaction| {
+            transaction.for_each_editable_story_with_resources(
+                EditableStorySelection::BODY,
+                |context| {
+                    let anchor = context
+                        .story()
+                        .document()
+                        .descendants(context.story().document().root())
+                        .into_iter()
+                        .find(|node| {
+                            context.story().document().tag(*node).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "p"
+                            })
+                        })
+                        .expect("target paragraph");
+                    detailed = Some(context.import_fragment_with_resolver(
+                        fragment.take().expect("body visited once"),
+                        FragmentInsertion::Before { anchor },
+                        &FragmentImportSettings::default(),
+                        &mut resolver,
+                    )?);
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    })?;
+
+    let detailed = detailed.expect("detailed fragment report");
+    assert!(resolver.image_calls >= 1);
+    assert!(detailed.summary.image_relationships >= 1);
+    assert_eq!(detailed.media_bytes_read, 0);
+    assert!(detailed
+        .relationship_map
+        .iter()
+        .any(|mapping| mapping.target_id.is_some()));
+    let package = Package::from_reader(Cursor::new(target.to_bytes()?), &PackageLimits::default())?;
+    package.validate()?;
+    Ok(())
 }
 
 #[test]

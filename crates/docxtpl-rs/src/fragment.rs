@@ -1,14 +1,17 @@
 //! Transactional import of paragraph/table WordML fragments.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::sync::Arc;
 
-use docxtpl_opc::{resolve_part_target, OpcError, Package, PartUri, TargetMode};
-use docxtpl_xml::{ns_uri, NodeId, XmlDocument, XmlLimits};
+use docxtpl_opc::{
+    resolve_part_target, OpcError, Package, PackageLimits, PartUri, Relationship, TargetMode,
+};
+use docxtpl_xml::{ns_uri, NodeId, QName, XmlDocument, XmlLimits};
 
 use super::{
     allocate_positive_id, decode_xml_bytes, is_word_element, Error, MediaRegistration,
-    StoryEditContext, HYPERLINK_REL_TYPE, IMAGE_REL_TYPE,
+    StoryEditContext, StoryResources, HYPERLINK_REL_TYPE, IMAGE_REL_TYPE,
 };
 
 const NUMBERING_REL_TYPE: &str =
@@ -58,29 +61,349 @@ pub struct FragmentImportReport {
     pub roots: Vec<NodeId>,
 }
 
+/// Resource limits applied while opening and importing a fragment source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentImportLimits {
+    /// Maximum compressed source DOCX bytes accepted by [`FragmentDocument::from_docx_bytes`].
+    pub max_source_docx_bytes: u64,
+    /// OPC ZIP entry and expansion limits.
+    pub package: PackageLimits,
+    /// Maximum XML bytes for one selected Story part.
+    pub max_story_xml_bytes: u64,
+    /// Maximum selected top-level paragraph/table nodes.
+    pub max_root_nodes: usize,
+    /// Maximum total nodes across the selected subtrees.
+    pub max_total_nodes: usize,
+    /// Maximum distinct relationship references resolved by one import.
+    pub max_relationships: usize,
+    /// Maximum source bytes read across default media imports.
+    pub max_media_bytes: u64,
+    /// Maximum resolver invocations for one import.
+    pub max_resolver_calls: usize,
+    /// Maximum relationship/bookmark mappings retained in a detailed report.
+    pub max_report_mappings: usize,
+}
+
+impl Default for FragmentImportLimits {
+    fn default() -> Self {
+        Self {
+            max_source_docx_bytes: 128 * 1024 * 1024,
+            package: PackageLimits::default(),
+            max_story_xml_bytes: 64 * 1024 * 1024,
+            max_root_nodes: 4_096,
+            max_total_nodes: 1_000_000,
+            max_relationships: 16_384,
+            max_media_bytes: 512 * 1024 * 1024,
+            max_resolver_calls: 16_384,
+            max_report_mappings: 4_096,
+        }
+    }
+}
+
+/// A reusable, limits-bound source DOCX for selecting one or more Stories.
+pub struct FragmentDocument {
+    package: Arc<Package>,
+    limits: FragmentImportLimits,
+}
+
+/// Node handle scoped by the owning [`WordFragment`] source DOM.
+pub type FragmentNodeId = NodeId;
+
+/// Parsed source Story returned by [`FragmentDocument::story`].
+pub type FragmentStory = WordFragment;
+
+impl FragmentDocument {
+    /// Open a source DOCX from immutable shared bytes under explicit limits.
+    pub fn from_docx_bytes(bytes: Arc<[u8]>, limits: &FragmentImportLimits) -> Result<Self, Error> {
+        if bytes.len() as u64 > limits.max_source_docx_bytes {
+            return Err(OpcError::LimitExceeded {
+                kind: "fragment_source_docx",
+                value: bytes.len() as u64,
+                max: limits.max_source_docx_bytes,
+            }
+            .into());
+        }
+        let package = Package::from_reader(Cursor::new(bytes), &limits.package)?;
+        Self::from_package(package, limits)
+    }
+
+    /// Wrap an already-opened source package.
+    pub fn from_package(package: Package, limits: &FragmentImportLimits) -> Result<Self, Error> {
+        package.validate()?;
+        Ok(Self {
+            package: Arc::new(package),
+            limits: limits.clone(),
+        })
+    }
+
+    /// Parse one source Story and select its direct paragraph/table children.
+    pub fn story(&self, part_name: &str) -> Result<WordFragment, Error> {
+        WordFragment::from_shared_package(
+            Arc::clone(&self.package),
+            part_name.to_string(),
+            self.limits.clone(),
+        )
+    }
+}
+
+/// Target insertion point for the additive fragment-import API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FragmentInsertion {
+    /// Append imported roots as children of the target element.
+    AppendTo { parent: NodeId },
+    /// Insert imported roots immediately before the anchor.
+    Before { anchor: NodeId },
+    /// Insert imported roots immediately after the anchor.
+    After { anchor: NodeId },
+    /// Replace the target element with imported roots.
+    Replace { target: NodeId },
+}
+
+/// Handling for an otherwise unsupported relationship-bearing node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedRelationshipPolicy {
+    /// Reject the import before attaching nodes.
+    #[default]
+    Reject,
+    /// Remove the relationship-bearing source element and record a warning.
+    Skip,
+}
+
+/// External hyperlink allow-list policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExternalLinkPolicy {
+    /// Permit only HTTP and HTTPS targets.
+    #[default]
+    HttpHttps,
+    /// Reject all external hyperlinks.
+    Reject,
+    /// Permit any non-empty URI scheme explicitly supplied by the source/resolver.
+    AllowAnyScheme,
+}
+
+/// Options for the resolver-capable import entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentImportSettings {
+    /// Policy for unknown relationship-bearing elements.
+    pub unsupported_relationships: UnsupportedRelationshipPolicy,
+    /// Policy for external hyperlink schemes.
+    pub external_links: ExternalLinkPolicy,
+    /// Validate the target Story's bookmark/internal-link integrity after import.
+    pub validate_after_import: bool,
+    /// Per-import resource limits.
+    pub limits: FragmentImportLimits,
+}
+
+impl Default for FragmentImportSettings {
+    fn default() -> Self {
+        Self {
+            unsupported_relationships: UnsupportedRelationshipPolicy::Reject,
+            external_links: ExternalLinkPolicy::HttpHttps,
+            validate_after_import: true,
+            limits: FragmentImportLimits::default(),
+        }
+    }
+}
+
+/// Read-only description of one source relationship presented to a resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentRelationshipView {
+    /// Source Story owner part.
+    pub source_owner: String,
+    /// Source relationship id referenced by WordML.
+    pub relationship_id: String,
+    /// OPC relationship type URI.
+    pub relationship_type: String,
+    /// Relationship target exactly as stored in the source package.
+    pub target: String,
+    /// Internal or external target mode.
+    pub target_mode: TargetMode,
+    /// Safely resolved internal part URI, when applicable.
+    pub resolved_part: Option<PartUri>,
+    /// Source content type, when the internal part has one.
+    pub content_type: Option<String>,
+}
+
+/// Source payload available to a fragment resource resolver.
+#[non_exhaustive]
+pub enum FragmentResourceSource<'a> {
+    /// Relationship has no package-part payload, such as an external hyperlink.
+    None,
+    /// Bounded bytes of an internal source package part.
+    Part { name: &'a PartUri, bytes: &'a [u8] },
+}
+
+/// Resolver decision for one distinct source relationship.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum FragmentResourceDecision {
+    /// Apply the library's default image/hyperlink behavior.
+    ImportDefault,
+    /// Use caller-registered media instead of the source image part.
+    UseMedia(MediaRegistration),
+    /// Use a caller-selected external hyperlink target.
+    UseExternalHyperlink(String),
+    /// Use a caller-selected relationship. The first implementation accepts
+    /// external hyperlink registrations; package-part relationships remain
+    /// subject to the built-in safe import paths.
+    UseRelationship(RelationshipRegistration),
+    /// Remove the relationship-bearing element when skipping is enabled.
+    Skip,
+    /// Reject the import with a safe diagnostic.
+    Reject { reason: String },
+}
+
+/// Caller-selected relationship registration returned by a resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RelationshipRegistration {
+    /// OPC relationship type URI.
+    pub relationship_type: String,
+    /// Target exactly as it should appear in the target Story's `.rels` part.
+    pub target: String,
+    /// Internal or external target mode.
+    pub target_mode: TargetMode,
+}
+
+impl RelationshipRegistration {
+    /// Construct an external hyperlink registration.
+    #[must_use]
+    pub fn external_hyperlink(target: impl Into<String>) -> Self {
+        Self {
+            relationship_type: HYPERLINK_REL_TYPE.to_string(),
+            target: target.into(),
+            target_mode: TargetMode::External,
+        }
+    }
+}
+
+/// Resolves or replaces resources referenced by imported WordML.
+pub trait FragmentResourceResolver {
+    /// Resolve one distinct source relationship. Repeated references reuse the decision.
+    fn resolve(
+        &mut self,
+        relationship: &FragmentRelationshipView,
+        source: &FragmentResourceSource<'_>,
+        resources: &mut StoryResources<'_, '_, '_>,
+    ) -> Result<FragmentResourceDecision, Error>;
+}
+
+/// Default resolver that imports supported source resources unchanged.
+#[derive(Debug, Default)]
+pub struct DefaultFragmentResourceResolver;
+
+impl FragmentResourceResolver for DefaultFragmentResourceResolver {
+    fn resolve(
+        &mut self,
+        _relationship: &FragmentRelationshipView,
+        _source: &FragmentResourceSource<'_>,
+        _resources: &mut StoryResources<'_, '_, '_>,
+    ) -> Result<FragmentResourceDecision, Error> {
+        Ok(FragmentResourceDecision::ImportDefault)
+    }
+}
+
+/// One source-to-target relationship id mapping retained in a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RelationshipIdMapping {
+    /// Source relationship id.
+    pub source_id: String,
+    /// Target relationship id, or `None` when skipped.
+    pub target_id: Option<String>,
+}
+
+/// Non-fatal fragment import diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FragmentImportWarning {
+    /// Stable warning category.
+    pub code: &'static str,
+    /// Safe human-readable detail.
+    pub message: String,
+}
+
+/// Detailed report from the resolver-capable import API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DetailedFragmentImportReport {
+    /// Compatibility-preserving summary.
+    pub summary: FragmentImportReport,
+    /// Total nodes copied across all roots.
+    pub imported_total_nodes: usize,
+    /// Source media bytes read by default imports.
+    pub media_bytes_read: u64,
+    /// Source-to-target relationship mappings, bounded by import limits.
+    pub relationship_map: Vec<RelationshipIdMapping>,
+    /// Whether mapping entries were truncated.
+    pub mappings_truncated: bool,
+    /// Non-fatal decisions such as explicitly skipped relationships.
+    pub warnings: Vec<FragmentImportWarning>,
+}
+
 /// A selected set of top-level paragraphs/tables from one source DOCX part.
 ///
 /// Construction parses the source part once. By default, a main-document
 /// source selects all direct `w:p`/`w:tbl` children of `w:body`; other parts
 /// select direct paragraph/table children of their root.
 pub struct WordFragment {
-    package: Package,
+    package: Arc<Package>,
     source_part: String,
     document: XmlDocument,
     roots: Vec<NodeId>,
+    all_roots: Vec<NodeId>,
     available_roots: HashSet<NodeId>,
+    limits: FragmentImportLimits,
 }
 
 impl WordFragment {
     /// Parse and select all supported top-level nodes from `source_part`.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use FragmentDocument::from_package with FragmentDocument::story"
+    )]
     pub fn from_package(package: Package, source_part: impl Into<String>) -> Result<Self, Error> {
-        let source_part = source_part.into();
+        Self::from_shared_package(
+            Arc::new(package),
+            source_part.into(),
+            FragmentImportLimits::default(),
+        )
+    }
+
+    /// Open a source DOCX from shared bytes and select one Story under explicit limits.
+    pub fn from_docx_bytes(
+        bytes: Arc<[u8]>,
+        source_part: impl Into<String>,
+        limits: &FragmentImportLimits,
+    ) -> Result<Self, Error> {
+        FragmentDocument::from_docx_bytes(bytes, limits)?.story(&source_part.into())
+    }
+
+    fn from_shared_package(
+        package: Arc<Package>,
+        source_part: String,
+        limits: FragmentImportLimits,
+    ) -> Result<Self, Error> {
         let bytes = package
             .part(&source_part)
             .ok_or_else(|| OpcError::MissingPart {
                 uri: source_part.clone(),
             })?
             .bytes()?;
+        if bytes.len() as u64 > limits.max_story_xml_bytes {
+            return Err(OpcError::LimitExceeded {
+                kind: "fragment_story_xml",
+                value: bytes.len() as u64,
+                max: limits.max_story_xml_bytes,
+            }
+            .into());
+        }
         let xml = decode_xml_bytes(bytes, &source_part)?;
         let document =
             XmlDocument::parse_strict(&xml, &XmlLimits::default()).map_err(|source| {
@@ -104,13 +427,24 @@ impl WordFragment {
                     || is_word_element_document(&document, *node, "tbl")
             })
             .collect();
+        if roots.len() > limits.max_root_nodes {
+            return Err(OpcError::LimitExceeded {
+                kind: "fragment_root_nodes",
+                value: roots.len() as u64,
+                max: limits.max_root_nodes as u64,
+            }
+            .into());
+        }
         let available_roots = roots.iter().copied().collect();
+        let all_roots = roots.clone();
         Ok(Self {
             package,
             source_part,
             document,
             roots,
+            all_roots,
             available_roots,
+            limits,
         })
     }
 
@@ -124,6 +458,29 @@ impl WordFragment {
     #[must_use]
     pub fn roots(&self) -> &[NodeId] {
         &self.roots
+    }
+
+    /// Direct paragraph/table children selected from the Story container.
+    #[must_use]
+    pub fn body_children(&self) -> Vec<NodeId> {
+        self.all_roots.clone()
+    }
+
+    /// Direct element children of a source node.
+    #[must_use]
+    pub fn element_children(&self, parent: NodeId) -> Vec<NodeId> {
+        self.document
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|node| self.document.tag(*node).is_some())
+            .collect()
+    }
+
+    /// Expanded source element name.
+    #[must_use]
+    pub fn tag(&self, node: NodeId) -> Option<&QName> {
+        self.document.tag(node)
     }
 
     /// Replace the selection with attached `w:p`/`w:tbl` nodes.
@@ -141,6 +498,26 @@ impl WordFragment {
             }
             .into());
         }
+        if roots.len() > self.limits.max_root_nodes {
+            return Err(OpcError::LimitExceeded {
+                kind: "fragment_root_nodes",
+                value: roots.len() as u64,
+                max: self.limits.max_root_nodes as u64,
+            }
+            .into());
+        }
+        let total_nodes = roots
+            .iter()
+            .map(|root| self.document.descendants(*root).len())
+            .sum::<usize>();
+        if total_nodes > self.limits.max_total_nodes {
+            return Err(OpcError::LimitExceeded {
+                kind: "fragment_total_nodes",
+                value: total_nodes as u64,
+                max: self.limits.max_total_nodes as u64,
+            }
+            .into());
+        }
         self.roots = roots;
         Ok(())
     }
@@ -148,26 +525,74 @@ impl WordFragment {
 
 impl StoryEditContext<'_, '_, '_> {
     /// Import selected paragraphs/tables and remap their package resources.
+    #[deprecated(
+        since = "1.3.2",
+        note = "use import_fragment_with_resolver with FragmentInsertion and FragmentImportSettings"
+    )]
     pub fn import_fragment(
         &mut self,
         target: NodeId,
-        mut fragment: WordFragment,
+        fragment: WordFragment,
         options: FragmentImportOptions,
     ) -> Result<FragmentImportReport, Error> {
+        let insertion = match options.placement {
+            FragmentPlacement::Before => FragmentInsertion::Before { anchor: target },
+            FragmentPlacement::After => FragmentInsertion::After { anchor: target },
+            FragmentPlacement::Append => FragmentInsertion::AppendTo { parent: target },
+        };
+        let settings = FragmentImportSettings {
+            external_links: ExternalLinkPolicy::AllowAnyScheme,
+            limits: fragment.limits.clone(),
+            ..FragmentImportSettings::default()
+        };
+        self.import_fragment_with_resolver(
+            fragment,
+            insertion,
+            &settings,
+            &mut DefaultFragmentResourceResolver,
+        )
+        .map(|report| report.summary)
+    }
+
+    /// Import a selected fragment with explicit insertion, policies, limits,
+    /// and caller-controlled resource replacement.
+    pub fn import_fragment_with_resolver<R: FragmentResourceResolver>(
+        &mut self,
+        mut fragment: WordFragment,
+        insertion: FragmentInsertion,
+        settings: &FragmentImportSettings,
+        resolver: &mut R,
+    ) -> Result<DetailedFragmentImportReport, Error> {
         self.transaction.check_control()?;
-        validate_target(self.story.document(), target, options.placement)?;
+        let (target, placement, replace) = match insertion {
+            FragmentInsertion::AppendTo { parent } => (parent, FragmentPlacement::Append, false),
+            FragmentInsertion::Before { anchor } => (anchor, FragmentPlacement::Before, false),
+            FragmentInsertion::After { anchor } => (anchor, FragmentPlacement::After, false),
+            FragmentInsertion::Replace { target } => (target, FragmentPlacement::Before, true),
+        };
+        validate_target(self.story.document(), target, placement)?;
+        validate_import_limits(&fragment, &settings.limits)?;
         validate_fragment_features(&fragment)?;
 
         let numbering_instances = self.remap_fragment_numbering(&mut fragment)?;
         let mut image_mapping = HashMap::new();
         let mut hyperlink_mapping = HashMap::new();
-        self.remap_fragment_relationships(
+        let mut details = RelationshipImportDetails::default();
+        self.remap_fragment_relationships_with_resolver(
             &mut fragment,
             &mut image_mapping,
             &mut hyperlink_mapping,
+            settings,
+            resolver,
+            &mut details,
         )?;
         self.remap_fragment_bookmarks(&mut fragment)?;
 
+        let imported_total_nodes = fragment
+            .roots
+            .iter()
+            .map(|root| fragment.document.descendants(*root).len())
+            .sum();
         let mut inserted = Vec::with_capacity(fragment.roots.len());
         for source_root in fragment.roots.iter().copied() {
             self.transaction.check_control()?;
@@ -181,27 +606,39 @@ impl StoryEditContext<'_, '_, '_> {
             self.renumber_imported_drawings(copied);
             inserted.push(copied);
         }
-        attach_roots(
-            self.story.document_mut(),
-            target,
-            &inserted,
-            options.placement,
-        )?;
+        attach_roots(self.story.document_mut(), target, &inserted, placement)?;
+        if replace {
+            self.story.document_mut().detach(target);
+        }
+        if settings.validate_after_import {
+            self.story.inner.validate_internal_links = true;
+            self.story.inner.validate_bookmarks_and_internal_links()?;
+        }
 
-        Ok(FragmentImportReport {
-            inserted_nodes: inserted.len(),
-            image_relationships: image_mapping.len(),
-            hyperlink_relationships: hyperlink_mapping.len(),
-            numbering_instances,
-            roots: inserted,
+        Ok(DetailedFragmentImportReport {
+            summary: FragmentImportReport {
+                inserted_nodes: inserted.len(),
+                image_relationships: image_mapping.len(),
+                hyperlink_relationships: hyperlink_mapping.len(),
+                numbering_instances,
+                roots: inserted,
+            },
+            imported_total_nodes,
+            media_bytes_read: details.media_bytes_read,
+            relationship_map: details.relationship_map,
+            mappings_truncated: details.mappings_truncated,
+            warnings: details.warnings,
         })
     }
 
-    fn remap_fragment_relationships(
+    fn remap_fragment_relationships_with_resolver<R: FragmentResourceResolver>(
         &mut self,
         fragment: &mut WordFragment,
         image_mapping: &mut HashMap<String, String>,
         hyperlink_mapping: &mut HashMap<String, String>,
+        settings: &FragmentImportSettings,
+        resolver: &mut R,
+        details: &mut RelationshipImportDetails,
     ) -> Result<(), Error> {
         let relationship_nodes = selected_descendants(fragment);
         for node in relationship_nodes {
@@ -223,34 +660,236 @@ impl StoryEditContext<'_, '_, '_> {
                 let is_hyperlink = ((tag_ns == ns_uri::W && tag_local == "hyperlink")
                     || (tag_ns == ns_uri::A && tag_local == "hlinkClick"))
                     && attribute == "id";
-                let new_rid = if is_image {
-                    if let Some(mapped) = image_mapping.get(&old_rid) {
-                        mapped.clone()
-                    } else {
-                        let media = register_fragment_image(self, fragment, &old_rid)?;
-                        let mapped = self.transaction.relate_image(&self.owner, &media)?;
-                        self.story.inner.image_rids.insert(mapped.clone());
-                        image_mapping.insert(old_rid.clone(), mapped.clone());
-                        mapped
+                if !is_image && !is_hyperlink {
+                    match settings.unsupported_relationships {
+                        UnsupportedRelationshipPolicy::Reject => {
+                            return Err(unsupported(format!(
+                                "relationship attribute {}:{}@r:{attribute}",
+                                tag_ns, tag_local
+                            )));
+                        }
+                        UnsupportedRelationshipPolicy::Skip => {
+                            let distinct_relationships = details
+                                .resolved_relationships
+                                .len()
+                                .saturating_add(details.skipped_relationships.len());
+                            if !details.skipped_relationships.contains(&old_rid)
+                                && distinct_relationships >= settings.limits.max_relationships
+                            {
+                                return Err(OpcError::LimitExceeded {
+                                    kind: "fragment_relationships",
+                                    value: (distinct_relationships + 1) as u64,
+                                    max: settings.limits.max_relationships as u64,
+                                }
+                                .into());
+                            }
+                            fragment.document.detach(node);
+                            details.skipped_relationships.insert(old_rid.clone());
+                            details.warnings.push(FragmentImportWarning {
+                                code: "fragment.relationship_skipped",
+                                message: format!(
+                                    "skipped unsupported relationship attribute {}:{}@r:{attribute}",
+                                    tag_ns, tag_local
+                                ),
+                            });
+                            details.record_mapping(&old_rid, None, &settings.limits);
+                            continue;
+                        }
                     }
-                } else if is_hyperlink {
-                    if let Some(mapped) = hyperlink_mapping.get(&old_rid) {
-                        mapped.clone()
-                    } else {
-                        let mapped = register_fragment_hyperlink(self, fragment, &old_rid)?;
-                        self.story
-                            .inner
-                            .external_hyperlink_rids
-                            .insert(mapped.clone());
-                        hyperlink_mapping.insert(old_rid.clone(), mapped.clone());
-                        mapped
-                    }
+                }
+
+                let existing = if is_image {
+                    image_mapping.get(&old_rid)
                 } else {
-                    return Err(unsupported(format!(
-                        "relationship attribute {}:{}@r:{attribute}",
-                        tag_ns, tag_local
-                    )));
+                    hyperlink_mapping.get(&old_rid)
                 };
+                if let Some(mapped) = existing {
+                    fragment
+                        .document
+                        .set_attr(node, ns_uri::R, &attribute, mapped.clone());
+                    continue;
+                }
+                if details.skipped_relationships.contains(&old_rid) {
+                    fragment.document.detach(node);
+                    continue;
+                }
+                let distinct_relationships = details
+                    .resolved_relationships
+                    .len()
+                    .saturating_add(details.skipped_relationships.len());
+                if distinct_relationships >= settings.limits.max_relationships {
+                    return Err(OpcError::LimitExceeded {
+                        kind: "fragment_relationships",
+                        value: (distinct_relationships + 1) as u64,
+                        max: settings.limits.max_relationships as u64,
+                    }
+                    .into());
+                }
+                if details.resolver_calls >= settings.limits.max_resolver_calls {
+                    return Err(OpcError::LimitExceeded {
+                        kind: "fragment_resolver_calls",
+                        value: (details.resolver_calls + 1) as u64,
+                        max: settings.limits.max_resolver_calls as u64,
+                    }
+                    .into());
+                }
+
+                let relationship = source_relationship(fragment, &old_rid)?.clone();
+                let resolved = resolve_source_relationship(fragment, &relationship)?;
+                if let Some((_, bytes)) = resolved.as_ref() {
+                    details.source_bytes_exposed = details
+                        .source_bytes_exposed
+                        .checked_add(bytes.len() as u64)
+                        .ok_or_else(|| malformed("fragment source byte count overflow"))?;
+                    if details.source_bytes_exposed > settings.limits.max_media_bytes {
+                        return Err(OpcError::LimitExceeded {
+                            kind: "fragment_media_bytes",
+                            value: details.source_bytes_exposed,
+                            max: settings.limits.max_media_bytes,
+                        }
+                        .into());
+                    }
+                }
+                let view = FragmentRelationshipView {
+                    source_owner: fragment.source_part.clone(),
+                    relationship_id: old_rid.clone(),
+                    relationship_type: relationship.rel_type.clone(),
+                    target: relationship.target.clone(),
+                    target_mode: relationship.target_mode,
+                    resolved_part: resolved.as_ref().map(|(part, _)| part.clone()),
+                    content_type: resolved.as_ref().and_then(|(part, _)| {
+                        fragment
+                            .package
+                            .content_types()
+                            .content_type_of(part)
+                            .map(str::to_string)
+                    }),
+                };
+                let source = match resolved.as_ref() {
+                    Some((part, bytes)) => FragmentResourceSource::Part { name: part, bytes },
+                    None => FragmentResourceSource::None,
+                };
+                details.resolver_calls += 1;
+                let decision = {
+                    let mut resources = self.resources();
+                    resolver.resolve(&view, &source, &mut resources)?
+                };
+
+                let new_rid = if is_image {
+                    if relationship.rel_type != IMAGE_REL_TYPE
+                        || relationship.target_mode != TargetMode::Internal
+                    {
+                        return Err(unsupported("non-embedded-image blip relationship"));
+                    }
+                    let media = match decision {
+                        FragmentResourceDecision::ImportDefault => {
+                            let FragmentResourceSource::Part { name, bytes } = source else {
+                                return Err(malformed(format!(
+                                    "fragment image relationship {old_rid:?} has no source part"
+                                )));
+                            };
+                            details.media_bytes_read = details
+                                .media_bytes_read
+                                .checked_add(bytes.len() as u64)
+                                .ok_or_else(|| malformed("fragment media byte count overflow"))?;
+                            if details.media_bytes_read > settings.limits.max_media_bytes {
+                                return Err(OpcError::LimitExceeded {
+                                    kind: "fragment_media_bytes",
+                                    value: details.media_bytes_read,
+                                    max: settings.limits.max_media_bytes,
+                                }
+                                .into());
+                            }
+                            let mut resources = self.resources();
+                            resources.register_media_bytes(name.file_name(), Arc::from(bytes))?
+                        }
+                        FragmentResourceDecision::UseMedia(media) => media,
+                        FragmentResourceDecision::Skip => {
+                            ensure_skip_enabled(settings)?;
+                            fragment.document.detach(node);
+                            details.skipped_relationships.insert(old_rid.clone());
+                            details.warnings.push(FragmentImportWarning {
+                                code: "fragment.relationship_skipped",
+                                message: format!("skipped image relationship {old_rid:?}"),
+                            });
+                            details.record_mapping(&old_rid, None, &settings.limits);
+                            continue;
+                        }
+                        FragmentResourceDecision::Reject { reason } => {
+                            return Err(malformed(format!(
+                                "fragment resolver rejected relationship {old_rid:?}: {reason}"
+                            )));
+                        }
+                        FragmentResourceDecision::UseExternalHyperlink(_) => {
+                            return Err(malformed(
+                                "fragment resolver returned a hyperlink for an image relationship",
+                            ));
+                        }
+                        FragmentResourceDecision::UseRelationship(_) => {
+                            return Err(malformed(
+                                "fragment resolver returned a raw relationship for an image",
+                            ));
+                        }
+                    };
+                    let mapped = {
+                        let mut resources = self.resources();
+                        resources.relate_image(&media)?
+                    };
+                    image_mapping.insert(old_rid.clone(), mapped.clone());
+                    mapped
+                } else if is_hyperlink {
+                    if relationship.rel_type != HYPERLINK_REL_TYPE
+                        || relationship.target_mode != TargetMode::External
+                    {
+                        return Err(unsupported("non-external hyperlink relationship"));
+                    }
+                    let target = match decision {
+                        FragmentResourceDecision::ImportDefault => relationship.target.clone(),
+                        FragmentResourceDecision::UseExternalHyperlink(target) => target,
+                        FragmentResourceDecision::UseRelationship(registration) => {
+                            if registration.relationship_type != HYPERLINK_REL_TYPE
+                                || registration.target_mode != TargetMode::External
+                            {
+                                return Err(malformed(
+                                    "fragment resolver relationship is not an external hyperlink",
+                                ));
+                            }
+                            registration.target
+                        }
+                        FragmentResourceDecision::Skip => {
+                            ensure_skip_enabled(settings)?;
+                            fragment.document.detach(node);
+                            details.skipped_relationships.insert(old_rid.clone());
+                            details.warnings.push(FragmentImportWarning {
+                                code: "fragment.relationship_skipped",
+                                message: format!("skipped hyperlink relationship {old_rid:?}"),
+                            });
+                            details.record_mapping(&old_rid, None, &settings.limits);
+                            continue;
+                        }
+                        FragmentResourceDecision::Reject { reason } => {
+                            return Err(malformed(format!(
+                                "fragment resolver rejected relationship {old_rid:?}: {reason}"
+                            )));
+                        }
+                        FragmentResourceDecision::UseMedia(_) => {
+                            return Err(malformed(
+                                "fragment resolver returned media for a hyperlink relationship",
+                            ));
+                        }
+                    };
+                    validate_external_target(&target, settings.external_links)?;
+                    let mapped = {
+                        let mut resources = self.resources();
+                        resources.relate_external_hyperlink(&target)?
+                    };
+                    hyperlink_mapping.insert(old_rid.clone(), mapped.clone());
+                    mapped
+                } else {
+                    unreachable!("relationship kind checked above")
+                };
+                details.resolved_relationships.insert(old_rid.clone());
+                details.record_mapping(&old_rid, Some(new_rid.clone()), &settings.limits);
                 fragment
                     .document
                     .set_attr(node, ns_uri::R, &attribute, new_rid);
@@ -495,20 +1134,49 @@ impl StoryEditContext<'_, '_, '_> {
     }
 }
 
-fn register_fragment_image(
-    context: &mut StoryEditContext<'_, '_, '_>,
-    fragment: &WordFragment,
-    rid: &str,
-) -> Result<MediaRegistration, Error> {
-    let relationship = source_relationship(fragment, rid)?;
-    if relationship.rel_type != IMAGE_REL_TYPE || relationship.target_mode != TargetMode::Internal {
-        return Err(unsupported("non-embedded-image blip relationship"));
+#[derive(Default)]
+struct RelationshipImportDetails {
+    media_bytes_read: u64,
+    source_bytes_exposed: u64,
+    resolver_calls: usize,
+    resolved_relationships: HashSet<String>,
+    skipped_relationships: HashSet<String>,
+    relationship_map: Vec<RelationshipIdMapping>,
+    mappings_truncated: bool,
+    warnings: Vec<FragmentImportWarning>,
+}
+
+impl RelationshipImportDetails {
+    fn record_mapping(
+        &mut self,
+        source_id: &str,
+        target_id: Option<String>,
+        limits: &FragmentImportLimits,
+    ) {
+        if self.relationship_map.len() < limits.max_report_mappings {
+            self.relationship_map.push(RelationshipIdMapping {
+                source_id: source_id.to_string(),
+                target_id,
+            });
+        } else {
+            self.mappings_truncated = true;
+        }
+    }
+}
+
+fn resolve_source_relationship<'a>(
+    fragment: &'a WordFragment,
+    relationship: &Relationship,
+) -> Result<Option<(PartUri, &'a [u8])>, Error> {
+    if relationship.target_mode == TargetMode::External {
+        return Ok(None);
     }
     let owner = PartUri::new(&fragment.source_part)?;
     let target =
         resolve_part_target(owner.parent().as_ref(), &relationship.target).ok_or_else(|| {
             malformed(format!(
-                "fragment image relationship {rid:?} has an invalid target"
+                "fragment relationship {:?} has an unsafe or invalid target {:?}",
+                relationship.id, relationship.target
             ))
         })?;
     let bytes = fragment
@@ -518,25 +1186,71 @@ fn register_fragment_image(
             uri: target.as_str().to_string(),
         })?
         .bytes()?;
-    context
-        .transaction
-        .register_media_bytes(target.file_name(), Arc::from(bytes))
+    Ok(Some((target, bytes)))
 }
 
-fn register_fragment_hyperlink(
-    context: &mut StoryEditContext<'_, '_, '_>,
-    fragment: &WordFragment,
-    rid: &str,
-) -> Result<String, Error> {
-    let relationship = source_relationship(fragment, rid)?;
-    if relationship.rel_type != HYPERLINK_REL_TYPE
-        || relationship.target_mode != TargetMode::External
-    {
-        return Err(unsupported("non-external hyperlink relationship"));
+fn ensure_skip_enabled(settings: &FragmentImportSettings) -> Result<(), Error> {
+    if settings.unsupported_relationships == UnsupportedRelationshipPolicy::Skip {
+        Ok(())
+    } else {
+        Err(malformed(
+            "fragment resolver returned Skip but relationship skipping is disabled",
+        ))
     }
-    context
-        .transaction
-        .relate_external_hyperlink(&context.owner, &relationship.target)
+}
+
+fn validate_external_target(target: &str, policy: ExternalLinkPolicy) -> Result<(), Error> {
+    let scheme = target
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            !scheme.is_empty()
+                && scheme.chars().enumerate().all(|(index, character)| {
+                    if index == 0 {
+                        character.is_ascii_alphabetic()
+                    } else {
+                        character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+                    }
+                })
+        })
+        .ok_or_else(|| malformed("fragment external hyperlink has no valid URI scheme"))?;
+    match policy {
+        ExternalLinkPolicy::Reject => Err(unsupported("external-hyperlink")),
+        ExternalLinkPolicy::HttpHttps
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") =>
+        {
+            Err(unsupported(format!("external hyperlink scheme {scheme:?}")))
+        }
+        ExternalLinkPolicy::HttpHttps | ExternalLinkPolicy::AllowAnyScheme => Ok(()),
+    }
+}
+
+fn validate_import_limits(
+    fragment: &WordFragment,
+    limits: &FragmentImportLimits,
+) -> Result<(), Error> {
+    if fragment.roots.len() > limits.max_root_nodes {
+        return Err(OpcError::LimitExceeded {
+            kind: "fragment_root_nodes",
+            value: fragment.roots.len() as u64,
+            max: limits.max_root_nodes as u64,
+        }
+        .into());
+    }
+    let total_nodes = fragment
+        .roots
+        .iter()
+        .map(|root| fragment.document.descendants(*root).len())
+        .sum::<usize>();
+    if total_nodes > limits.max_total_nodes {
+        return Err(OpcError::LimitExceeded {
+            kind: "fragment_total_nodes",
+            value: total_nodes as u64,
+            max: limits.max_total_nodes as u64,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn source_relationship<'a>(

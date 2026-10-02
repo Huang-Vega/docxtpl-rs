@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-cli"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "clap",
  "docxtpl-rs",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-compat"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "fancy-regex",
  "proptest",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-opc"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "proptest",
  "quick-xml",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-rich"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "sha1",
  "thiserror",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-rs"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "crc32fast",
  "docxtpl-compat",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-template"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "docxtpl-compat",
  "docxtpl-rich",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "docxtpl-xml"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "proptest",
  "thiserror",
