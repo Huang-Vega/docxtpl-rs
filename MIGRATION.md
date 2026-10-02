@@ -339,19 +339,23 @@ pipeline.set_part_cache_policy(PartCachePolicy::EvictAbove {
 construction and after each visited Story, releasing only clean lazy buffers
 backed by the reopenable source ZIP.
 Dirty/new parts, file-backed media, and transaction rollback snapshots are
-never evicted. `PassReport::resources` reports eviction runs and released
-bytes, while `residency_before` and `residency_after` expose the pass boundary.
+never evicted. Use `RenderedDocument::postprocess_with_metrics` when extended
+observability is needed. Its `DetailedPassReport::resources` reports eviction
+runs and released bytes, while `residency_before` and `residency_after` expose
+the pass boundary.
 
-`StoryEditReport` now includes parsed/serialized byte totals and their elapsed
-times. `PassReport::transaction` exposes snapshot/add counts and byte sizes;
-`PassReport::resources` also distinguishes added/reused media and
-relationships and records `peak_resident_bytes` at mutation, media-catalog,
-and Story checkpoints. Recoverably rolled-back passes report
-`rollback_elapsed`. Atomic file-save `PackageWriteReport` values additionally
-include `temporary_file_bytes`, `temporary_sync_elapsed`, and
-`atomic_replace_elapsed`; stream writes leave those fields at zero. These
-metrics are counters only and do not retain part names beyond the existing
-`touched_parts`, URLs, source paths, or application data.
+The `for_each_*_with_metrics` Story APIs return `DetailedStoryEditReport`, whose
+`metrics` field contains parsed/serialized byte totals and elapsed times.
+`DetailedPassReport::transaction` exposes snapshot/add counts and byte sizes;
+its `resources` field also distinguishes added/reused media and relationships
+and records `peak_resident_bytes` at mutation, media-catalog, and Story
+checkpoints. Recoverably rolled-back passes report `rollback_elapsed`.
+`Package::save_with_atomic_report` returns `AtomicSaveReport`, including
+`temporary_file_bytes`, `temporary_sync_elapsed`, and `atomic_replace_elapsed`
+alongside the stable `PackageWriteReport`. These separate detailed report types
+preserve source compatibility for callers that construct the original public
+reports. The metrics are counters only and do not retain part names beyond the
+existing `touched_parts`, URLs, source paths, or application data.
 
 Controlled media probing hashes byte and file inputs in 64 KiB chunks, and OPC
 validation checks cancellation between parts and relationships. Controlled

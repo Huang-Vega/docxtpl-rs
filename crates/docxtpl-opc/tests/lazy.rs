@@ -67,17 +67,20 @@ fn write_report_counts_raw_copies_and_final_bytes() {
     let output = dir.path().join("reported.docx");
 
     let report = pkg
-        .save_with_report(&output, &docxtpl_opc::WriteOptions::compatible())
+        .save_with_atomic_report(&output, &docxtpl_opc::WriteOptions::compatible())
         .expect("save with report");
 
-    assert_eq!(report.total_parts, pkg.part_count());
-    assert_eq!(report.raw_copied_parts, pkg.part_count());
-    assert_eq!(report.rewritten_parts, 0);
-    assert_eq!(report.modified_parts, 0);
-    assert_eq!(report.output_bytes, fs::metadata(output).unwrap().len());
-    assert_eq!(report.temporary_file_bytes, report.output_bytes);
-    assert!(report.raw_copied_compressed_bytes > 0);
-    assert!(report.raw_copied_uncompressed_bytes > 0);
+    assert_eq!(report.write.total_parts, pkg.part_count());
+    assert_eq!(report.write.raw_copied_parts, pkg.part_count());
+    assert_eq!(report.write.rewritten_parts, 0);
+    assert_eq!(report.write.modified_parts, 0);
+    assert_eq!(
+        report.write.output_bytes,
+        fs::metadata(output).unwrap().len()
+    );
+    assert_eq!(report.temporary_file_bytes, report.write.output_bytes);
+    assert!(report.write.raw_copied_compressed_bytes > 0);
+    assert!(report.write.raw_copied_uncompressed_bytes > 0);
 }
 
 #[test]

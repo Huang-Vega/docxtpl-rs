@@ -72,8 +72,14 @@ pub struct PackageWriteReport {
     pub modified_parts: usize,
     /// Final ZIP stream length.
     pub output_bytes: u64,
+}
+
+/// Metrics for an atomic file save, including the underlying ZIP write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AtomicSaveReport {
+    /// Aggregate ZIP serialization metrics.
+    pub write: PackageWriteReport,
     /// Size of the completed same-directory temporary file for atomic saves.
-    /// Stream writes report zero.
     pub temporary_file_bytes: u64,
     /// Time spent flushing the atomic-save temporary file to storage.
     pub temporary_sync_elapsed: Duration,
@@ -1099,6 +1105,16 @@ impl Package {
         path: impl AsRef<Path>,
         options: &WriteOptions,
     ) -> Result<PackageWriteReport, OpcError> {
+        self.save_with_atomic_report(path, options)
+            .map(|report| report.write)
+    }
+
+    /// Save atomically and return both ZIP and atomic-replacement metrics.
+    pub fn save_with_atomic_report(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+    ) -> Result<AtomicSaveReport, OpcError> {
         let path = path.as_ref();
         self.validate()?;
         let overwrites_source = self
@@ -1111,11 +1127,11 @@ impl Package {
             Some(parent) => tempfile::NamedTempFile::new_in(parent)?,
             None => tempfile::NamedTempFile::new_in(".")?,
         };
-        let mut report = self.write_to_with_report(temporary.as_file_mut(), options)?;
-        report.temporary_file_bytes = temporary.as_file().metadata()?.len();
+        let write = self.write_to_with_report(temporary.as_file_mut(), options)?;
+        let temporary_file_bytes = temporary.as_file().metadata()?.len();
         let sync_started = Instant::now();
         temporary.as_file_mut().sync_all()?;
-        report.temporary_sync_elapsed = sync_started.elapsed();
+        let temporary_sync_elapsed = sync_started.elapsed();
         if overwrites_source {
             if let Some(source) = &self.source {
                 source.close()?;
@@ -1130,13 +1146,18 @@ impl Package {
             }
             return Err(OpcError::Io(error.error));
         }
-        report.atomic_replace_elapsed = persist_started.elapsed();
+        let atomic_replace_elapsed = persist_started.elapsed();
         if overwrites_source {
             if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
                 source.reopen(source_path)?;
             }
         }
-        Ok(report)
+        Ok(AtomicSaveReport {
+            write,
+            temporary_file_bytes,
+            temporary_sync_elapsed,
+            atomic_replace_elapsed,
+        })
     }
 
     /// Save atomically while checking for cooperative cancellation during
@@ -1147,6 +1168,17 @@ impl Package {
         options: &WriteOptions,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<PackageWriteReport, InterruptibleWriteError> {
+        self.save_with_atomic_report_interruptible(path, options, should_cancel)
+            .map(|report| report.write)
+    }
+
+    /// Save atomically with cancellation and return detailed save metrics.
+    pub fn save_with_atomic_report_interruptible(
+        &self,
+        path: impl AsRef<Path>,
+        options: &WriteOptions,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<AtomicSaveReport, InterruptibleWriteError> {
         if should_cancel() {
             return Err(InterruptibleWriteError::Cancelled);
         }
@@ -1166,7 +1198,7 @@ impl Package {
         // in-memory copy of `max_output_size` scale. The temporary file lives
         // in the same directory and is persisted only on success, so a write
         // failure never leaves a truncated target document.
-        let mut report = self.write_to_with_report_interruptible(
+        let write = self.write_to_with_report_interruptible(
             temporary.as_file_mut(),
             options,
             should_cancel,
@@ -1174,10 +1206,10 @@ impl Package {
         if should_cancel() {
             return Err(InterruptibleWriteError::Cancelled);
         }
-        report.temporary_file_bytes = temporary.as_file().metadata().map_err(OpcError::Io)?.len();
+        let temporary_file_bytes = temporary.as_file().metadata().map_err(OpcError::Io)?.len();
         let sync_started = Instant::now();
         temporary.as_file_mut().sync_all().map_err(OpcError::Io)?;
-        report.temporary_sync_elapsed = sync_started.elapsed();
+        let temporary_sync_elapsed = sync_started.elapsed();
         if should_cancel() {
             return Err(InterruptibleWriteError::Cancelled);
         }
@@ -1195,13 +1227,18 @@ impl Package {
             }
             return Err(OpcError::Io(error.error).into());
         }
-        report.atomic_replace_elapsed = persist_started.elapsed();
+        let atomic_replace_elapsed = persist_started.elapsed();
         if overwrites_source {
             if let (Some(source), Some(source_path)) = (&self.source, &self.source_path) {
                 source.reopen(source_path)?;
             }
         }
-        Ok(report)
+        Ok(AtomicSaveReport {
+            write,
+            temporary_file_bytes,
+            temporary_sync_elapsed,
+            atomic_replace_elapsed,
+        })
     }
 
     /// Write to any seekable writer stream.

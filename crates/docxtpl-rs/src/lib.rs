@@ -2931,18 +2931,32 @@ fn unique_bookmark_name(base: &str, used: &HashSet<&str>) -> String {
 pub struct StoryEditReport {
     /// Parts parsed into a DOM.
     pub parsed_parts: usize,
+    /// Parts serialized after mutable access.
+    pub serialized_parts: usize,
+    /// Parts whose serialized bytes differed and were written to the transaction.
+    pub changed_parts: Vec<String>,
+}
+
+/// Byte and timing metrics collected while editing Word stories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoryEditMetrics {
     /// Source XML bytes decoded and parsed.
     pub parsed_bytes: u64,
     /// Wall-clock time spent decoding and parsing selected stories.
     pub parse_elapsed: Duration,
-    /// Parts serialized after mutable access.
-    pub serialized_parts: usize,
     /// XML bytes produced by serialization before change comparison.
     pub serialized_bytes: u64,
     /// Wall-clock time spent serializing changed stories.
     pub serialize_elapsed: Duration,
-    /// Parts whose serialized bytes differed and were written to the transaction.
-    pub changed_parts: Vec<String>,
+}
+
+/// Compatibility-preserving detailed result of one story-edit operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetailedStoryEditReport {
+    /// Stable counters and changed-part names.
+    pub edit: StoryEditReport,
+    /// Additional byte and timing observations.
+    pub metrics: StoryEditMetrics,
 }
 
 /// Behavior when a post-processing pass returns an error.
@@ -3040,16 +3054,6 @@ pub struct PassReport {
     pub rolled_back: bool,
     /// Existing or newly-added parts touched by the pass.
     pub touched_parts: Vec<String>,
-    /// Transaction undo-journal and final touched-content sizes.
-    pub transaction: PackageTransactionMetrics,
-    /// Relationship, media, and automatic cache-reclamation activity.
-    pub resources: PassResourceMetrics,
-    /// Package residency immediately before the pass.
-    pub residency_before: PackageResidency,
-    /// Package residency after commit or rollback.
-    pub residency_after: PackageResidency,
-    /// Time spent restoring the transaction after a recoverable failure.
-    pub rollback_elapsed: Duration,
     /// Recoverable warnings emitted by this pass.
     pub warnings: Vec<PostprocessWarning>,
     /// Wall-clock duration of the pass, including rollback when applicable.
@@ -3063,11 +3067,38 @@ pub struct PostprocessReport {
     pub passes: Vec<PassReport>,
 }
 
+/// Extended resource observations for one post-processing pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedPassReport {
+    /// Stable pass outcome and warnings.
+    pub pass: PassReport,
+    /// Transaction undo-journal and final touched-content sizes.
+    pub transaction: PackageTransactionMetrics,
+    /// Relationship, media, and automatic cache-reclamation activity.
+    pub resources: PassResourceMetrics,
+    /// Package residency immediately before the pass.
+    pub residency_before: PackageResidency,
+    /// Package residency after commit or rollback.
+    pub residency_after: PackageResidency,
+    /// Time spent restoring the transaction after a recoverable failure.
+    pub rollback_elapsed: Duration,
+}
+
+/// Post-processing result with per-pass resource observations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetailedPostprocessReport {
+    /// Compatibility-preserving pass reports.
+    pub report: PostprocessReport,
+    /// Extended reports in the same execution order.
+    pub details: Vec<DetailedPassReport>,
+}
+
 /// A sequential, pass-transactional editor for one rendered document.
 pub struct PostprocessPipeline<'a> {
     package: &'a mut Package,
     max_rendered_xml_bytes: usize,
     reports: Vec<PassReport>,
+    detailed_reports: Vec<DetailedPassReport>,
     control: Option<RenderControl>,
     media_catalog: MediaCatalog,
     part_cache_policy: PartCachePolicy,
@@ -3591,11 +3622,22 @@ impl PostprocessTransaction<'_, '_> {
     pub fn for_each_story(
         &mut self,
         scope: StoryScope,
-        mut edit: impl FnMut(&mut StoryEditor) -> Result<(), Error>,
+        edit: impl FnMut(&mut StoryEditor) -> Result<(), Error>,
     ) -> Result<StoryEditReport, Error> {
+        self.for_each_story_with_metrics(scope, edit)
+            .map(|detailed| detailed.edit)
+    }
+
+    /// Parse and edit selected stories while also returning byte and timing metrics.
+    pub fn for_each_story_with_metrics(
+        &mut self,
+        scope: StoryScope,
+        mut edit: impl FnMut(&mut StoryEditor) -> Result<(), Error>,
+    ) -> Result<DetailedStoryEditReport, Error> {
         self.check_cancelled()?;
         let stories = editable_story_parts(self.transaction.package(), scope)?;
         let mut report = StoryEditReport::default();
+        let mut metrics = StoryEditMetrics::default();
         for (name, kind) in stories {
             self.check_cancelled()?;
             let external_hyperlink_rids = self
@@ -3638,8 +3680,8 @@ impl PostprocessTransaction<'_, '_> {
                         source,
                     })?;
             report.parsed_parts += 1;
-            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
-            report.parse_elapsed += parse_started.elapsed();
+            metrics.parsed_bytes = metrics.parsed_bytes.saturating_add(source_bytes);
+            metrics.parse_elapsed += parse_started.elapsed();
             let mut story = StoryEditor {
                 name: name.clone(),
                 kind,
@@ -3671,10 +3713,10 @@ impl PostprocessTransaction<'_, '_> {
                 max: self.max_rendered_xml_bytes as u64,
             })?;
             report.serialized_parts += 1;
-            report.serialized_bytes = report
+            metrics.serialized_bytes = metrics
                 .serialized_bytes
                 .saturating_add(serialized.len() as u64);
-            report.serialize_elapsed += serialize_started.elapsed();
+            metrics.serialize_elapsed += serialize_started.elapsed();
             let changed = {
                 let current = self
                     .transaction
@@ -3691,7 +3733,10 @@ impl PostprocessTransaction<'_, '_> {
             self.maybe_evict_clean_part_caches();
         }
         self.check_cancelled()?;
-        Ok(report)
+        Ok(DetailedStoryEditReport {
+            edit: report,
+            metrics,
+        })
     }
 
     /// Parse each selected Word story once, run all caller edits on its shared
@@ -3704,11 +3749,22 @@ impl PostprocessTransaction<'_, '_> {
     pub fn for_each_editable_story(
         &mut self,
         selection: EditableStorySelection,
-        mut edit: impl FnMut(&mut EditableStoryEditor) -> Result<(), Error>,
+        edit: impl FnMut(&mut EditableStoryEditor) -> Result<(), Error>,
     ) -> Result<StoryEditReport, Error> {
+        self.for_each_editable_story_with_metrics(selection, edit)
+            .map(|detailed| detailed.edit)
+    }
+
+    /// Edit unified Word stories and return byte and timing metrics.
+    pub fn for_each_editable_story_with_metrics(
+        &mut self,
+        selection: EditableStorySelection,
+        mut edit: impl FnMut(&mut EditableStoryEditor) -> Result<(), Error>,
+    ) -> Result<DetailedStoryEditReport, Error> {
         self.check_cancelled()?;
         let stories = unified_editable_story_parts(self.transaction.package(), selection)?;
         let mut report = StoryEditReport::default();
+        let mut metrics = StoryEditMetrics::default();
         for (name, kind) in stories {
             self.check_cancelled()?;
             let external_hyperlink_rids = self
@@ -3751,8 +3807,8 @@ impl PostprocessTransaction<'_, '_> {
                         source,
                     })?;
             report.parsed_parts += 1;
-            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
-            report.parse_elapsed += parse_started.elapsed();
+            metrics.parsed_bytes = metrics.parsed_bytes.saturating_add(source_bytes);
+            metrics.parse_elapsed += parse_started.elapsed();
             let legacy_kind = match kind {
                 EditableStoryKind::Header => StoryKind::Header,
                 EditableStoryKind::Footer => StoryKind::Footer,
@@ -3803,10 +3859,10 @@ impl PostprocessTransaction<'_, '_> {
                 max: self.max_rendered_xml_bytes as u64,
             })?;
             report.serialized_parts += 1;
-            report.serialized_bytes = report
+            metrics.serialized_bytes = metrics
                 .serialized_bytes
                 .saturating_add(serialized.len() as u64);
-            report.serialize_elapsed += serialize_started.elapsed();
+            metrics.serialize_elapsed += serialize_started.elapsed();
             let changed = {
                 let current = self
                     .transaction
@@ -3823,7 +3879,10 @@ impl PostprocessTransaction<'_, '_> {
             self.maybe_evict_clean_part_caches();
         }
         self.check_cancelled()?;
-        Ok(report)
+        Ok(DetailedStoryEditReport {
+            edit: report,
+            metrics,
+        })
     }
 
     /// Parse each selected Story once and expose both its DOM and a resource
@@ -3834,11 +3893,22 @@ impl PostprocessTransaction<'_, '_> {
     pub fn for_each_editable_story_with_resources(
         &mut self,
         selection: EditableStorySelection,
-        mut edit: impl FnMut(&mut StoryEditContext<'_, '_, '_>) -> Result<(), Error>,
+        edit: impl FnMut(&mut StoryEditContext<'_, '_, '_>) -> Result<(), Error>,
     ) -> Result<StoryEditReport, Error> {
+        self.for_each_editable_story_with_resources_and_metrics(selection, edit)
+            .map(|detailed| detailed.edit)
+    }
+
+    /// Edit unified stories with resource access and detailed byte/timing metrics.
+    pub fn for_each_editable_story_with_resources_and_metrics(
+        &mut self,
+        selection: EditableStorySelection,
+        mut edit: impl FnMut(&mut StoryEditContext<'_, '_, '_>) -> Result<(), Error>,
+    ) -> Result<DetailedStoryEditReport, Error> {
         self.check_cancelled()?;
         let stories = unified_editable_story_parts(self.transaction.package(), selection)?;
         let mut report = StoryEditReport::default();
+        let mut metrics = StoryEditMetrics::default();
         for (name, kind) in stories {
             self.check_cancelled()?;
             let external_hyperlink_rids = self
@@ -3882,8 +3952,8 @@ impl PostprocessTransaction<'_, '_> {
                     })?;
             let drawing_ids = DrawingIdAllocator::from_document(&document);
             report.parsed_parts += 1;
-            report.parsed_bytes = report.parsed_bytes.saturating_add(source_bytes);
-            report.parse_elapsed += parse_started.elapsed();
+            metrics.parsed_bytes = metrics.parsed_bytes.saturating_add(source_bytes);
+            metrics.parse_elapsed += parse_started.elapsed();
             let legacy_kind = match kind {
                 EditableStoryKind::Header => StoryKind::Header,
                 EditableStoryKind::Footer => StoryKind::Footer,
@@ -3943,10 +4013,10 @@ impl PostprocessTransaction<'_, '_> {
                 max: self.max_rendered_xml_bytes as u64,
             })?;
             report.serialized_parts += 1;
-            report.serialized_bytes = report
+            metrics.serialized_bytes = metrics
                 .serialized_bytes
                 .saturating_add(serialized.len() as u64);
-            report.serialize_elapsed += serialize_started.elapsed();
+            metrics.serialize_elapsed += serialize_started.elapsed();
             let changed = {
                 let current = self
                     .transaction
@@ -3963,7 +4033,10 @@ impl PostprocessTransaction<'_, '_> {
             self.maybe_evict_clean_part_caches();
         }
         self.check_cancelled()?;
-        Ok(report)
+        Ok(DetailedStoryEditReport {
+            edit: report,
+            metrics,
+        })
     }
 }
 
@@ -4016,19 +4089,23 @@ impl PostprocessPipeline<'_> {
                 let transaction_metrics = transaction.metrics();
                 transaction.commit();
                 let residency_after = self.package.residency();
-                self.reports.push(PassReport {
+                let report = PassReport {
                     name,
                     changed,
                     rolled_back: false,
                     touched_parts,
+                    warnings: Vec::new(),
+                    elapsed: started.elapsed(),
+                };
+                self.detailed_reports.push(DetailedPassReport {
+                    pass: report.clone(),
                     transaction: transaction_metrics,
                     resources,
                     residency_before,
                     residency_after,
                     rollback_elapsed: Duration::ZERO,
-                    warnings: Vec::new(),
-                    elapsed: started.elapsed(),
                 });
+                self.reports.push(report);
                 Ok(self)
             }
             Err(error) => {
@@ -4053,19 +4130,23 @@ impl PostprocessPipeline<'_> {
                             code: "pass_rolled_back",
                             message: error.to_string(),
                         };
-                        self.reports.push(PassReport {
+                        let report = PassReport {
                             name,
                             changed: false,
                             rolled_back: true,
                             touched_parts,
+                            warnings: vec![warning],
+                            elapsed: started.elapsed(),
+                        };
+                        self.detailed_reports.push(DetailedPassReport {
+                            pass: report.clone(),
                             transaction: transaction_metrics,
                             resources,
                             residency_before,
                             residency_after,
                             rollback_elapsed,
-                            warnings: vec![warning],
-                            elapsed: started.elapsed(),
                         });
+                        self.reports.push(report);
                         Ok(self)
                     }
                 }
@@ -4113,19 +4194,23 @@ impl PostprocessPipeline<'_> {
                 let transaction_metrics = transaction.metrics();
                 transaction.commit();
                 let residency_after = self.package.residency();
-                self.reports.push(PassReport {
+                let report = PassReport {
                     name,
                     changed,
                     rolled_back: false,
                     touched_parts,
+                    warnings: Vec::new(),
+                    elapsed: started.elapsed(),
+                };
+                self.detailed_reports.push(DetailedPassReport {
+                    pass: report.clone(),
                     transaction: transaction_metrics,
                     resources,
                     residency_before,
                     residency_after,
                     rollback_elapsed: Duration::ZERO,
-                    warnings: Vec::new(),
-                    elapsed: started.elapsed(),
                 });
+                self.reports.push(report);
                 Ok(self)
             }
             Err(error) => {
@@ -4154,23 +4239,27 @@ impl PostprocessPipeline<'_> {
                                 ("pass_rolled_back", error.to_string())
                             }
                         };
-                        self.reports.push(PassReport {
+                        let report = PassReport {
                             name: name.clone(),
                             changed: false,
                             rolled_back: true,
                             touched_parts,
-                            transaction: transaction_metrics,
-                            resources,
-                            residency_before,
-                            residency_after,
-                            rollback_elapsed,
                             warnings: vec![PostprocessWarning {
                                 pass: name,
                                 code,
                                 message,
                             }],
                             elapsed: started.elapsed(),
+                        };
+                        self.detailed_reports.push(DetailedPassReport {
+                            pass: report.clone(),
+                            transaction: transaction_metrics,
+                            resources,
+                            residency_before,
+                            residency_after,
+                            rollback_elapsed,
                         });
+                        self.reports.push(report);
                         Ok(self)
                     }
                 }
@@ -4205,6 +4294,34 @@ impl RenderedDocument {
         self.postprocess_checked(configure, None)
     }
 
+    /// Run post-processing and retain extended transaction and residency metrics.
+    pub fn postprocess_with_metrics(
+        &mut self,
+        configure: impl FnOnce(&mut PostprocessPipeline<'_>) -> Result<(), Error>,
+    ) -> Result<DetailedPostprocessReport, Error> {
+        check_render_control(None)?;
+        self.edited = true;
+        let mut pipeline = PostprocessPipeline {
+            package: &mut self.pkg,
+            max_rendered_xml_bytes: self.max_rendered_xml_bytes,
+            reports: Vec::new(),
+            detailed_reports: Vec::new(),
+            control: None,
+            media_catalog: MediaCatalog::default(),
+            part_cache_policy: PartCachePolicy::default(),
+        };
+        let result = configure(&mut pipeline);
+        let reports = std::mem::take(&mut pipeline.reports);
+        let details = std::mem::take(&mut pipeline.detailed_reports);
+        drop(pipeline);
+        self.postprocess_passes.extend(reports.clone());
+        result?;
+        Ok(DetailedPostprocessReport {
+            report: PostprocessReport { passes: reports },
+            details,
+        })
+    }
+
     /// Run rollback-capable passes that may return caller-defined structured
     /// validation errors without converting them to facade I/O errors.
     pub fn postprocess_structured(
@@ -4217,6 +4334,7 @@ impl RenderedDocument {
             package: &mut self.pkg,
             max_rendered_xml_bytes: self.max_rendered_xml_bytes,
             reports: Vec::new(),
+            detailed_reports: Vec::new(),
             control: None,
             media_catalog: MediaCatalog::default(),
             part_cache_policy: PartCachePolicy::default(),
@@ -4265,6 +4383,7 @@ impl RenderedDocument {
             package: &mut self.pkg,
             max_rendered_xml_bytes: self.max_rendered_xml_bytes,
             reports: Vec::new(),
+            detailed_reports: Vec::new(),
             control,
             media_catalog: MediaCatalog::default(),
             part_cache_policy: PartCachePolicy::default(),
@@ -4585,14 +4704,6 @@ fn map_interruptible_control_error(
 /// Facade-level errors: OPC, template rendering or encoding problems.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A relationship-bearing or package-level feature is outside the first
-    /// safe WordML fragment import boundary.
-    #[error("unsupported WordML fragment feature {feature:?}")]
-    UnsupportedFragmentFeature {
-        /// Stable feature name suitable for diagnostics.
-        feature: String,
-    },
-
     /// The compressed input file exceeds the default read limit.
     #[error("input DOCX exceeds the {max} byte limit")]
     InputTooLarge { max: u64 },

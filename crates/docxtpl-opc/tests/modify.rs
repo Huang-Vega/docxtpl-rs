@@ -245,9 +245,6 @@ fn write_report_counts_modified_file_backed_replacement() {
     assert_eq!(report.file_backed_parts, 1);
     assert_eq!(report.modified_parts, 1);
     assert_eq!(report.output_bytes, out.len() as u64);
-    assert_eq!(report.temporary_file_bytes, 0);
-    assert_eq!(report.temporary_sync_elapsed, std::time::Duration::ZERO);
-    assert_eq!(report.atomic_replace_elapsed, std::time::Duration::ZERO);
     assert!(report.rewritten_source_bytes >= replacement.len() as u64);
     assert!(!pkg.part("word/document.xml").unwrap().is_loaded());
 }

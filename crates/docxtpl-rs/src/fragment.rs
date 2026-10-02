@@ -851,7 +851,7 @@ fn malformed(reason: impl Into<String>) -> Error {
 }
 
 fn unsupported(feature: impl Into<String>) -> Error {
-    Error::UnsupportedFragmentFeature {
-        feature: feature.into(),
-    }
+    Error::Opc(OpcError::Malformed {
+        reason: format!("unsupported WordML fragment feature {:?}", feature.into()),
+    })
 }

@@ -1138,7 +1138,7 @@ fn postprocess_pipeline_commits_and_warns_with_pass_local_rollback(
     let template = DocxTemplate::open(TEMPLATE)?;
     let mut document = template.render(&json!({"name": "before"}), &RenderOptions::compat())?;
 
-    let report = document.postprocess(|pipeline| {
+    let report = document.postprocess_with_metrics(|pipeline| {
         pipeline.pass("commit", FailurePolicy::Abort, |transaction| {
             let xml = String::from_utf8(
                 transaction
@@ -1178,19 +1178,19 @@ fn postprocess_pipeline_commits_and_warns_with_pass_local_rollback(
         Ok(())
     })?;
 
-    assert_eq!(report.passes.len(), 3);
-    assert!(report.passes[0].changed);
-    assert_eq!(report.passes[0].transaction.snapshotted_parts, 1);
-    assert!(report.passes[0].transaction.snapshotted_bytes > 0);
-    assert!(report.passes[1].rolled_back);
-    assert_eq!(report.passes[1].transaction.snapshotted_parts, 1);
-    assert!(report.passes[1].rollback_elapsed > std::time::Duration::ZERO);
+    assert_eq!(report.report.passes.len(), 3);
+    assert!(report.report.passes[0].changed);
+    assert_eq!(report.details[0].transaction.snapshotted_parts, 1);
+    assert!(report.details[0].transaction.snapshotted_bytes > 0);
+    assert!(report.report.passes[1].rolled_back);
+    assert_eq!(report.details[1].transaction.snapshotted_parts, 1);
+    assert!(report.details[1].rollback_elapsed > std::time::Duration::ZERO);
     assert_eq!(
-        report.passes[1].residency_after,
-        report.passes[2].residency_before
+        report.details[1].residency_after,
+        report.details[2].residency_before
     );
-    assert_eq!(report.passes[1].warnings[0].code, "pass_rolled_back");
-    assert!(!report.passes[2].changed);
+    assert_eq!(report.report.passes[1].warnings[0].code, "pass_rolled_back");
+    assert!(!report.report.passes[2].changed);
     let bytes = document.to_bytes()?;
     let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
     let xml = std::str::from_utf8(
@@ -1243,36 +1243,38 @@ fn story_editor_shares_one_dom_and_serializes_once() -> Result<(), Box<dyn std::
 
     let report = document.postprocess(|pipeline| {
         pipeline.pass("two-dom-edits", FailurePolicy::Abort, |transaction| {
-            story_report = Some(transaction.for_each_story(StoryScope::Body, |story| {
-                assert_eq!(story.kind(), StoryKind::Body);
-                let text_node = story
-                    .document()
-                    .descendants(story.document().root())
-                    .into_iter()
-                    .find(|id| {
-                        story
-                            .document()
-                            .tag(*id)
-                            .is_some_and(|tag| tag.ns == docxtpl_xml::ns_uri::W && tag.local == "t")
-                    })
-                    .expect("body contains a w:t element");
-                story.document_mut().set_element_text(text_node, "first");
-                story.document_mut().set_element_text(text_node, "second");
-                Ok(())
-            })?);
+            story_report = Some(transaction.for_each_story_with_metrics(
+                StoryScope::Body,
+                |story| {
+                    assert_eq!(story.kind(), StoryKind::Body);
+                    let text_node = story
+                        .document()
+                        .descendants(story.document().root())
+                        .into_iter()
+                        .find(|id| {
+                            story.document().tag(*id).is_some_and(|tag| {
+                                tag.ns == docxtpl_xml::ns_uri::W && tag.local == "t"
+                            })
+                        })
+                        .expect("body contains a w:t element");
+                    story.document_mut().set_element_text(text_node, "first");
+                    story.document_mut().set_element_text(text_node, "second");
+                    Ok(())
+                },
+            )?);
             Ok(())
         })?;
         Ok(())
     })?;
 
     let story_report = story_report.expect("story report");
-    assert_eq!(story_report.parsed_parts, 1);
-    assert!(story_report.parsed_bytes > 0);
-    assert!(story_report.parse_elapsed > std::time::Duration::ZERO);
-    assert_eq!(story_report.serialized_parts, 1);
-    assert!(story_report.serialized_bytes > 0);
-    assert!(story_report.serialize_elapsed > std::time::Duration::ZERO);
-    assert_eq!(story_report.changed_parts, vec!["word/document.xml"]);
+    assert_eq!(story_report.edit.parsed_parts, 1);
+    assert!(story_report.metrics.parsed_bytes > 0);
+    assert!(story_report.metrics.parse_elapsed > std::time::Duration::ZERO);
+    assert_eq!(story_report.edit.serialized_parts, 1);
+    assert!(story_report.metrics.serialized_bytes > 0);
+    assert!(story_report.metrics.serialize_elapsed > std::time::Duration::ZERO);
+    assert_eq!(story_report.edit.changed_parts, vec!["word/document.xml"]);
     assert_eq!(report.passes[0].touched_parts, vec!["word/document.xml"]);
 
     let bytes = document.to_bytes()?;
@@ -1289,7 +1291,7 @@ fn story_high_water_policy_evicts_reloadable_clean_parts() -> Result<(), Box<dyn
     let template = DocxTemplate::open(TEMPLATE)?;
     let mut document = template.render(&json!({"name": "eviction"}), &RenderOptions::compat())?;
 
-    let report = document.postprocess(|pipeline| {
+    let report = document.postprocess_with_metrics(|pipeline| {
         pipeline.set_part_cache_policy(PartCachePolicy::EvictAbove { resident_bytes: 0 });
         pipeline.pass("evict", FailurePolicy::Abort, |transaction| {
             transaction
@@ -1302,7 +1304,7 @@ fn story_high_water_policy_evicts_reloadable_clean_parts() -> Result<(), Box<dyn
         Ok(())
     })?;
 
-    let pass = &report.passes[0];
+    let pass = &report.details[0];
     assert!(pass.resources.eviction_runs >= 1);
     assert!(pass.resources.evicted_parts >= 1);
     assert!(pass.resources.evicted_bytes > 0);
@@ -1409,7 +1411,7 @@ fn media_registration_deduplicates_and_relates_multiple_owners(
     let mut registered_part = String::new();
     let mut body_rid = String::new();
 
-    let report = document.postprocess(|pipeline| {
+    let report = document.postprocess_with_metrics(|pipeline| {
         pipeline.pass("media", FailurePolicy::Abort, |transaction| {
             let first = transaction.register_media_path(MEDIA)?;
             assert!(!first.reused);
@@ -1430,10 +1432,10 @@ fn media_registration_deduplicates_and_relates_multiple_owners(
         Ok(())
     })?;
 
-    assert_eq!(report.passes[0].resources.media_added, 1);
-    assert_eq!(report.passes[0].resources.media_reused, 1);
-    assert_eq!(report.passes[0].resources.relationships_added, 2);
-    assert_eq!(report.passes[0].resources.relationships_reused, 1);
+    assert_eq!(report.details[0].resources.media_added, 1);
+    assert_eq!(report.details[0].resources.media_reused, 1);
+    assert_eq!(report.details[0].resources.relationships_added, 2);
+    assert_eq!(report.details[0].resources.relationships_reused, 1);
 
     let bytes = document.to_bytes()?;
     let reopened = Package::from_reader(Cursor::new(bytes), &PackageLimits::default())?;
